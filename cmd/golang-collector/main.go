@@ -124,9 +124,17 @@ func run() error {
 	// over the live pool compresses similar ads several-fold (~6x on real startd
 	// ads), which is the difference between a compact collector and a fat one.
 	// COLLECTOR_DICT_RETRAIN_INTERVAL seconds (default 900); 0 disables.
+	//
+	// COLLECTOR_DICT_SAMPLE_SIZE bounds how many ads are decoded to train the
+	// dictionary. This is the dominant transient cost of a retrain: the trainer
+	// holds that many decoded ads at once (~16 KB each), so 50k samples is a
+	// ~800 MiB spike -- for no better compression than a few thousand. Keep it
+	// small (default 4000).
 	if iv := configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute); iv > 0 {
-		log.Info(logging.DestinationGeneral, "dictionary auto-retraining enabled", "interval", iv.String())
-		defer st.StartAutoRetrain(iv, 50000)()
+		sampleN := configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000)
+		log.Info(logging.DestinationGeneral, "dictionary auto-retraining enabled",
+			"interval", iv.String(), "sample_size", sampleN)
+		defer st.StartAutoRetrain(iv, sampleN)()
 	}
 
 	go housekeep(ctx, d.Config(), st, log)
@@ -301,6 +309,15 @@ func configSeconds(cfg *config.Config, key string, def time.Duration) time.Durat
 	if v, ok := cfg.Get(key); ok {
 		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
+		}
+	}
+	return def
+}
+
+func configInt(cfg *config.Config, key string, def int) int {
+	if v, ok := cfg.Get(key); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
 	}
 	return def

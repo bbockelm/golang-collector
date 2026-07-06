@@ -73,6 +73,45 @@ func TestRetrainMemoryOverhangBare(t *testing.T) {
 	runtime.KeepAlive(col)
 }
 
+// TestRetrainPeak isolates what drives the RetrainDict transient peak: the
+// dictionary-training sample (CollectSamples retains RETRAIN_SAMPLE decoded ads)
+// vs the recompaction churn (fixed). Run it at two sample sizes in SEPARATE
+// processes (HeapSys is monotonic within a process) and compare the peak:
+//
+//	RETRAIN_SAMPLE=2000  go test ./store/ -run TestRetrainPeak -v
+//	RETRAIN_SAMPLE=50000 go test ./store/ -run TestRetrainPeak -v
+func TestRetrainPeak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("retrain peak report skipped under -short")
+	}
+	sample := loadStartdCorpus(t)
+	n := envInt("CLASSAD_BENCH_N", 100_000)
+	sm := envInt("RETRAIN_SAMPLE", 50_000)
+
+	col := collections.New(collections.Options{})
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < n; i++ {
+		if err := col.Put([]byte("ad-"+strconv.Itoa(i)), mutate(sample[i%len(sample)], i, rng)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.GC()
+	debug.FreeOSMemory()
+	var m0 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+
+	if _, err := col.RetrainDict(sm); err != nil {
+		t.Fatal(err)
+	}
+
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	t.Logf("n=%d sampleMax=%d: HeapSys %s -> %s (peak +%s), live_after=%s",
+		n, sm, humanBytes(int64(m0.HeapSys)), humanBytes(int64(m1.HeapSys)),
+		humanBytes(int64(m1.HeapSys-m0.HeapSys)), humanBytes(col.Stats().LiveBytes()))
+	runtime.KeepAlive(col)
+}
+
 func logMemCol(t *testing.T, label string, col *collections.Collection) {
 	t.Helper()
 	runtime.GC()
