@@ -110,18 +110,20 @@ func TestStartdPrivateAd(t *testing.T) {
 	}
 	stream := cl.GetStream()
 
-	// public ad, then private ad, on the same connection.
-	for _, ad := range []*classad.ClassAd{
-		mustAd(t, `[MyType="Machine"; Name="slot1@a"; MyAddress="<1.2.3.4:5>"; Cpus=8]`),
-		mustAd(t, `[MyType="Machine"; Name="slot1@a"; MyAddress="<1.2.3.4:5>"; ClaimId="secret-claim-123"]`),
-	} {
-		m := message.NewMessageForStream(stream)
-		if err := m.PutClassAd(ctx, ad); err != nil {
-			t.Fatalf("put ad: %v", err)
-		}
-		if err := m.FinishMessage(ctx); err != nil {
-			t.Fatalf("finish: %v", err)
-		}
+	// Public ad and private ad in ONE message under a single end_of_message,
+	// exactly as the C++ startd's finishUpdate frames them.
+	m := message.NewMessageForStream(stream)
+	if err := m.PutClassAd(ctx, mustAd(t, `[MyType="Machine"; Name="slot1@a"; MyAddress="<1.2.3.4:5>"; Cpus=8]`)); err != nil {
+		t.Fatalf("put public ad: %v", err)
+	}
+	// The startd's raw private ad carries only its claim secret -- no identifying
+	// Name/MyAddress. The collector must enrich it from the public ad so the
+	// negotiator can correlate it.
+	if err := m.PutClassAd(ctx, mustAd(t, `[MyType="Machine"; ClaimId="secret-claim-123"]`)); err != nil {
+		t.Fatalf("put private ad: %v", err)
+	}
+	if err := m.FinishMessage(ctx); err != nil {
+		t.Fatalf("finish: %v", err)
 	}
 	cl.Close()
 
@@ -151,6 +153,57 @@ func TestStartdPrivateAd(t *testing.T) {
 	}
 	if cid, _ := pvt.EvaluateAttrString("ClaimId"); cid != "secret-claim-123" {
 		t.Errorf("private ad ClaimId = %q, want secret-claim-123", cid)
+	}
+
+	// And it must come back over the wire via QUERY_STARTD_PVT_ADS -- the command
+	// the negotiator uses to fetch claim capabilities. This is exactly the query
+	// that returned "0 private" in the pool, so assert it returns the ad here.
+	qsec := plaintextSec()
+	qsec.Command = commands.QUERY_STARTD_PVT_ADS
+	qcl, err := client.ConnectAndAuthenticate(ctx, addr, qsec)
+	if err != nil {
+		t.Fatalf("connect for private query: %v", err)
+	}
+	qs := qcl.GetStream()
+	qm := message.NewMessageForStream(qs)
+	if err := qm.PutClassAd(ctx, mustAd(t, `[MyType="Query"; TargetType="Machine"; Requirements = true]`)); err != nil {
+		t.Fatalf("put query ad: %v", err)
+	}
+	if err := qm.FinishMessage(ctx); err != nil {
+		t.Fatalf("finish query: %v", err)
+	}
+	rm := message.NewMessageFromStream(qs)
+	var results []*classad.ClassAd
+	for {
+		more, err := rm.GetInt(ctx)
+		if err != nil {
+			t.Fatalf("read result marker: %v", err)
+		}
+		if more == 0 {
+			break
+		}
+		ad, err := rm.GetClassAd(ctx)
+		if err != nil {
+			t.Fatalf("read result ad: %v", err)
+		}
+		results = append(results, ad)
+	}
+	qcl.Close()
+	if len(results) != 1 {
+		t.Fatalf("QUERY_STARTD_PVT_ADS returned %d ads, want 1", len(results))
+	}
+	// The returned private ad must carry the claim secret AND the Name/MyAddress
+	// copied from the public ad -- the (Name, MyAddress) key the negotiator uses
+	// to correlate it back to the public slot ad (MakeClaimIdHash).
+	got := results[0]
+	if cid, _ := got.EvaluateAttrString("ClaimId"); cid != "secret-claim-123" {
+		t.Errorf("queried private ad ClaimId = %q, want secret-claim-123", cid)
+	}
+	if name, _ := got.EvaluateAttrString("Name"); name != "slot1@a" {
+		t.Errorf("queried private ad Name = %q, want slot1@a (copied from public ad)", name)
+	}
+	if _, ok := got.EvaluateAttrString("MyAddress"); !ok {
+		t.Error("queried private ad missing MyAddress (should be copied from public ad)")
 	}
 }
 

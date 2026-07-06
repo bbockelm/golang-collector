@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
@@ -28,6 +29,11 @@ func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarse
 	for cmd, t := range queryCommands {
 		cs.Handle(cmd, queryHandler(st, t))
 	}
+	// QUERY_MULTIPLE_ADS / QUERY_MULTIPLE_PVT_ADS: one query ad names several
+	// target types (TargetType is a list) with optional per-type constraints; the
+	// negotiator uses these every cycle to fetch Submitter + Machine ads at once.
+	cs.Handle(commands.QUERY_MULTIPLE_ADS, multiQueryHandler(st))
+	cs.Handle(commands.QUERY_MULTIPLE_PVT_ADS, multiQueryHandler(st))
 	for cmd, t := range invalidateCommands {
 		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd))
 	}
@@ -45,19 +51,29 @@ func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarse
 // common case -- most clients send only the public ad and close) is fine.
 func updateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
-		text, err := message.NewMessageFromStream(c.Stream).GetClassAdRaw(ctx)
+		// Keep the connection open for follow-on updates on the same session:
+		// HTCondor daemons stream several updates down one persistent command
+		// socket (e.g. the schedd sends its schedd ad, then a submitter ad per
+		// user, each as another raw command int -- no re-authentication).
+		c.KeepAlive()
+
+		msg := adMessage(c)
+		text, err := msg.GetClassAdRaw(ctx)
 		if err != nil {
 			return err
 		}
 		if err := st.UpdateOldText(t, text); err != nil {
+			slog.Warn("collector: dropped update", "type", t.String(), "err", err)
 			return err
 		}
 		// Relay the public ad to any CONDOR_VIEW_HOST collectors (never the
 		// private ad below -- claim ids must not leak to a monitoring collector).
 		fwd.forwardText(cmd, text)
 		if t == store.StartdAd {
-			// Optional private ad follows; EOF (peer closed) means there is none.
-			if pvt, err := message.NewMessageFromStream(c.Stream).GetClassAdRaw(ctx); err == nil && pvt != "" {
+			// The startd's public and private ads arrive in the SAME message
+			// (finishUpdate puts both under one end_of_message), so read the
+			// optional private ad from that same message; io.EOF means none.
+			if pvt, err := msg.GetClassAdRaw(ctx); err == nil && pvt != "" {
 				if err := st.UpdatePvt(text, pvt); err != nil {
 					return err
 				}
@@ -65,6 +81,16 @@ func updateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) ced
 		}
 		return nil
 	}
+}
+
+// adMessage returns the message a handler should read its ad from: the message
+// the (follow-on) command integer was already read from, or a fresh message for
+// the first command (whose ad the peer sends as a separate message).
+func adMessage(c *cedarserver.Conn) *message.Message {
+	if c.Message != nil {
+		return c.Message
+	}
+	return message.NewMessageFromStream(c.Stream)
 }
 
 // ackUpdateHandler stores one ad and returns a one-int acknowledgment, for the
@@ -116,6 +142,54 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 				return err
 			}
 			n++
+		}
+		if err := resp.PutInt32(ctx, 0); err != nil {
+			return err
+		}
+		return resp.FlushFrame(ctx, true)
+	}
+}
+
+// multiQueryHandler serves QUERY_MULTIPLE_ADS / QUERY_MULTIPLE_PVT_ADS: the query
+// ad's TargetType is a comma-separated list of target types, each with an optional
+// per-type constraint (<Type>Requirements), projection and limit. It streams the
+// matching ads from every named table as one flat sequence -- PutInt32(1)+ad per
+// ad, PutInt32(0) terminator -- the same framing as a single-type query.
+//
+// The private-attr variant is served identically: the negotiator obtains startd
+// claim capabilities through the dedicated QUERY_STARTD_PVT_ADS command, so the
+// multi-query only needs the public ads of each target table.
+func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
+	return func(ctx context.Context, c *cedarserver.Conn) error {
+		queryAd, err := message.NewMessageFromStream(c.Stream).GetClassAd(ctx)
+		if err != nil {
+			return err
+		}
+		targets, _ := queryAd.EvaluateAttrString(attrTargetType)
+
+		resp := message.NewMessageForStream(c.Stream)
+		for _, target := range splitAttrs(targets) {
+			adType, ok := store.AdTypeForTarget(target)
+			if !ok {
+				continue // unknown target type: skip it, like the C++ collector
+			}
+			q, projection, limit, err := parseSubQuery(queryAd, target)
+			if err != nil {
+				return err
+			}
+			n := 0
+			for ad := range st.Query(adType, q) {
+				if limit > 0 && n >= limit {
+					break
+				}
+				if err := resp.PutInt32(ctx, 1); err != nil {
+					return err
+				}
+				if err := resp.PutClassAd(ctx, project(ad, projection)); err != nil {
+					return err
+				}
+				n++
+			}
 		}
 		if err := resp.PutInt32(ctx, 0); err != nil {
 			return err

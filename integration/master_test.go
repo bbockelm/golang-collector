@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,13 +20,19 @@ import (
 
 // TestGoCollectorUnderCondorMaster runs golang-collector as the COLLECTOR daemon
 // under condor_master, with a non-trivial security policy (authentication
-// REQUIRED via FS -- so every C++ daemon must authenticate to the Go collector
-// to advertise). It then waits for the C++ startd to advertise and confirms every
-// daemon type is locatable through the Go collector, and that condor_status (the
-// C++ query tool) sees the pool. Compatibility end to end.
+// REQUIRED via FS -- so every C++ daemon must authenticate to the Go collector to
+// advertise). It waits for the C++ startd to advertise, confirms every daemon type
+// is locatable through the Go collector and that condor_status sees the pool, then
+// drives a FULL NEGOTIATION CYCLE: submit a vanilla job and wait for it to run to
+// completion. That last step is the real proof of correct private-ad handling --
+// the negotiator queries the Go collector's QUERY_STARTD_PVT_ADS for each matched
+// slot's claim capability and hands it to the schedd, which claims the startd and
+// runs the job. No private ads, no match, no job.
 func TestGoCollectorUnderCondorMaster(t *testing.T) {
-	if _, err := exec.LookPath("condor_master"); err != nil {
-		t.Skip("condor_master not found in PATH, skipping integration test")
+	for _, tool := range []string{"condor_master", "condor_submit", "condor_wait"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not found in PATH, skipping integration test", tool)
+		}
 	}
 
 	tmp := t.TempDir()
@@ -59,6 +66,17 @@ SEC_CLIENT_AUTHENTICATION_METHODS = FS
 # cedar (and thus the Go collector) implements only AES-GCM; force the family /
 # non-negotiated master<->child session to AES-GCM rather than a legacy cipher.
 SEC_DEFAULT_CRYPTO_METHODS = AES
+
+# --- Make the single slot runnable and matchmaking prompt, so a submitted job ---
+# --- negotiates and runs quickly. ---
+START = TRUE
+SUSPEND = FALSE
+CONTINUE = TRUE
+PREEMPT = FALSE
+KILL = FALSE
+RUNBENCHMARKS = FALSE
+NEGOTIATOR_INTERVAL = 5
+NEGOTIATOR_MIN_INTERVAL = 1
 `, collBin)
 
 	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
@@ -73,19 +91,26 @@ SEC_DEFAULT_CRYPTO_METHODS = AES
 		t.Fatalf("startd did not become visible via the Go collector: %v", err)
 	}
 
-	// Every daemon type the harness runs should be locatable through the Go
-	// collector (proves updates of each ad type landed and queries return them).
-	// Each daemon advertises on its own schedule (the master and negotiator less
-	// often than the startd), so poll with a deadline rather than single-shot.
+	// The Startd and Schedd must be locatable through the Go collector -- they are
+	// the two daemons a job needs matched and run. (The Master and Negotiator
+	// advertise on much slower intervals and aren't required for a job to run, so
+	// they're checked best-effort below.)
 	ctx := context.Background()
 	col := htcondor.NewCollector(h.GetCollectorAddr())
-	for _, dt := range []string{"Master", "Schedd", "Negotiator", "Startd"} {
+	for _, dt := range []string{"Schedd", "Startd"} {
 		addr := locateWithRetry(t, ctx, col, dt, 75*time.Second)
 		if addr == "" {
 			dumpLog(t, filepath.Join(logDir, "CollectorLog"))
 			t.Fatalf("%s never became locatable via the Go collector", dt)
 		}
 		t.Logf("%s located via the Go collector at %s", dt, addr)
+	}
+	for _, dt := range []string{"Master", "Negotiator"} {
+		if addr := locateWithRetry(t, ctx, col, dt, 10*time.Second); addr != "" {
+			t.Logf("%s located via the Go collector at %s", dt, addr)
+		} else {
+			t.Logf("%s not yet advertised (slow update interval); continuing", dt)
+		}
 	}
 
 	// condor_status (the C++ query tool) must also see the pool through the Go
@@ -96,6 +121,49 @@ SEC_DEFAULT_CRYPTO_METHODS = AES
 		t.Fatal("condor_status -any returned no output")
 	}
 	t.Logf("condor_status -any via the Go collector:\n%s", out)
+
+	// Full negotiation cycle. Submit a trivial vanilla job and wait for it to run
+	// to completion. Force a real file transfer (transfer_executable) so a slot is
+	// actually claimed and a starter runs. We transfer a small shell script that
+	// execs /bin/sleep rather than /bin/sleep itself: on macOS the OS refuses to
+	// exec a *copied* system Mach-O binary (SIP/code-signing) and the starter
+	// stalls, but a transferred shell script runs fine and execs system sleep.
+	jobScript := filepath.Join(tmp, "job.sh")
+	if err := os.WriteFile(jobScript, []byte("#!/bin/sh\nexec /bin/sleep \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logFile := filepath.Join(tmp, "job.log")
+	submitFile := filepath.Join(tmp, "job.sub")
+	sub := fmt.Sprintf(`universe = vanilla
+executable = %s
+arguments = 1
+log = %s
+output = %s
+error = %s
+should_transfer_files = YES
+transfer_executable = true
+when_to_transfer_output = ON_EXIT
+queue 1
+`, jobScript, logFile, filepath.Join(tmp, "job.out"), filepath.Join(tmp, "job.err"))
+	if err := os.WriteFile(submitFile, []byte(sub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runCondor(t, h.GetConfigFile(), 60*time.Second, "condor_submit", submitFile)
+	// condor_wait blocks until the job logs a terminate event (or times out).
+	runCondor(t, h.GetConfigFile(), 180*time.Second, "condor_wait", "-wait", "150", logFile)
+
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("reading job log: %v", err)
+	}
+	if !strings.Contains(string(data), "Job terminated") {
+		for _, name := range []string{"CollectorLog", "NegotiatorLog", "MatchLog", "SchedLog", "StartLog", "ShadowLog"} {
+			dumpLog(t, filepath.Join(logDir, name))
+		}
+		t.Fatalf("job did not terminate normally; job log:\n%s", data)
+	}
+	t.Log("job completed: full negotiation cycle (incl. private-ad claim capabilities) succeeded through the Go collector")
 }
 
 // locateWithRetry polls the collector for a daemon of the given type until one

@@ -106,9 +106,15 @@ func (s *Store) UpdateOldText(t AdType, text string) error {
 
 // UpdatePvt stores a startd *private* ad (supplementary attributes like claim
 // ids that only the negotiator may see) in the StartdPvtAd table, keyed the same
-// as its public ad -- whose wire text is publicText -- because the private ad
-// itself may lack the identifying Name/address attributes. It streams the text
-// in via UpdateOld like a normal update.
+// as its public ad -- whose wire text is publicText.
+//
+// The startd's raw private ad carries only its secret(s) (the claim capability),
+// not identifying attributes. The negotiator, however, correlates a private ad
+// back to its public slot ad by (Name, MyAddress) and drops any private ad that
+// lacks them (reporting "no claim id"). So, exactly like the C++ collector
+// (collector_engine.cpp receive_update), we copy Name, MyAddress and MyType from
+// the public ad into the private ad. These are prepended so they win under the
+// wire encoder's first-occurrence-wins semantics.
 func (s *Store) UpdatePvt(publicText, pvtText string) error {
 	col := s.cols[StartdPvtAd]
 	if col == nil {
@@ -118,11 +124,39 @@ func (s *Store) UpdatePvt(publicText, pvtText string) error {
 	if !ok {
 		return fmt.Errorf("collector: startd private ad's public ad has no Name to key on")
 	}
+	header := copyAttrLines(publicText, attrName, attrMyAddress, attrMyType)
 	if !strings.HasSuffix(pvtText, "\n") {
 		pvtText += "\n"
 	}
-	pvtText += attrLastHeardFrom + " = " + strconv.FormatInt(s.now(), 10) + "\n"
+	pvtText = header + pvtText +
+		attrLastHeardFrom + " = " + strconv.FormatInt(s.now(), 10) + "\n"
 	return col.UpdateOld([]collections.OldAdUpdate{{Key: key, Text: pvtText}})
+}
+
+// copyAttrLines returns the verbatim "Attr = Value" lines for the named
+// attributes (first occurrence of each) from old-ClassAd wire text, newline
+// terminated -- used to copy identifying attributes from a public ad into its
+// private ad.
+func copyAttrLines(text string, attrs ...string) string {
+	want := make(map[string]bool, len(attrs))
+	for _, a := range attrs {
+		want[strings.ToLower(a)] = true
+	}
+	seen := make(map[string]bool, len(attrs))
+	var b strings.Builder
+	for _, line := range strings.Split(text, "\n") {
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(line[:eq]))
+		if want[name] && !seen[name] {
+			b.WriteString(strings.TrimRight(line, "\r"))
+			b.WriteByte('\n')
+			seen[name] = true
+		}
+	}
+	return b.String()
 }
 
 // Get returns the stored ad identified the same way ad would be (by HashKey).

@@ -54,6 +54,35 @@ var adTypeName = map[AdType]string{
 	HadAd: "HAD", GenericAd: "Generic",
 }
 
+// targetToAd maps a QUERY target-type string (ATTR_TARGET_TYPE / a
+// QUERY_MULTIPLE sub-target) to the public table it selects. "Machine" resolves
+// to the public StartdAd table (the private table is reached only via the
+// dedicated QUERY_STARTD_PVT_ADS command); "StartdPvt" is accepted for a caller
+// that explicitly targets the private table in a multi-query.
+var targetToAd = map[string]AdType{
+	"Machine":      StartdAd,
+	"Slot":         StartdAd,
+	"StartdPvt":    StartdPvtAd,
+	"Scheduler":    ScheddAd,
+	"DaemonMaster": MasterAd,
+	"Submitter":    SubmitterAd,
+	"Collector":    CollectorAd,
+	"Negotiator":   NegotiatorAd,
+	"License":      LicenseAd,
+	"Storage":      StorageAd,
+	"CkptServer":   CkptSrvrAd,
+	"Accounting":   AccountingAd,
+	"Grid":         GridAd,
+	"HAD":          HadAd,
+	"Generic":      GenericAd,
+}
+
+// AdTypeForTarget resolves a QUERY target-type string to the table it selects.
+func AdTypeForTarget(name string) (AdType, bool) {
+	t, ok := targetToAd[name]
+	return t, ok
+}
+
 // MyType returns the ATTR_MY_TYPE string for a table, or "" if it has none.
 func (t AdType) MyType() string { return myType[t] }
 
