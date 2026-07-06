@@ -119,6 +119,16 @@ func run() error {
 		startMetrics(ctx, addr, st, log)
 	}
 
+	// Periodically (re)train the ClassAd compression dictionary. A fresh
+	// collection stores ads uncompressed (identity codec); a dictionary trained
+	// over the live pool compresses similar ads several-fold (~6x on real startd
+	// ads), which is the difference between a compact collector and a fat one.
+	// COLLECTOR_DICT_RETRAIN_INTERVAL seconds (default 900); 0 disables.
+	if iv := configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute); iv > 0 {
+		log.Info(logging.DestinationGeneral, "dictionary auto-retraining enabled", "interval", iv.String())
+		defer st.StartAutoRetrain(iv, 50000)()
+	}
+
 	go housekeep(ctx, d.Config(), st, log)
 
 	log.Info(logging.DestinationGeneral, "golang-collector starting",

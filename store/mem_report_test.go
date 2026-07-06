@@ -111,18 +111,30 @@ func reportFootprint(t *testing.T, sample []*classad.ClassAd, ingest func(i int,
 	}
 	// The exported Stats() -- what the Prometheus metrics report -- should track
 	// the measured footprint closely, so a pool can be sized from the metric alone.
-	switch v := keep.(type) {
-	case *Store:
-		for at, cs := range v.Stats() {
+	if st, ok := keep.(*Store); ok {
+		for at, cs := range st.Stats() {
 			if cs.Ads > 0 {
-				t.Logf("  Stats() metric [%s]: arena_bytes=%s live_bytes=%s dead_bytes=%s segments=%d",
-					at, humanBytes(cs.ArenaBytes), humanBytes(cs.LiveBytes()), humanBytes(cs.DeadBytes), cs.Segments)
+				t.Logf("  before dict [%s]: live_bytes=%s (%.0f/ad) arena_bytes=%s segments=%d",
+					at, humanBytes(cs.LiveBytes()), float64(cs.LiveBytes())/float64(cs.Ads),
+					humanBytes(cs.ArenaBytes), cs.Segments)
 			}
 		}
-	case *collections.Collection:
-		cs := v.Stats()
-		t.Logf("  Stats() metric: arena_bytes=%s live_bytes=%s dead_bytes=%s segments=%d",
-			humanBytes(cs.ArenaBytes), humanBytes(cs.LiveBytes()), humanBytes(cs.DeadBytes), cs.Segments)
+		// A fresh collection uses the identity (no-compression) codec. Train a
+		// ZSTD dictionary over the real ads and recompact, then re-measure -- this
+		// is what the collector must do to realize the collection's compression.
+		st.RetrainDict(50_000)
+		runtime.GC()
+		debug.FreeOSMemory()
+		afterDictRSS := rss(t)
+		t.Logf("  after RetrainDict: RSS %s (growth from empty %s)",
+			humanBytes(afterDictRSS), humanBytes(afterDictRSS-baseRSS))
+		for at, cs := range st.Stats() {
+			if cs.Ads > 0 {
+				t.Logf("  after dict [%s]: live_bytes=%s (%.0f/ad) arena_bytes=%s segments=%d",
+					at, humanBytes(cs.LiveBytes()), float64(cs.LiveBytes())/float64(cs.Ads),
+					humanBytes(cs.ArenaBytes), cs.Segments)
+			}
+		}
 	}
 	runtime.KeepAlive(keep)
 }

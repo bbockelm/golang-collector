@@ -159,6 +159,40 @@ func copyAttrLines(text string, attrs ...string) string {
 	return b.String()
 }
 
+// RetrainDict retrains each table's ZSTD dictionary from a sample of up to
+// sampleMax of its live ads and recompacts under the new codec. A fresh
+// collection starts with the identity (no-compression) codec; training a
+// dictionary over the real ad population is what unlocks the collection's
+// compression, so the collector should call this once enough ads have arrived
+// and periodically thereafter (see StartAutoRetrain).
+func (s *Store) RetrainDict(sampleMax int) {
+	for _, col := range s.cols {
+		if col != nil {
+			_, _ = col.RetrainDict(sampleMax)
+		}
+	}
+}
+
+// StartAutoRetrain starts periodic ZSTD dictionary retraining on every table in
+// a background goroutine, and returns a stop function (which blocks until the
+// goroutines exit). Without this the collection stays on the identity codec and
+// stores ads uncompressed; a dictionary trained over the real ad population
+// compresses a pool of similar ads several-fold. hotTopN is 0 here because the
+// collector front-loads a fixed hot-attribute set rather than auto-tuning it.
+func (s *Store) StartAutoRetrain(interval time.Duration, sampleMax int) func() {
+	stops := make([]func(), 0, len(s.cols))
+	for _, col := range s.cols {
+		if col != nil {
+			stops = append(stops, col.StartAutoRetrain(interval, sampleMax, 0))
+		}
+	}
+	return func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}
+}
+
 // Stats returns per-table storage statistics (ad counts and compressed byte
 // footprint) for every storage table, for observability / metrics. Only tables
 // that hold ads are included.
