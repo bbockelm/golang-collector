@@ -23,7 +23,7 @@ import (
 // the same client, workload and (plaintext) security.
 func startPlaintextGoCollector(tb testing.TB) (addr string, stop func()) {
 	tb.Helper()
-	srv := New(store.New(), plaintextSec())
+	srv := New(store.New(), plaintextSec(), nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatal(err)

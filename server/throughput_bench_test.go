@@ -61,7 +61,7 @@ func startEncryptedCollector(tb testing.TB) (addr string, stop func()) {
 			tb.Fatal(err)
 		}
 	}
-	srv := New(st, encryptedSec())
+	srv := New(st, encryptedSec(), nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatal(err)

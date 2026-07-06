@@ -38,9 +38,14 @@ func mustAd(tb testing.TB, s string) *classad.ClassAd {
 
 // startCollector stands up the collector server on a random localhost port.
 func startCollector(t *testing.T) (*store.Store, string, func()) {
+	return startCollectorFwd(t, nil)
+}
+
+// startCollectorFwd is startCollector with an optional view-forwarder attached.
+func startCollectorFwd(t *testing.T, fwd *Forwarder) (*store.Store, string, func()) {
 	t.Helper()
 	st := store.New()
-	srv := New(st, plaintextSec())
+	srv := New(st, plaintextSec(), fwd)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +152,55 @@ func TestStartdPrivateAd(t *testing.T) {
 	if cid, _ := pvt.EvaluateAttrString("ClaimId"); cid != "secret-claim-123" {
 		t.Errorf("private ad ClaimId = %q, want secret-claim-123", cid)
 	}
+}
+
+// TestViewForwarding verifies CONDOR_VIEW_HOST forwarding: an update advertised
+// to the primary collector is relayed to the view collector, and an invalidation
+// is relayed too. Forwarding is asynchronous, so we poll the view collector.
+func TestViewForwarding(t *testing.T) {
+	// View collector (the forwarding target).
+	viewStore, viewAddr, stopView := startCollector(t)
+	defer stopView()
+
+	// Primary collector forwarding to the view collector.
+	fwd := NewForwarder([]string{viewAddr}, plaintextSec())
+	_, primaryAddr, stopPrimary := startCollectorFwd(t, fwd)
+	defer stopPrimary()
+
+	ctx, cancel := context.WithTimeout(htcondor.WithSecurityConfig(context.Background(), plaintextSec()), 10*time.Second)
+	defer cancel()
+
+	col := htcondor.NewCollector(primaryAddr)
+	ad := mustAd(t, `[MyType="Machine"; Name="fwd@host"; MyAddress="<1.2.3.4:5>"; Cpus=8]`)
+	if err := col.Advertise(ctx, ad, &htcondor.AdvertiseOptions{Command: commands.UPDATE_STARTD_AD}); err != nil {
+		t.Fatalf("advertise to primary: %v", err)
+	}
+
+	// The ad should propagate to the view collector.
+	if !waitFor(2*time.Second, func() bool { return viewStore.Len(store.StartdAd) == 1 }) {
+		t.Fatalf("update not forwarded to view collector (view has %d ads)", viewStore.Len(store.StartdAd))
+	}
+
+	// Now invalidate on the primary; the view collector should drop it too.
+	inv := mustAd(t, `[MyType="Query"; TargetType="Machine"; Requirements = Name == "fwd@host"]`)
+	if err := col.Advertise(ctx, inv, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_STARTD_ADS}); err != nil {
+		t.Fatalf("invalidate on primary: %v", err)
+	}
+	if !waitFor(2*time.Second, func() bool { return viewStore.Len(store.StartdAd) == 0 }) {
+		t.Fatalf("invalidation not forwarded to view collector (view still has %d ads)", viewStore.Len(store.StartdAd))
+	}
+}
+
+// waitFor polls cond until it is true or the timeout elapses.
+func waitFor(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
 }
 
 // TestRoundTripAdvertiseQuery drives the real htcondor.Collector client against

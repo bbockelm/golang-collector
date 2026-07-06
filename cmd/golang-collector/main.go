@@ -67,7 +67,12 @@ func run() error {
 		return fmt.Errorf("building security config: %w", err)
 	}
 
-	srv := server.New(st, sec)
+	// View forwarding: relay updates/invalidations to CONDOR_VIEW_HOST collectors
+	// (excluding ourselves, so a CONDOR_VIEW_HOST that names this collector -- a
+	// common default -- does not create a forwarding loop).
+	fwd := server.NewForwarder(viewHosts(cfg), sec)
+
+	srv := server.New(st, sec, fwd)
 	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
 	d.RegisterDefaultCommands(srv)
 
@@ -117,6 +122,25 @@ func housekeep(ctx context.Context, cfg *config.Config, st *store.Store, log *lo
 			}
 		}
 	}
+}
+
+// viewHosts returns the CONDOR_VIEW_HOST collector addresses to forward to,
+// comma/space separated, with any entry equal to our own COLLECTOR_HOST dropped
+// (a self-reference would forward every ad back to ourselves in a loop).
+func viewHosts(cfg *config.Config) []string {
+	raw, ok := cfg.Get("CONDOR_VIEW_HOST")
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	self, _ := cfg.Get("COLLECTOR_HOST")
+	self = strings.TrimSpace(self)
+	var hosts []string
+	for _, h := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if h != "" && h != self {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
 }
 
 // writeAddressFile publishes the collector's command address to

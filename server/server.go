@@ -14,20 +14,22 @@ import (
 // New builds a cedar command-dispatch server that serves the collector protocol
 // against st: UPDATE_*_AD commands feed the store, QUERY_*_ADS scan it, and
 // INVALIDATE_*_ADS prune it. sec is the CEDAR security policy (may be a
-// plaintext/no-auth config for testing). The returned server is ready to Serve.
-func New(st *store.Store, sec *security.SecurityConfig) *cedarserver.Server {
+// plaintext/no-auth config for testing). fwd, if non-nil, relays every update and
+// invalidation on to the configured CONDOR_VIEW_HOST collectors (a nil fwd
+// forwards nothing). The returned server is ready to Serve.
+func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarserver.Server {
 	cs := cedarserver.New(sec)
 	for cmd, t := range updateCommands {
-		cs.Handle(cmd, updateHandler(st, t))
+		cs.Handle(cmd, updateHandler(st, t, cmd, fwd))
 	}
 	// UPDATE_STARTD_AD_WITH_ACK: the sender blocks for a one-int acknowledgment
 	// that the ad was stored.
-	cs.Handle(commands.UPDATE_STARTD_AD_WITH_ACK, ackUpdateHandler(st, store.StartdAd))
+	cs.Handle(commands.UPDATE_STARTD_AD_WITH_ACK, ackUpdateHandler(st, store.StartdAd, fwd))
 	for cmd, t := range queryCommands {
 		cs.Handle(cmd, queryHandler(st, t))
 	}
 	for cmd, t := range invalidateCommands {
-		cs.Handle(cmd, invalidateHandler(st, t))
+		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd))
 	}
 	return cs
 }
@@ -41,7 +43,7 @@ func New(st *store.Store, sec *security.SecurityConfig) *cedarserver.Server {
 // connection (claim ids etc. that only the negotiator may query); it is stored
 // in the StartdPvtAd table keyed the same as the public ad. Its absence (the
 // common case -- most clients send only the public ad and close) is fine.
-func updateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
+func updateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		text, err := message.NewMessageFromStream(c.Stream).GetClassAdRaw(ctx)
 		if err != nil {
@@ -50,6 +52,9 @@ func updateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 		if err := st.UpdateOldText(t, text); err != nil {
 			return err
 		}
+		// Relay the public ad to any CONDOR_VIEW_HOST collectors (never the
+		// private ad below -- claim ids must not leak to a monitoring collector).
+		fwd.forwardText(cmd, text)
 		if t == store.StartdAd {
 			// Optional private ad follows; EOF (peer closed) means there is none.
 			if pvt, err := message.NewMessageFromStream(c.Stream).GetClassAdRaw(ctx); err == nil && pvt != "" {
@@ -64,7 +69,7 @@ func updateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 
 // ackUpdateHandler stores one ad and returns a one-int acknowledgment, for the
 // UPDATE_*_WITH_ACK commands whose sender blocks until the collector confirms.
-func ackUpdateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
+func ackUpdateHandler(st *store.Store, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		msg := message.NewMessageFromStream(c.Stream)
 		text, err := msg.GetClassAdRaw(ctx)
@@ -74,6 +79,7 @@ func ackUpdateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 		if err := st.UpdateOldText(t, text); err != nil {
 			return err
 		}
+		fwd.forwardText(commands.UPDATE_STARTD_AD, text)
 		ack := message.NewMessageForStream(c.Stream)
 		if err := ack.PutInt32(ctx, 1); err != nil {
 			return err
@@ -120,7 +126,7 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 
 // invalidateHandler reads an invalidation ad and removes matching ads: by its
 // Requirements constraint if present, otherwise the single ad it identifies.
-func invalidateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
+func invalidateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		msg := message.NewMessageFromStream(c.Stream)
 		ad, err := msg.GetClassAd(ctx)
@@ -136,6 +142,8 @@ func invalidateHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc 
 		} else {
 			st.Invalidate(t, q, nil)
 		}
+		// Relay the invalidation so view collectors drop the same ads.
+		fwd.forward(cmd, ad)
 		return nil
 	}
 }
