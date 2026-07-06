@@ -18,6 +18,9 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/commands"
+	"github.com/bbockelm/cedar/security"
+	cedarserver "github.com/bbockelm/cedar/server"
+	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -98,6 +101,14 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Optional embedded CCB server (ENABLE_CCB_SERVER), sharing this collector's
+	// command socket exactly like the C++ collector: NAT'd daemons register here
+	// and public clients reach them by connection reversal brokered through us.
+	if err := maybeStartEmbeddedCCB(ctx, d, cfg, sec, srv, collectorAddr(d, ln)); err != nil {
+		return err
+	}
+
 	go housekeep(ctx, d.Config(), st, log)
 
 	log.Info(logging.DestinationGeneral, "golang-collector starting",
@@ -156,15 +167,59 @@ func writeAddressFile(d *daemon.Daemon, cfg *config.Config, ln net.Listener) str
 		}
 		path = filepath.Join(logDir, ".collector_address")
 	}
-	addr := ln.Addr().String()
-	if sinful, ok := d.AdvertisedSinful(); ok {
-		addr = sinful
-	}
-	if err := os.WriteFile(path, []byte("<"+addr+">\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("<"+collectorAddr(d, ln)+">\n"), 0o644); err != nil {
 		slog.Warn("could not write collector address file", "path", path, "err", err)
 		return ""
 	}
 	return path
+}
+
+// collectorAddr is this collector's externally reachable command address: the
+// shared-port sinful when running under condor_master, otherwise the plain listen
+// address.
+func collectorAddr(d *daemon.Daemon, ln net.Listener) string {
+	if sinful, ok := d.AdvertisedSinful(); ok {
+		return sinful
+	}
+	return ln.Addr().String()
+}
+
+// maybeStartEmbeddedCCB starts an embedded CCB server on the collector's own
+// command socket when ENABLE_CCB_SERVER is set, mirroring the C++ collector. It
+// registers the CCB handlers onto srv (so CCB commands arrive on the shared port)
+// and starts CCB background maintenance under ctx. pubAddr is the collector's
+// reachable address, used to build the "<addr>#<id>" CCB contact strings.
+func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Config, sec *security.SecurityConfig, srv *cedarserver.Server, pubAddr string) error {
+	if !configBool(cfg, "ENABLE_CCB_SERVER", false) {
+		return nil
+	}
+	ccbSrv, err := ccbserver.New(ccbserver.Config{
+		PublicAddress: pubAddr,
+		Security:      sec,
+		Logger:        d.Slog(),
+	})
+	if err != nil {
+		return fmt.Errorf("embedded CCB server: %w", err)
+	}
+	ccbSrv.RegisterOn(srv)
+	ccbSrv.StartBackground(ctx)
+	slog.Info("embedded CCB server enabled", "public_address", pubAddr)
+	return nil
+}
+
+// configBool reads an HTCondor boolean knob (true/t/yes/1, case-insensitive).
+func configBool(cfg *config.Config, key string, def bool) bool {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "t", "yes", "y", "1":
+		return true
+	case "false", "f", "no", "n", "0":
+		return false
+	}
+	return def
 }
 
 // collectorListenAddr picks the fallback TCP bind address when not inheriting a

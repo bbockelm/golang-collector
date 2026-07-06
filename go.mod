@@ -6,7 +6,8 @@ require (
 	github.com/PelicanPlatform/classad v0.1.0
 	github.com/PelicanPlatform/classad/collections v0.0.0
 	github.com/bbockelm/cedar v0.1.2
-	github.com/bbockelm/golang-htcondor v0.0.0-00010101000000-000000000000
+	github.com/bbockelm/golang-ccb v0.0.0-00010101000000-000000000000
+	github.com/bbockelm/golang-htcondor v0.2.1
 )
 
 require (
@@ -31,5 +32,6 @@ replace (
 	github.com/PelicanPlatform/classad => /Users/bbockelm/projects/golang-classads
 	github.com/PelicanPlatform/classad/collections => /Users/bbockelm/projects/golang-classads/collections
 	github.com/bbockelm/cedar => /Users/bbockelm/projects/golang-cedar
+	github.com/bbockelm/golang-ccb => /Users/bbockelm/projects/golang-ccb
 	github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor
 )
