@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	"github.com/bbockelm/golang-collector/metrics"
 	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
 )
@@ -44,6 +46,7 @@ func run() error {
 	// our launch. -local-name additionally scopes config lookups.
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
+	metricsAddr := flag.String("metrics", "", "if set (e.g. \":9720\"), serve Prometheus metrics at /metrics on this address; overrides COLLECTOR_METRICS_ADDRESS")
 	flag.Parse()
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "COLLECTOR", LocalName: *localName})
@@ -107,6 +110,13 @@ func run() error {
 	// and public clients reach them by connection reversal brokered through us.
 	if err := maybeStartEmbeddedCCB(ctx, d, cfg, sec, srv, collectorAddr(d, ln)); err != nil {
 		return err
+	}
+
+	// Optional Prometheus metrics endpoint reporting the compressed storage
+	// footprint per ad type (plus Go/process metrics), so a pool can be sized from
+	// live numbers rather than a profiler.
+	if addr := metricsListenAddr(cfg, *metricsAddr); addr != "" {
+		startMetrics(ctx, addr, st, log)
 	}
 
 	go housekeep(ctx, d.Config(), st, log)
@@ -220,6 +230,37 @@ func configBool(cfg *config.Config, key string, def bool) bool {
 		return false
 	}
 	return def
+}
+
+// metricsListenAddr resolves the Prometheus metrics listen address: the -metrics
+// flag if set, else the COLLECTOR_METRICS_ADDRESS config knob, else "" (disabled).
+func metricsListenAddr(cfg *config.Config, flagAddr string) string {
+	if flagAddr != "" {
+		return flagAddr
+	}
+	if v, ok := cfg.Get("COLLECTOR_METRICS_ADDRESS"); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// startMetrics serves the collector's Prometheus metrics at /metrics on addr
+// until ctx is cancelled. Bind failures are logged, not fatal -- metrics are
+// observability, not core function.
+func startMetrics(ctx context.Context, addr string, st *store.Store, log *logging.Logger) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler(st))
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error(logging.DestinationGeneral, "metrics endpoint stopped", "err", err.Error())
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
 }
 
 // collectorListenAddr picks the fallback TCP bind address when not inheriting a

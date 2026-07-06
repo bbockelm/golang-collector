@@ -159,6 +159,19 @@ func copyAttrLines(text string, attrs ...string) string {
 	return b.String()
 }
 
+// Stats returns per-table storage statistics (ad counts and compressed byte
+// footprint) for every storage table, for observability / metrics. Only tables
+// that hold ads are included.
+func (s *Store) Stats() map[AdType]collections.Stats {
+	out := make(map[AdType]collections.Stats, len(s.cols))
+	for t, col := range s.cols {
+		if col != nil {
+			out[t] = col.Stats()
+		}
+	}
+	return out
+}
+
 // Get returns the stored ad identified the same way ad would be (by HashKey).
 func (s *Store) Get(t AdType, ad *classad.ClassAd) (*classad.ClassAd, bool) {
 	col := s.cols[t]
