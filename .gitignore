@@ -1,0 +1,7 @@
+# Built binaries
+/golang-collector
+/cmd/golang-collector/golang-collector
+# Test / build artifacts
+*.test
+*.out
+/build/
