@@ -131,17 +131,35 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
-		for ad := range st.Query(t, q) {
-			if limit > 0 && n >= limit {
-				break
+		if len(projection) == 0 {
+			// Fast path: no projection means whole ads, so stream them straight
+			// from the stored wire form (PutClassAdRaw) without decoding each into
+			// a *classad.ClassAd -- ~2x faster on realistic ads.
+			for ra := range st.QueryRaw(t, q) {
+				if limit > 0 && n >= limit {
+					break
+				}
+				if err := resp.PutInt32(ctx, 1); err != nil {
+					return err
+				}
+				if err := resp.PutClassAdRaw(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
+					return err
+				}
+				n++
 			}
-			if err := resp.PutInt32(ctx, 1); err != nil {
-				return err
+		} else {
+			for ad := range st.Query(t, q) {
+				if limit > 0 && n >= limit {
+					break
+				}
+				if err := resp.PutInt32(ctx, 1); err != nil {
+					return err
+				}
+				if err := resp.PutClassAd(ctx, project(ad, projection)); err != nil {
+					return err
+				}
+				n++
 			}
-			if err := resp.PutClassAd(ctx, project(ad, projection)); err != nil {
-				return err
-			}
-			n++
 		}
 		if err := resp.PutInt32(ctx, 0); err != nil {
 			return err

@@ -251,6 +251,39 @@ func (s *Store) queryOne(t AdType, q *vm.Query) iter.Seq[*classad.ClassAd] {
 	return col.Query(q)
 }
 
+// QueryRaw is Query, but yields each matching ad as collections.RawAd -- the
+// old-ClassAd expression strings decoded straight from the stored form with no
+// AST -- for streaming a result set to the wire via message.PutClassAdRaw. It is
+// used only when the query has no projection (raw ads are whole ads).
+func (s *Store) QueryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+	if t == AnyAd {
+		return func(yield func(collections.RawAd) bool) {
+			for at := AnyAd + 1; at < numAdTypes; at++ {
+				if at == StartdPvtAd {
+					continue // private ads are never returned by an ANY query
+				}
+				for ra := range s.queryOneRaw(at, q) {
+					if !yield(ra) {
+						return
+					}
+				}
+			}
+		}
+	}
+	return s.queryOneRaw(t, q)
+}
+
+func (s *Store) queryOneRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+	col := s.cols[t]
+	if col == nil {
+		return func(func(collections.RawAd) bool) {}
+	}
+	if q == nil {
+		return col.ScanRaw()
+	}
+	return col.QueryRaw(q)
+}
+
 // Invalidate removes ads from table t. If a constraint q is given, every ad it
 // matches is removed; otherwise the single ad identified by keyAd (by HashKey)
 // is removed. It returns the number of ads removed.
