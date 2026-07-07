@@ -142,7 +142,7 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 				if err := resp.PutInt32(ctx, 1); err != nil {
 					return err
 				}
-				if err := resp.PutClassAdRaw(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
+				if err := resp.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
 					return err
 				}
 				n++
