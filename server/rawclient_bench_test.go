@@ -102,6 +102,63 @@ func BenchmarkRawClientRead(b *testing.B) {
 		b.StopTimer()
 		reportAds(b, ads)
 	})
+
+	// drain-client does not decode the response at all: it consumes each ad off
+	// the wire with SkipClassAdRaw (no per-expression string, no ad text). The
+	// client is now as cheap as the protocol allows, so this measures the SERVER's
+	// serialization ceiling with the client removed as a variable.
+	b.Run("drain-client", func(b *testing.B) {
+		b.ResetTimer()
+		var ads int64
+		for i := 0; i < b.N; i++ {
+			nads, err := drainQueryRead(addr, q)
+			if err != nil {
+				b.Fatal(err)
+			}
+			ads += int64(nads)
+		}
+		b.StopTimer()
+		reportAds(b, ads)
+	})
+}
+
+// drainQueryRead runs a query and discards each response ad with SkipClassAdRaw,
+// never materializing its text -- the cheapest possible client, used to isolate
+// server throughput.
+func drainQueryRead(addr string, queryAd *classad.ClassAd) (int, error) {
+	ctx := context.Background()
+	sec := plaintextSec()
+	sec.Command = commands.QUERY_STARTD_ADS
+	cl, err := client.ConnectAndAuthenticate(ctx, addr, sec)
+	if err != nil {
+		return 0, err
+	}
+	defer cl.Close()
+	st := cl.GetStream()
+
+	req := message.NewMessageForStream(st)
+	if err := req.PutClassAd(ctx, queryAd); err != nil {
+		return 0, err
+	}
+	if err := req.FinishMessage(ctx); err != nil {
+		return 0, err
+	}
+
+	resp := message.NewMessageFromStream(st)
+	n := 0
+	for {
+		more, err := resp.GetInt(ctx)
+		if err != nil {
+			return n, err
+		}
+		if more == 0 {
+			return n, nil
+		}
+		if err := resp.SkipClassAdRaw(ctx); err != nil { // consume, do not decode
+			return n, err
+		}
+		n++
+	}
 }
 
 // rawQueryRead runs a query and reads the response ads as raw wire text
