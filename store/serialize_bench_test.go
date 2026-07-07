@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,26 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/stream"
 )
+
+// stripLastHeardFrom removes a LastHeardFrom line from old-ClassAd text. The
+// collector stamps LastHeardFrom on receipt, so a startd never sends one; corpus
+// ads captured via `condor_status -l` already carry it, which -- combined with the
+// store's unconditional re-stamp -- makes markSeen see a duplicate and fall back to
+// a full classad.ParseOld re-parse (~6x slower, ~8x more allocs than the streaming
+// fast path a real update takes). Stripping it makes the benchmark measure
+// production ingest.
+func stripLastHeardFrom(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "LastHeardFrom ") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
 
 // BenchmarkIngestScaling measures how concurrent ad ingest scales across cores with
 // NO network: g goroutines each re-advertise their own set of distinct-keyed ads
@@ -38,7 +59,7 @@ func BenchmarkIngestScaling(b *testing.B) {
 				texts := make([]string, perG)
 				for i := range texts {
 					ad := mutate(sample[i%len(sample)], w*perG+i, rng)
-					texts[i] = ad.MarshalOld()
+					texts[i] = stripLastHeardFrom(ad.MarshalOld())
 					_ = st.UpdateOldText(StartdAd, texts[i])
 				}
 				textByG[w] = texts
