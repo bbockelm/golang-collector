@@ -20,6 +20,19 @@ import (
 // forwards nothing). The returned server is ready to Serve.
 func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarserver.Server {
 	cs := cedarserver.New(sec)
+	Register(cs, st, fwd)
+	return cs
+}
+
+// Register adds the collector protocol handlers -- UPDATE_*_AD (feed the store),
+// QUERY_*_ADS (scan it), INVALIDATE_*_ADS (prune it), the multi-ad queries, and the
+// ack'd update -- to an existing cedar command-dispatch server. A host daemon that
+// wants to serve the collector on its own already-established command socket
+// registers here (see the embeddable Collector's RegisterOn); New wraps this for the
+// standalone case. fwd, if non-nil, relays updates/invalidations to CONDOR_VIEW_HOST
+// collectors. It registers only the collector protocol; DC_* default commands (NOP,
+// CONFIG_VAL, ...) are the host's responsibility.
+func Register(cs *cedarserver.Server, st *store.Store, fwd *Forwarder) {
 	for cmd, t := range updateCommands {
 		cs.Handle(cmd, updateHandler(st, t, cmd, fwd))
 	}
@@ -37,7 +50,6 @@ func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarse
 	for cmd, t := range invalidateCommands {
 		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd))
 	}
-	return cs
 }
 
 // updateHandler stores one ad update into table t. Each ad is its own command

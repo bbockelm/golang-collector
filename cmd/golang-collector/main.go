@@ -27,8 +27,8 @@ import (
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	collector "github.com/bbockelm/golang-collector"
 	"github.com/bbockelm/golang-collector/metrics"
-	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
 )
 
@@ -64,8 +64,6 @@ func run() error {
 	// Route cedar's security/server slog output into CollectorLog.
 	slog.SetDefault(d.Slog())
 
-	st := store.New()
-
 	// Server-side security policy from the HTCondor configuration (SEC_* knobs),
 	// so this collector authenticates and encrypts exactly like the C++ one.
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), commands.QUERY_STARTD_ADS, "DAEMON")
@@ -73,12 +71,23 @@ func run() error {
 		return fmt.Errorf("building security config: %w", err)
 	}
 
-	// View forwarding: relay updates/invalidations to CONDOR_VIEW_HOST collectors
-	// (excluding ourselves, so a CONDOR_VIEW_HOST that names this collector -- a
-	// common default -- does not create a forwarding loop).
-	fwd := server.NewForwarder(viewHosts(cfg), sec)
-
-	srv := server.New(st, sec, fwd)
+	// The collector core -- store, protocol handlers, CONDOR_VIEW_HOST forwarding,
+	// and background dictionary retraining + ad expiry -- exactly as the embeddable
+	// collector library provides it. This daemon wraps it with the condor_master
+	// glue: config, logging, the command socket, the address file, DC_* commands,
+	// metrics, and the embedded CCB.
+	c, err := collector.New(collector.Config{
+		Security:            sec,
+		ViewHosts:           viewHosts(cfg),
+		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
+		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
+		ExpireInterval:      configSeconds(cfg, "COLLECTOR_UPDATE_INTERVAL", 900*time.Second),
+		Logger:              d.Slog(),
+	})
+	if err != nil {
+		return err
+	}
+	st, srv := c.Store(), c.Server()
 	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
 	d.RegisterDefaultCommands(srv)
 
@@ -119,48 +128,15 @@ func run() error {
 		startMetrics(ctx, addr, st, log)
 	}
 
-	// Periodically (re)train the ClassAd compression dictionary. A fresh
-	// collection stores ads uncompressed (identity codec); a dictionary trained
-	// over the live pool compresses similar ads several-fold (~6x on real startd
-	// ads), which is the difference between a compact collector and a fat one.
-	// COLLECTOR_DICT_RETRAIN_INTERVAL seconds (default 900); 0 disables.
-	//
-	// COLLECTOR_DICT_SAMPLE_SIZE bounds how many ads are decoded to train the
-	// dictionary. This is the dominant transient cost of a retrain: the trainer
-	// holds that many decoded ads at once (~16 KB each), so 50k samples is a
-	// ~800 MiB spike -- for no better compression than a few thousand. Keep it
-	// small (default 4000).
-	if iv := configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute); iv > 0 {
-		sampleN := configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000)
-		log.Info(logging.DestinationGeneral, "dictionary auto-retraining enabled",
-			"interval", iv.String(), "sample_size", sampleN)
-		defer st.StartAutoRetrain(iv, sampleN)()
-	}
-
-	go housekeep(ctx, d.Config(), st, log)
+	// Background maintenance -- dictionary retraining (COLLECTOR_DICT_RETRAIN_INTERVAL,
+	// COLLECTOR_DICT_SAMPLE_SIZE) and ad expiry (COLLECTOR_UPDATE_INTERVAL) -- on the
+	// intervals passed to collector.New above.
+	defer c.StartBackground(ctx)()
 
 	log.Info(logging.DestinationGeneral, "golang-collector starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
 	return d.Serve(ctx, ln, srv.Serve)
-}
-
-// housekeep periodically reaps ads whose ATTR_LAST_HEARD_FROM + lifetime has
-// passed, on the COLLECTOR_UPDATE_INTERVAL timer (matching the C++ collector).
-func housekeep(ctx context.Context, cfg *config.Config, st *store.Store, log *logging.Logger) {
-	interval := configSeconds(cfg, "COLLECTOR_UPDATE_INTERVAL", 900*time.Second)
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if n := st.Expire(); n > 0 {
-				log.Info(logging.DestinationGeneral, "reaped expired ads", "count", n)
-			}
-		}
-	}
 }
 
 // viewHosts returns the CONDOR_VIEW_HOST collector addresses to forward to,

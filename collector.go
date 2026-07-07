@@ -1,0 +1,184 @@
+// Package collector is an embeddable HTCondor condor_collector: an in-memory,
+// compressed, indexed ClassAd store served over the CEDAR collector protocol
+// (UPDATE_*/QUERY_*/INVALIDATE_*_ADS, multi-ad queries, ack'd updates, private
+// startd ads).
+//
+// It can run standalone (Serve on a listener) or be embedded in another daemon by
+// registering its command handlers onto a cedar command-dispatch server the host
+// already owns -- so a host can serve the collector protocol on its own shared
+// command socket, the way the C++ collector is embedded in condor_master-managed
+// daemons. This mirrors the embeddable golang-ccb server.
+//
+//	c, err := collector.New(collector.Config{Security: sec})
+//	if err != nil { ... }
+//	stop := c.StartBackground(ctx)   // dictionary retrain + ad expiry
+//	defer stop()
+//
+//	// standalone:
+//	c.Serve(ctx, listener)
+//
+//	// embedded, sharing a host's cedar command server:
+//	c.RegisterOn(hostServer)
+package collector
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/bbockelm/cedar/security"
+	cedarserver "github.com/bbockelm/cedar/server"
+
+	"github.com/bbockelm/golang-collector/server"
+	"github.com/bbockelm/golang-collector/store"
+)
+
+// Config configures an embeddable Collector.
+type Config struct {
+	// Security is the CEDAR server-side security policy applied to the Collector's
+	// own command server (used by Serve and by New's internal server). It may be a
+	// plaintext/no-auth config. Required. When embedding via RegisterOn, the host
+	// server's own security policy governs the shared socket instead.
+	Security *security.SecurityConfig
+
+	// ViewHosts are CONDOR_VIEW_HOST collector addresses to relay every update and
+	// invalidation to (never private startd ads). Optional; nil forwards nothing.
+	ViewHosts []string
+
+	// DictRetrainInterval, if > 0, is how often StartBackground retrains the ClassAd
+	// compression dictionary over up to DictSampleSize stored ads. A fresh store
+	// keeps ads uncompressed (identity codec) until the first retrain, after which a
+	// dictionary trained on the live pool compresses similar ads several-fold.
+	DictRetrainInterval time.Duration
+
+	// DictSampleSize bounds how many ads are decoded to train the dictionary
+	// (default 4000). This is the dominant transient cost of a retrain, so keep it
+	// modest.
+	DictSampleSize int
+
+	// ExpireInterval, if > 0, is how often StartBackground reaps ads whose
+	// ATTR_LAST_HEARD_FROM + lifetime has passed (the collector's ClassAd timeout).
+	ExpireInterval time.Duration
+
+	// Authorizer, if set, is installed on the Collector's own command server to
+	// enforce per-command HTCondor ALLOW_/DENY_ authorization. Optional; nil allows
+	// any authenticated peer (the Security authentication policy still applies).
+	// When embedding via RegisterOn, set the authorizer on the host server instead.
+	Authorizer func(perm, peerAddr, user string) bool
+
+	// Logger for operational logging (default slog.Default()).
+	Logger *slog.Logger
+}
+
+// Collector is an embeddable collector: a ClassAd store plus the CEDAR collector
+// protocol handlers, with optional CONDOR_VIEW_HOST forwarding and background
+// dictionary retraining and ad expiry.
+type Collector struct {
+	cfg   Config
+	log   *slog.Logger
+	store *store.Store
+	fwd   *server.Forwarder
+	srv   *cedarserver.Server
+}
+
+// New creates a Collector with an empty store and its protocol handlers registered
+// on an internal command server (used by Serve). To embed the collector in a host
+// daemon's own command server, additionally call RegisterOn(hostServer).
+func New(cfg Config) (*Collector, error) {
+	if cfg.Security == nil {
+		return nil, fmt.Errorf("collector: Security is required")
+	}
+	if cfg.DictSampleSize == 0 {
+		cfg.DictSampleSize = 4000
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	c := &Collector{
+		cfg:   cfg,
+		log:   cfg.Logger,
+		store: store.New(),
+		fwd:   server.NewForwarder(cfg.ViewHosts, cfg.Security),
+	}
+	c.srv = cedarserver.New(cfg.Security)
+	if cfg.Authorizer != nil {
+		c.srv.Authorizer = cfg.Authorizer
+	}
+	c.RegisterOn(c.srv)
+	return c, nil
+}
+
+// RegisterOn registers the collector protocol handlers (UPDATE_*/QUERY_*/
+// INVALIDATE_*_ADS, multi-ad queries, ack'd updates) onto an existing cedar
+// command-dispatch server, so a host daemon can serve the collector on a command
+// socket it already owns. It registers only the collector protocol; the host is
+// responsible for DC_* default commands (NOP, CONFIG_VAL, ...) and for running the
+// serve loop. New calls this on its internal server for the standalone case.
+func (c *Collector) RegisterOn(cs *cedarserver.Server) {
+	server.Register(cs, c.store, c.fwd)
+}
+
+// StartBackground starts the configured background maintenance -- periodic
+// dictionary retraining and ad expiry -- under ctx, and returns a function that
+// stops it (and waits for the loops to exit). It is a no-op with both intervals
+// unset. Safe to call once.
+func (c *Collector) StartBackground(ctx context.Context) func() {
+	var stops []func()
+	if c.cfg.DictRetrainInterval > 0 {
+		c.log.Info("collector: dictionary auto-retraining enabled",
+			"interval", c.cfg.DictRetrainInterval.String(), "sample_size", c.cfg.DictSampleSize)
+		stops = append(stops, c.store.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
+	}
+	if c.cfg.ExpireInterval > 0 {
+		loopCtx, cancel := context.WithCancel(ctx)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); c.expireLoop(loopCtx) }()
+		stops = append(stops, func() { cancel(); wg.Wait() })
+	}
+	return func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+}
+
+func (c *Collector) expireLoop(ctx context.Context) {
+	t := time.NewTicker(c.cfg.ExpireInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n := c.store.Expire(); n > 0 {
+				c.log.Info("collector: reaped expired ads", "count", n)
+			}
+		}
+	}
+}
+
+// Serve accepts connections on l and dispatches the collector protocol until ctx is
+// cancelled, using the Collector's own command server (see New). A host embedding
+// via RegisterOn runs its own serve loop instead and does not call Serve.
+func (c *Collector) Serve(ctx context.Context, l net.Listener) error {
+	return c.srv.Serve(ctx, l)
+}
+
+// ServeConn dispatches the collector protocol on a single already-accepted
+// connection, for a host with its own accept loop (e.g. a shared-port endpoint).
+func (c *Collector) ServeConn(ctx context.Context, conn net.Conn) error {
+	return c.srv.ServeConn(ctx, conn)
+}
+
+// Store returns the underlying ad store, for introspection and metrics
+// (Store().Stats() gives per-table ad counts and compressed byte footprints).
+func (c *Collector) Store() *store.Store { return c.store }
+
+// Server returns the Collector's internal cedar command server, for callers that
+// want to register additional commands (e.g. DC_* defaults) or set an Authorizer
+// before Serve.
+func (c *Collector) Server() *cedarserver.Server { return c.srv }
