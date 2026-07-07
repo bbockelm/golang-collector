@@ -41,9 +41,16 @@ func loadLargeAds(tb testing.TB, n int) []*classad.ClassAd {
 	}
 	out := make([]*classad.ClassAd, n)
 	for i := range out {
-		a := base[i%len(base)]
-		a.InsertAttrString("Name", "slot1_"+strconv.Itoa(i)+"@host"+strconv.Itoa(i))
-		out[i] = a
+		// Deep-copy (parse a fresh ad) before renaming: base has only len(base)
+		// objects, so mutating base[i%len] in place and storing the pointer would
+		// alias every replica to one object with the last-written Name, collapsing
+		// the set to ~len(base) distinct ads regardless of n.
+		cp, err := classad.Parse(base[i%len(base)].String())
+		if err != nil {
+			tb.Fatalf("copy ad %d: %v", i, err)
+		}
+		cp.InsertAttrString("Name", "slot1_"+strconv.Itoa(i)+"@host"+strconv.Itoa(i))
+		out[i] = cp
 	}
 	return out
 }
