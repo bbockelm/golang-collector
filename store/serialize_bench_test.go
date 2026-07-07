@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +16,109 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/stream"
 )
+
+// BenchmarkIngestScaling measures how concurrent ad ingest scales across cores with
+// NO network: g goroutines each re-advertise their own set of distinct-keyed ads
+// into the shared store (Update = serialize + intern + shard insert). Reveals any
+// write-path contention (shard write locks, intern-table locking on encode).
+//
+//	go test ./store/ -run=^$ -bench=BenchmarkIngestScaling -benchtime=200000x
+func BenchmarkIngestScaling(b *testing.B) {
+	sample := loadStartdCorpus(b)
+	for _, g := range []int{1, 2, 4, 6, 8, 12} {
+		b.Run(fmt.Sprintf("g=%02d", g), func(b *testing.B) {
+			st := New()
+			// Pre-render each goroutine's ads to old-ClassAd text (the form the
+			// server feeds UpdateOldText -- the raw ingest path, no AST) and warm the
+			// store + intern table so the measured loop hits steady state.
+			perG := 256
+			textByG := make([][]string, g)
+			rng := rand.New(rand.NewSource(1))
+			for w := 0; w < g; w++ {
+				texts := make([]string, perG)
+				for i := range texts {
+					ad := mutate(sample[i%len(sample)], w*perG+i, rng)
+					texts[i] = ad.MarshalOld()
+					_ = st.UpdateOldText(StartdAd, texts[i])
+				}
+				textByG[w] = texts
+			}
+			var claimed int64
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			for w := 0; w < g; w++ {
+				wg.Add(1)
+				go func(texts []string) {
+					defer wg.Done()
+					i := 0
+					for atomic.AddInt64(&claimed, 1) <= int64(b.N) {
+						if err := st.UpdateOldText(StartdAd, texts[i%len(texts)]); err != nil {
+							b.Error(err)
+							return
+						}
+						i++
+					}
+				}(textByG[w])
+			}
+			wg.Wait()
+			b.StopTimer()
+			if secs := b.Elapsed().Seconds(); secs > 0 {
+				b.ReportMetric(float64(b.N)/secs, "updates/sec")
+			}
+		})
+	}
+}
+
+// BenchmarkSerializeScaling measures how the raw serialization path scales across
+// cores with NO network and NO client: g goroutines each repeatedly scan the shared
+// store and serialize every ad to its own discard stream (PutClassAdRawBytes). This
+// isolates store-scan + serialization CPU scaling from all I/O -- if it scales ~g
+// then the server itself is contention-free and any lower scaling in the networked
+// benchmarks is I/O/client, not the collector.
+//
+//	go test ./store/ -run=^$ -bench=BenchmarkSerializeScaling -benchtime=100x
+func BenchmarkSerializeScaling(b *testing.B) {
+	sample := loadStartdCorpus(b)
+	st := New()
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 2000; i++ {
+		_ = st.Update(StartdAd, mutate(sample[i%len(sample)], i, rng))
+	}
+
+	for _, g := range []int{1, 2, 4, 6, 8, 12} {
+		b.Run(fmt.Sprintf("g=%02d", g), func(b *testing.B) {
+			var ads, claimed int64
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			for w := 0; w < g; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					ctx := context.Background()
+					st2 := stream.NewStream(discardConn{})
+					var local int64
+					for atomic.AddInt64(&claimed, 1) <= int64(b.N) {
+						msg := message.NewMessageForStream(st2)
+						for ra := range st.QueryRaw(StartdAd, nil) {
+							if err := msg.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
+								b.Error(err)
+								return
+							}
+							local++
+						}
+						_ = msg.FlushFrame(ctx, true)
+					}
+					atomic.AddInt64(&ads, local)
+				}()
+			}
+			wg.Wait()
+			b.StopTimer()
+			if secs := b.Elapsed().Seconds(); secs > 0 {
+				b.ReportMetric(float64(ads)/secs, "ads/sec")
+			}
+		})
+	}
+}
 
 // discardConn is a net.Conn whose writes are dropped -- lets us drive cedar's
 // PutClassAd (the real server serialization) at full speed without a socket.
