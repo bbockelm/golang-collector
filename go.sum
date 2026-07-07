@@ -33,6 +33,10 @@ cloud.google.com/go/storage v1.10.0/go.mod h1:FLPqc6j+Ki4BU591ie1oL6qBQGu2Bl/tZ9
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
+github.com/PelicanPlatform/classad v0.2.0 h1:6hczfq6R3EbhYJPIR2IPTa54sQJ7seWYNmCvGDyxX54=
+github.com/PelicanPlatform/classad v0.2.0/go.mod h1:z1d5dXdX+1pxBi8f8Ab/yCX8zKyiLam9CtQHSykMlWQ=
+github.com/PelicanPlatform/classad/collections v0.2.0 h1:xTDHddiHnTEiJmfY58P4X6ohzoGTfeVbIxrRReZXNCM=
+github.com/PelicanPlatform/classad/collections v0.2.0/go.mod h1:fAh/iDJ+5wnWOSx229p4irWQu8y0fKcG/4L2LuskVYY=
 github.com/RoaringBitmap/roaring/v2 v2.19.0 h1:zsWtVE+biht4eVl0YDLvykUqGkftR3Qc5UCbeKB4UQ4=
 github.com/RoaringBitmap/roaring/v2 v2.19.0/go.mod h1:SfT3of9nYh3vis1dIbCj4Yw6KQGujTN+f345nrN/0JA=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
@@ -40,6 +44,12 @@ github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751/go.mod h1:LOuy
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190717042225-c3de453c63f4/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d/go.mod h1:rBZYJk541a8SKzHPHnH3zbiI+7dagKZ0cgpgrD7Fyho=
+github.com/bbockelm/cedar v0.2.0 h1:qonq6obCybfNoMOWVt9KCLaT8mmKiUlfzPzyH4YNfh8=
+github.com/bbockelm/cedar v0.2.0/go.mod h1:5EeimjvNk4sGd9qky00oH5ow3NAHMeScdV2eHT3vFF8=
+github.com/bbockelm/golang-ccb v0.1.0 h1:ZaweNqBvr5GQe2fBcozctX8k99Dw+Wowdd8yarXWEp0=
+github.com/bbockelm/golang-ccb v0.1.0/go.mod h1:KHuOcyrWz9R5nYHNXITjqd+0PwsFyOTRFlYxlkr2/nM=
+github.com/bbockelm/golang-htcondor v0.3.0 h1:aQgAmpdw0jAL/C4LnRkermwnNhkzKJErKOKupRVU6iI=
+github.com/bbockelm/golang-htcondor v0.3.0/go.mod h1:QFffS1KJ/96uy7Tp9SMJTgphlMyxHzunM9lMXHjU41s=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=

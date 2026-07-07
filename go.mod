@@ -3,11 +3,11 @@ module github.com/bbockelm/golang-collector
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.1.0
-	github.com/PelicanPlatform/classad/collections v0.0.0
-	github.com/bbockelm/cedar v0.1.2
-	github.com/bbockelm/golang-ccb v0.0.0-00010101000000-000000000000
-	github.com/bbockelm/golang-htcondor v0.2.1
+	github.com/PelicanPlatform/classad v0.2.0
+	github.com/PelicanPlatform/classad/collections v0.2.0
+	github.com/bbockelm/cedar v0.2.0
+	github.com/bbockelm/golang-ccb v0.1.0
+	github.com/bbockelm/golang-htcondor v0.3.0
 	github.com/prometheus/client_golang v1.13.0
 )
 
@@ -33,14 +33,3 @@ require (
 )
 
 // The collector is built on the in-progress large-collection overhaul in the
-// local classad checkout: the classad package (parent module) and the separate
-// collections module (collections/ and collections/vm). cedar provides the
-// CEDAR wire/security/command-dispatch layer; golang-htcondor provides the
-// collector client used in round-trip tests.
-replace (
-	github.com/PelicanPlatform/classad => /Users/bbockelm/projects/golang-classads
-	github.com/PelicanPlatform/classad/collections => /Users/bbockelm/projects/golang-classads/collections
-	github.com/bbockelm/cedar => /Users/bbockelm/projects/golang-cedar
-	github.com/bbockelm/golang-ccb => /Users/bbockelm/projects/golang-ccb
-	github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor
-)
