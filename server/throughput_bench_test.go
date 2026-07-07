@@ -37,14 +37,21 @@ const benchNumAds = 10000
 
 // benchAd builds a representative startd ad. Names cycle over benchNumAds so
 // updates land as replaces across a realistic keyspace, and the filterable
-// attributes vary so query constraints select a meaningful fraction.
+// attributes vary so query constraints select a meaningful fraction: State is
+// "Claimed" for ~1/4 of ads (an indexed categorical with partial selectivity),
+// while Activity is "Idle" for all (an un-indexed attribute a scan must evaluate
+// on every ad).
 func benchAd(i int) *classad.ClassAd {
 	i %= benchNumAds
+	state := "Unclaimed"
+	if i%4 == 0 {
+		state = "Claimed"
+	}
 	ad, err := classad.Parse(fmt.Sprintf(
 		`[MyType="Machine"; Name="slot%d@host%d"; MyAddress="<10.%d.%d.%d:9618>"; `+
-			`State="Unclaimed"; Activity="Idle"; Cpus=%d; Memory=%d; Disk=%d; `+
+			`State=%q; Activity="Idle"; Cpus=%d; Memory=%d; Disk=%d; `+
 			`Arch="X86_64"; OpSys="LINUX"; SlotType="Partitionable"]`,
-		i%64, i, i>>16&0xff, i>>8&0xff, i&0xff, i%16+1, (i%16+1)*2048, (i%16+1)*1024*100))
+		i%64, i, i>>16&0xff, i>>8&0xff, i&0xff, state, i%16+1, (i%16+1)*2048, (i%16+1)*1024*100))
 	if err != nil {
 		panic(err)
 	}

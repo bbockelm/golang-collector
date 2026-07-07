@@ -106,9 +106,10 @@ func TestRetrainPeak(t *testing.T) {
 
 	var m1 runtime.MemStats
 	runtime.ReadMemStats(&m1)
-	t.Logf("n=%d sampleMax=%d: HeapSys %s -> %s (peak +%s), live_after=%s",
+	t.Logf("n=%d sampleMax=%d: HeapSys %s -> %s (peak +%s), TotalAlloc during retrain=%s, NumGC+%d, live_after=%s",
 		n, sm, humanBytes(int64(m0.HeapSys)), humanBytes(int64(m1.HeapSys)),
-		humanBytes(int64(m1.HeapSys-m0.HeapSys)), humanBytes(col.Stats().LiveBytes()))
+		humanBytes(int64(m1.HeapSys-m0.HeapSys)), humanBytes(int64(m1.TotalAlloc-m0.TotalAlloc)),
+		m1.NumGC-m0.NumGC, humanBytes(col.Stats().LiveBytes()))
 	runtime.KeepAlive(col)
 }
 
