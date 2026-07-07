@@ -63,24 +63,51 @@ func BenchmarkQuerySerialize(b *testing.B) {
 }
 
 func benchSerialize(b *testing.B, st *Store) {
+	// "ast" is the legacy path: decode each stored ad to a *classad.ClassAd, then
+	// PutClassAd. "raw" is the current query-handler path: QueryRaw renders the wire
+	// straight to "Name = Value" byte slices (no AST) and PutClassAdRawBytes streams
+	// them. Both write to a discard conn, so this is pure server serialization -- no
+	// client, no socket -- which is what a CPU/alloc profile should attribute.
 	ctx := context.Background()
 	st2 := stream.NewStream(discardConn{})
-	b.ResetTimer()
-	var ads int64
-	for i := 0; i < b.N; i++ {
-		msg := message.NewMessageForStream(st2)
-		for ad := range st.Query(StartdAd, nil) { // nil == match all
-			// Exactly the query handler's per-ad work: decode (done by Query) then
-			// serialize to the wire with cedar PutClassAd.
-			if err := msg.PutClassAd(ctx, ad); err != nil {
-				b.Fatal(err)
+
+	b.Run("ast", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		var ads int64
+		for i := 0; i < b.N; i++ {
+			msg := message.NewMessageForStream(st2)
+			for ad := range st.Query(StartdAd, nil) { // nil == match all
+				if err := msg.PutClassAd(ctx, ad); err != nil {
+					b.Fatal(err)
+				}
+				ads++
 			}
-			ads++
+			_ = msg.FlushFrame(ctx, true)
 		}
-		_ = msg.FlushFrame(ctx, true)
-	}
-	b.StopTimer()
-	if secs := b.Elapsed().Seconds(); secs > 0 {
-		b.ReportMetric(float64(ads)/secs, "ads/sec")
-	}
+		b.StopTimer()
+		if secs := b.Elapsed().Seconds(); secs > 0 {
+			b.ReportMetric(float64(ads)/secs, "ads/sec")
+		}
+	})
+
+	b.Run("raw", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		var ads int64
+		for i := 0; i < b.N; i++ {
+			msg := message.NewMessageForStream(st2)
+			for ra := range st.QueryRaw(StartdAd, nil) {
+				if err := msg.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
+					b.Fatal(err)
+				}
+				ads++
+			}
+			_ = msg.FlushFrame(ctx, true)
+		}
+		b.StopTimer()
+		if secs := b.Elapsed().Seconds(); secs > 0 {
+			b.ReportMetric(float64(ads)/secs, "ads/sec")
+		}
+	})
 }
