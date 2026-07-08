@@ -55,13 +55,18 @@ func watchHandler(st *store.Store) cedarserver.HandlerFunc {
 			return err
 		}
 
+		// A watch subscription streams a public table's changes; redact private
+		// (secret) attributes from every emitted ad, unless this is the authorized
+		// StartdPvt channel (consistent with the query handlers).
+		redact := adType != store.StartdPvtAd
+
 		resp := message.NewMessageForStream(c.Stream)
 		send := func(sctx context.Context, kind watch.Kind, key, cur []byte, ad *classad.ClassAd) error {
 			if err := resp.PutClassAd(sctx, watch.EncodeHeader(kind, key, cur)); err != nil {
 				return err
 			}
 			if kind.HasAd() && ad != nil {
-				if err := resp.PutClassAd(sctx, ad); err != nil {
+				if err := putAd(sctx, resp, ad, redact); err != nil {
 					return err
 				}
 			}
