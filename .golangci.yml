@@ -1,0 +1,23 @@
+version: "2"
+
+run:
+  tests: true
+
+# Keep the default linter set (errcheck, govet, ineffassign, staticcheck,
+# unused). The exclusions below match the convention in the sibling
+# PelicanPlatform/classad and bbockelm/golang-htcondor repos.
+linters:
+  exclusions:
+    rules:
+      # Test files routinely ignore Close()/Update() errors on throwaway
+      # listeners, files, and store setup; that noise is not worth guarding.
+      - linters:
+          - errcheck
+        path: _test\.go
+      # Some tests deliberately exercise the simple, unlimited QueryAds path
+      # (the paginated QueryAdsWithOptions imposes default limits/projection),
+      # so its deprecation warning is expected there.
+      - linters:
+          - staticcheck
+        path: _test\.go
+        text: "SA1019"

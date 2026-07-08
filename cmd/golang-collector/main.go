@@ -102,13 +102,13 @@ func run() error {
 		log.Error(logging.DestinationGeneral, "listener setup failed", "listen_addr", listenAddr, "err", err.Error())
 		return err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Publish our command address so the rest of the pool (and tools like
 	// condor_status) can find us, exactly like the C++ collector's
 	// COLLECTOR_ADDRESS_FILE.
 	if path := writeAddressFile(d, cfg, ln); path != "" {
-		defer os.Remove(path)
+		defer func() { _ = os.Remove(path) }()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

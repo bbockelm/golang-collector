@@ -80,7 +80,7 @@ func drainQuery(addr, queryAd string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 	st := cl.GetStream()
 
 	ad, err := classad.Parse(queryAd)

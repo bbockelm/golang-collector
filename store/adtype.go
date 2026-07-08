@@ -93,6 +93,3 @@ func (t AdType) String() string {
 	}
 	return "AdType(?)"
 }
-
-// stored reports whether t is a real storage table (not the query-only AnyAd).
-func (t AdType) stored() bool { return t > AnyAd && t < numAdTypes }
