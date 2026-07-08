@@ -3,11 +3,11 @@ module github.com/bbockelm/golang-collector
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.2.0
-	github.com/PelicanPlatform/classad/collections v0.2.0
+	github.com/PelicanPlatform/classad v0.3.0
+	github.com/PelicanPlatform/classad/collections v0.3.0
 	github.com/bbockelm/cedar v0.2.0
 	github.com/bbockelm/golang-ccb v0.1.0
-	github.com/bbockelm/golang-htcondor v0.3.0
+	github.com/bbockelm/golang-htcondor v0.4.0
 	github.com/prometheus/client_golang v1.13.0
 )
 
