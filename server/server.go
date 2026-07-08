@@ -254,11 +254,12 @@ func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
 // authorized StartdPvt channel). It is the single materialized-ad write path for
 // the query handlers, so a client-facing response cannot forget to redact.
 func putAd(ctx context.Context, resp *message.Message, ad *classad.ClassAd, redact bool) error {
-	if !redact {
-		return resp.PutClassAd(ctx, ad)
+	if redact {
+		return resp.PutClassAd(ctx, ad) // serialization redacts private attributes by default
 	}
+	// The authorized StartdPvt channel must send the claim ids it exists to serve.
 	return resp.PutClassAdWithOptions(ctx, ad, &message.PutClassAdConfig{
-		Options: message.PutClassAdNoPrivate,
+		Options: message.PutClassAdIncludePrivate,
 	})
 }
 
