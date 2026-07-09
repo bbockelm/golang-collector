@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"strconv"
@@ -16,6 +17,12 @@ import (
 // does not carry its own ATTR_CLASSAD_LIFETIME. It matches the C++ collector's
 // CLASSAD_LIFETIME default.
 const DefaultLifetime = 900
+
+// DefaultWatchHistory is the per-shard delete-journal capacity enabling the Watch
+// subscription on every table. It bounds how far back a disconnected watcher can
+// resume incrementally before falling to a full replay; with no active watchers
+// its only cost is recording deletes.
+const DefaultWatchHistory = 8192
 
 // startdHotAttrs are front-loaded in each startd ad's hot header so the common
 // matchmaking/status queries that filter on them resolve in O(1) rather than
@@ -53,7 +60,7 @@ func New() *Store {
 		defaultLifetime: DefaultLifetime,
 	}
 	for t := AnyAd + 1; t < numAdTypes; t++ {
-		opts := collections.Options{}
+		opts := collections.Options{WatchHistory: DefaultWatchHistory}
 		if t == StartdAd {
 			opts.HotAttrs = startdHotAttrs
 			opts.CategoricalAttrs = startdCategoricalAttrs
@@ -62,6 +69,31 @@ func New() *Store {
 		s.cols[t] = collections.New(opts)
 	}
 	return s
+}
+
+// Watch streams changes to table t as a resumable subscription: pass a nil cursor
+// for a full replay, or a cursor returned in a prior WatchSynced event to resume.
+// A non-empty constraint (a ClassAd expression) delivers only events for ads that
+// match it -- an update that leaves the match set arrives as a Delete, so a
+// filtered view stays consistent (see collections.WatchFilter). Errors if t is
+// not a storage table or the constraint does not parse.
+func (s *Store) Watch(ctx context.Context, t AdType, cursor []byte, constraint string) (iter.Seq[collections.WatchEvent], error) {
+	col := s.cols[t]
+	if col == nil {
+		return nil, fmt.Errorf("collector: %s is not a storage table", t)
+	}
+	seq, err := col.Watch(ctx, cursor)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(constraint) != "" {
+		q, err := vm.Parse(constraint)
+		if err != nil {
+			return nil, fmt.Errorf("collector: watch constraint %q: %w", constraint, err)
+		}
+		seq = collections.WatchFilter(seq, q.Matches)
+	}
+	return seq, nil
 }
 
 // Update inserts or replaces ad in table t, stamping it with the current time

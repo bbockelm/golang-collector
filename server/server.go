@@ -4,10 +4,13 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/PelicanPlatform/classad/classad"
+
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/bbockelm/cedar/watch"
 
 	"github.com/bbockelm/golang-collector/store"
 )
@@ -50,6 +53,8 @@ func Register(cs *cedarserver.Server, st *store.Store, fwd *Forwarder) {
 	for cmd, t := range invalidateCommands {
 		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd))
 	}
+	// WatchAds: subscribe to a table's change stream (resumable, cursor-based).
+	cs.Handle(watch.WatchAds, watchHandler(st))
 }
 
 // updateHandler stores one ad update into table t. Each ad is its own command
@@ -141,20 +146,32 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 			return err
 		}
 
+		// Redact private (secret) attributes from every public table's response.
+		// The StartdPvt table is the authorized private channel (served only via
+		// QUERY_STARTD_PVT_ADS to the negotiator), so its claim ids must pass
+		// through unredacted -- serving them is the whole point of that table.
+		redact := t != store.StartdPvtAd
+
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
 		if len(projection) == 0 {
 			// Fast path: no projection means whole ads, so stream them straight
 			// from the stored wire form (PutClassAdRaw) without decoding each into
-			// a *classad.ClassAd -- ~2x faster on realistic ads.
+			// a *classad.ClassAd -- ~2x faster on realistic ads. Private attributes
+			// are dropped by filtering the rendered [][]byte expressions (a cheap
+			// filter-and-recount, no re-encoding), so redaction keeps the fast path.
 			for ra := range st.QueryRaw(t, q) {
 				if limit > 0 && n >= limit {
 					break
 				}
+				exprs := ra.Exprs
+				if redact {
+					exprs = redactRawExprs(exprs)
+				}
 				if err := resp.PutInt32(ctx, 1); err != nil {
 					return err
 				}
-				if err := resp.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
+				if err := resp.PutClassAdRawBytes(ctx, exprs, ra.MyType, ra.TargetType); err != nil {
 					return err
 				}
 				n++
@@ -167,7 +184,7 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 				if err := resp.PutInt32(ctx, 1); err != nil {
 					return err
 				}
-				if err := resp.PutClassAd(ctx, project(ad, projection)); err != nil {
+				if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
 					return err
 				}
 				n++
@@ -207,6 +224,10 @@ func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
 			if err != nil {
 				return err
 			}
+			// Multi-queries only name public target types (the negotiator gets startd
+			// claim caps through the dedicated QUERY_STARTD_PVT_ADS command), so every
+			// response here is redacted.
+			redact := adType != store.StartdPvtAd
 			n := 0
 			for ad := range st.Query(adType, q) {
 				if limit > 0 && n >= limit {
@@ -215,7 +236,7 @@ func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
 				if err := resp.PutInt32(ctx, 1); err != nil {
 					return err
 				}
-				if err := resp.PutClassAd(ctx, project(ad, projection)); err != nil {
+				if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
 					return err
 				}
 				n++
@@ -226,6 +247,61 @@ func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
 		}
 		return resp.FlushFrame(ctx, true)
 	}
+}
+
+// putAd writes ad to resp, excluding private (secret) attributes when redact is
+// set (every public-table response) and sending the full ad otherwise (the
+// authorized StartdPvt channel). It is the single materialized-ad write path for
+// the query handlers, so a client-facing response cannot forget to redact.
+func putAd(ctx context.Context, resp *message.Message, ad *classad.ClassAd, redact bool) error {
+	if redact {
+		return resp.PutClassAd(ctx, ad) // serialization redacts private attributes by default
+	}
+	// The authorized StartdPvt channel must send the claim ids it exists to serve.
+	return resp.PutClassAdWithOptions(ctx, ad, &message.PutClassAdConfig{
+		Options: message.PutClassAdIncludePrivate,
+	})
+}
+
+// rawExprAttrName extracts the attribute name from a rendered "Name = value"
+// expression line (leading whitespace trimmed, name up to the first '=' or
+// space). It does not allocate beyond the returned name.
+func rawExprAttrName(expr []byte) string {
+	i := 0
+	for i < len(expr) && (expr[i] == ' ' || expr[i] == '\t') {
+		i++
+	}
+	start := i
+	for i < len(expr) && expr[i] != '=' && expr[i] != ' ' && expr[i] != '\t' {
+		i++
+	}
+	return string(expr[start:i])
+}
+
+// redactRawExprs returns exprs with private (secret) attributes removed. The
+// [][]byte form makes redaction a cheap filter-and-count with no re-encoding.
+// When nothing is private (the common case -- a public ad holds no claim ids),
+// the original slice is returned unchanged, so the fast path stays allocation-free.
+func redactRawExprs(exprs [][]byte) [][]byte {
+	first := -1
+	for i, e := range exprs {
+		if message.ClassAdAttributeIsPrivateAny(rawExprAttrName(e)) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return exprs // nothing private
+	}
+	out := make([][]byte, first, len(exprs)-1)
+	copy(out, exprs[:first])
+	for _, e := range exprs[first+1:] {
+		if message.ClassAdAttributeIsPrivateAny(rawExprAttrName(e)) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // invalidateHandler reads an invalidation ad and removes matching ads: by its

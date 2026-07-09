@@ -118,8 +118,10 @@ func TestStartdPrivateAd(t *testing.T) {
 	}
 	// The startd's raw private ad carries only its claim secret -- no identifying
 	// Name/MyAddress. The collector must enrich it from the public ad so the
-	// negotiator can correlate it.
-	if err := m.PutClassAd(ctx, mustAd(t, `[MyType="Machine"; ClaimId="secret-claim-123"]`)); err != nil {
+	// negotiator can correlate it. The startd deliberately sends its secret here, so
+	// opt in past the redact-by-default serialization (PutClassAdIncludePrivate).
+	if err := m.PutClassAdWithOptions(ctx, mustAd(t, `[MyType="Machine"; ClaimId="secret-claim-123"]`),
+		&message.PutClassAdConfig{Options: message.PutClassAdIncludePrivate}); err != nil {
 		t.Fatalf("put private ad: %v", err)
 	}
 	if err := m.FinishMessage(ctx); err != nil {

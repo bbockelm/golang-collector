@@ -3,6 +3,8 @@
 // update / query / invalidate / expire semantics layered on top.
 package store
 
+import "strings"
+
 // AdType identifies one collector table. The values mirror the roles of the
 // C++ collector's per-type hash tables; queries and updates are routed to the
 // table matching their command.
@@ -81,6 +83,22 @@ var targetToAd = map[string]AdType{
 func AdTypeForTarget(name string) (AdType, bool) {
 	t, ok := targetToAd[name]
 	return t, ok
+}
+
+// AdTypeByName resolves a watch ad-type name to a storage table. It accepts a
+// query target-type ("Machine", "Scheduler", ...), the short table name
+// ("Startd", "Schedd", ...), or that name with an "Ad" suffix ("StartdAd").
+func AdTypeByName(name string) (AdType, bool) {
+	if t, ok := targetToAd[name]; ok {
+		return t, true
+	}
+	for t := AnyAd + 1; t < numAdTypes; t++ {
+		n := adTypeName[t]
+		if n != "" && (strings.EqualFold(n, name) || strings.EqualFold(n+"Ad", name)) {
+			return t, true
+		}
+	}
+	return AnyAd, false
 }
 
 // MyType returns the ATTR_MY_TYPE string for a table, or "" if it has none.
