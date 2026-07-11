@@ -98,7 +98,7 @@ func ImportAccountantLog(path string) (map[string]*ImportedAd, error) {
 	if err != nil {
 		return nil, fmt.Errorf("accountant import: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	ads := map[string]*ImportedAd{}
 

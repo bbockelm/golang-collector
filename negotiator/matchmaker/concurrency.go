@@ -90,7 +90,7 @@ func isValidAttrName(s string) bool {
 			}
 			continue
 		}
-		if !alpha && !(c >= '0' && c <= '9') {
+		if !alpha && (c < '0' || c > '9') {
 			return false
 		}
 	}

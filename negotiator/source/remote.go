@@ -66,7 +66,13 @@ func (s *RemoteSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot, 
 
 	go func() {
 		defer wg.Done()
-		ads, err := s.collector().QueryAdsWithProjection(qctx, "Machine", s.cfg.SlotConstraint, nil)
+		// Full ads, no result cap: the matchmaker evaluates arbitrary
+		// Requirements/Rank references, and a truncated pool would drop slots.
+		// Limit:-1 (unlimited) + Projection:["*"] reproduces the wire request of
+		// the deprecated QueryAdsWithProjection(...,nil) exactly (no
+		// ProjectionAttributes, no LimitResults).
+		ads, _, err := s.collector().QueryAdsWithOptions(qctx, "Machine", s.cfg.SlotConstraint,
+			&htcondor.QueryOptions{Limit: -1, Projection: []string{"*"}})
 		if err != nil {
 			slotErr = fmt.Errorf("query machine ads: %w", err)
 			return
@@ -79,7 +85,8 @@ func (s *RemoteSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot, 
 
 	go func() {
 		defer wg.Done()
-		ads, err := s.collector().QueryAdsWithProjection(qctx, "Submitter", s.cfg.SubmitterConstraint, nil)
+		ads, _, err := s.collector().QueryAdsWithOptions(qctx, "Submitter", s.cfg.SubmitterConstraint,
+			&htcondor.QueryOptions{Limit: -1, Projection: []string{"*"}})
 		if err != nil {
 			subErr = fmt.Errorf("query submitter ads: %w", err)
 			return

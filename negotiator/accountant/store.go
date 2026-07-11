@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 )
@@ -47,14 +46,6 @@ type record struct {
 }
 
 func newRecord() *record { return &record{attrs: make(map[string]any)} }
-
-func (r *record) clone() *record {
-	c := newRecord()
-	for k, v := range r.attrs {
-		c.attrs[k] = v
-	}
-	return c
-}
 
 func (r *record) getFloat(attr string) (float64, bool) {
 	v, ok := r.attrs[attr]
@@ -170,7 +161,7 @@ func (s *Store) replay(path string) error {
 		}
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	line := 0
@@ -222,11 +213,11 @@ func (s *Store) append(e *logEntry) {
 	if err != nil {
 		return
 	}
-	s.w.Write(b)
-	s.w.WriteByte('\n')
+	_, _ = s.w.Write(b)
+	_ = s.w.WriteByte('\n')
 	// Flush eagerly so a concurrent reopen (tests, crash recovery) sees the
 	// committed state. The OS page cache absorbs the cost.
-	s.w.Flush()
+	_ = s.w.Flush()
 }
 
 func (s *Store) ensure(tbl table, key string) *record {
@@ -319,9 +310,8 @@ func (s *Store) Close() error {
 			return err
 		}
 	}
-	if err := s.f.Sync(); err != nil && err != io.EOF {
-		// Sync failures on some filesystems are non-fatal for our purposes.
-	}
+	// Sync failures on some filesystems are non-fatal for our purposes.
+	_ = s.f.Sync()
 	err := s.f.Close()
 	s.f = nil
 	s.w = nil

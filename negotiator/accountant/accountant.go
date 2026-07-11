@@ -178,7 +178,7 @@ func New(cfg Config) (*Accountant, error) {
 	if cfg.ImportFrom != "" && store.count(tableCustomer) == 0 {
 		n, err := store.loadCppAccountantLog(cfg.ImportFrom)
 		if err != nil {
-			store.Close()
+			_ = store.Close()
 			return nil, fmt.Errorf("accountant: importing %q: %w", cfg.ImportFrom, err)
 		}
 		slog.Info("accountant: imported C++ Accountantnew.log into native store",
