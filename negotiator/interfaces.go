@@ -64,6 +64,10 @@ type Accountant interface {
 	SetAccumUsage(submitter string, accumUsage float64) error
 	SetBeginTime(submitter string, t time.Time) error
 	SetLastTime(submitter string, t time.Time) error
+	// SetCeiling/SetFloor set the weighted-usage caps (SET_CEILING 525 /
+	// SET_FLOOR 530); a negative value clears the cap.
+	SetCeiling(submitter string, ceiling int64) error
+	SetFloor(submitter string, floor int64) error
 	ResetUsage(submitter string) error
 	ResetAllUsage() error
 	DeleteRecord(submitter string) error

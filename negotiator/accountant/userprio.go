@@ -224,6 +224,30 @@ func (a *Accountant) SetAccumUsage(submitter string, accumUsage float64) error {
 	return nil
 }
 
+// SetCeiling sets a submitter's weighted-usage ceiling (SET_CEILING). A
+// negative value clears the cap (GetCeiling then reports -1 = unlimited).
+func (a *Accountant) SetCeiling(submitter string, ceiling int64) error {
+	if submitter == "" {
+		return errNoName
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store.setInt(tableCustomer, submitter, attrCeiling, ceiling)
+	return nil
+}
+
+// SetFloor sets a submitter's weighted-usage floor (SET_FLOOR). A negative
+// value clears it (GetFloor then reports 0 = none).
+func (a *Accountant) SetFloor(submitter string, floor int64) error {
+	if submitter == "" {
+		return errNoName
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store.setInt(tableCustomer, submitter, attrFloor, floor)
+	return nil
+}
+
 // SetBeginTime sets a submitter's BeginUsageTime (SET_BEGINTIME,
 // Accountant.cpp:794).
 func (a *Accountant) SetBeginTime(submitter string, t time.Time) error {
