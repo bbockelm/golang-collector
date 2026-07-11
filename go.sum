@@ -33,8 +33,8 @@ cloud.google.com/go/storage v1.10.0/go.mod h1:FLPqc6j+Ki4BU591ie1oL6qBQGu2Bl/tZ9
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/PelicanPlatform/classad v0.4.0 h1:d409NSsyWQvMwBIPmwrX+6qTfWrDxlM6RdMIpP2uIWw=
-github.com/PelicanPlatform/classad v0.4.0/go.mod h1:z1d5dXdX+1pxBi8f8Ab/yCX8zKyiLam9CtQHSykMlWQ=
+github.com/PelicanPlatform/classad v0.5.1 h1:Bavn7So8sPEQMIQ5cbqcJAzNpqXSftFECSsEKcHute0=
+github.com/PelicanPlatform/classad v0.5.1/go.mod h1:z1d5dXdX+1pxBi8f8Ab/yCX8zKyiLam9CtQHSykMlWQ=
 github.com/PelicanPlatform/classad/collections v0.4.0 h1:WJQE/QApsKqmXI5dkDZjHys4PgnDKwY0cCz4anQc7cw=
 github.com/PelicanPlatform/classad/collections v0.4.0/go.mod h1:fAh/iDJ+5wnWOSx229p4irWQu8y0fKcG/4L2LuskVYY=
 github.com/RoaringBitmap/roaring/v2 v2.19.0 h1:zsWtVE+biht4eVl0YDLvykUqGkftR3Qc5UCbeKB4UQ4=
