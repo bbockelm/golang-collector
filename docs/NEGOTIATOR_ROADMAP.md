@@ -11,11 +11,11 @@ gives what/why, the Go touchpoints, the C++ reference, and scope. Read
 [`NEGOTIATOR_CPP_DIFFERENCES.md`](NEGOTIATOR_CPP_DIFFERENCES.md) first — several
 of these are the deferrals it calls out.
 
-**Progress:** #1 (differential harness) and #2 (preemption) are **DONE**
-(commits `e14353b`, `a6ce298`). #3 (concurrency limits) and #4 (Accountantnew.log
-importer) are **in progress**. Remaining order is otherwise independent; the
-differential harness (#1) is now available to validate later features against a
-preemption-*on* C++ config.
+**Progress:** #1 differential harness (`e14353b`), #2 preemption (`a6ce298`),
+#3 concurrency limits (`68861e5`), and #4 Accountantnew.log importer (`c241d31`)
+are all **DONE**. Next up: #5 (perf benchmarks) and #6-#9. The differential
+harness (#1) is available to validate later features against C++, including a
+preemption-*on* config.
 
 ---
 
@@ -93,7 +93,16 @@ only matches C++ on preemption-off pools.
 **Scope:** large. This is the marquee Phase-7 feature. Flip
 `GroupConfig.ConsiderPreemption`/matchmaker default only when complete.
 
-## 3. Concurrency limits  (P1)
+## 3. Concurrency limits  ✅ DONE (`68861e5`)
+
+Delivered: matchmaker gate on `ConcurrencyLimits` (comma list, `name:weight`)
+vs `<NAME>_LIMIT` / `CONCURRENCY_LIMIT_DEFAULT[_<PREFIX>]` maxes; cross-cycle
+counts store-backed under a `ConcurrencyLimit.` namespace (rebuilt in
+CheckMatches), in-cycle live consumption via a per-cycle tracker; pure gate so
+compat==fast holds. Not ported: the per-candidate expression form
+(`evaluate_limits_with_match`).
+
+_Original brief:_
 
 **What:** enforce `CONCURRENCY_LIMIT` during matchmaking — a match consumes a
 limit; a candidate that would exceed a limit is rejected
@@ -108,7 +117,15 @@ tracks). The match-ad enrichment already sets `MatchedConcurrencyLimits`.
 
 **Scope:** medium; self-contained.
 
-## 4. `Accountantnew.log` importer  (P1 — migration/adoption)
+## 4. `Accountantnew.log` importer  ✅ DONE (`c241d31`)
+
+Delivered: a ClassAdLog format adapter (`accountant/import.go`) parsing the C++
+transaction journal (opcodes 101-107, commit/abort/truncation semantics) into
+the native store; `Config.ImportFrom` + `cmd -import`/`ACCOUNTANT_IMPORT_LOG`
+with a one-shot idempotency guard (imports only when the native store has no
+Customer records). C++ attr names map verbatim.
+
+_Original brief:_
 
 **What:** read the C++ `ClassAdLog` accountant journal so a Go negotiator can
 take over a running pool's accumulated usage/priorities in place.
