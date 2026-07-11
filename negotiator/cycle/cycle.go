@@ -209,7 +209,10 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 			}
 			return c.negotiateWithGroup(ctx, st, ri, gsubs)
 		}
-		if err := accountant.NegotiateAllGroups(tree, totalQuota, c.cfg.Group, usage, cb); err != nil {
+		// Persist per-group rr_time across cycles when the accountant supports
+		// it (the concrete accountant does; a wrapping test stub may not).
+		rrt, _ := c.acct.(accountant.RRTimeStore)
+		if err := accountant.NegotiateAllGroups(tree, totalQuota, c.cfg.Group, usage, rrt, cb); err != nil {
 			return stats, err
 		}
 	}

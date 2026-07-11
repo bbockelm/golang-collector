@@ -400,6 +400,20 @@ func (a *allocator) sortForNegotiation(autoregroup bool) []*negotiator.GroupNode
 	return out
 }
 
+// RRTimeStore persists per-group round-robin timestamps (the C++ GroupEntry
+// rr_time) across negotiation cycles, keyed by group name. In C++ the group
+// tree is a process-lived singleton, so rr_time simply survives in memory; our
+// tree is rebuilt every cycle, so NegotiateAllGroups seeds each node's rr_time
+// from this store and writes updated stamps back after allocation. A nil store
+// degrades to per-call state (RR fairness within, but not across, cycles).
+// *Accountant implements it on the group's Customer record.
+type RRTimeStore interface {
+	GetGroupRRTime(group string) (float64, bool)
+	SetGroupRRTime(group string, t float64)
+}
+
+var _ RRTimeStore = (*Accountant)(nil)
+
 // NegotiateAllGroups is the multi-round allocation driver, a port of
 // GroupEntry::hgq_negotiate_with_all_groups (GroupEntry.cpp:341-537). It runs up
 // to cfg.MaxAllocationRounds rounds; each round computes fairshare + surplus
@@ -410,14 +424,15 @@ func (a *allocator) sortForNegotiation(autoregroup bool) []*negotiator.GroupNode
 //
 // The signature differs from the C++ (which takes an Accountant and an int
 // callback): usage is injected as a pure func(name)->weighted-usage, totalQuota
-// is the weighted (or effective) pool size, and the callback takes the limit as
+// is the weighted (or effective) pool size, rr (nil ok) persists each group's
+// rr_time across cycles (see RRTimeStore), and the callback takes the limit as
 // a float64 (the C++ truncates it to int). The tree must already be prepared
 // (PrepareForMatchmaking / AssignSubmitters+AssignQuotas).
 //
 // The RR inner loop over "round robin rate" (cfg.RoundRobinRate, default +Inf =
 // a single pass) is preserved. Between rounds, usage is re-read; a round that
 // filled all allocations (usage_total >= allocated_total) ends the driver early.
-func NegotiateAllGroups(root *negotiator.GroupNode, totalQuota float64, cfg GroupConfig, usage func(name string) float64, negotiateGroup func(g *negotiator.GroupNode, allocation float64) error) error {
+func NegotiateAllGroups(root *negotiator.GroupNode, totalQuota float64, cfg GroupConfig, usage func(name string) float64, rr RRTimeStore, negotiateGroup func(g *negotiator.GroupNode, allocation float64) error) error {
 	groups := BreadthFirst(root)
 
 	sortExprStr := cfg.GroupSortExpr
@@ -431,7 +446,15 @@ func NegotiateAllGroups(root *negotiator.GroupNode, totalQuota float64, cfg Grou
 
 	st := make(map[*negotiator.GroupNode]*nodeState, len(groups))
 	for _, g := range groups {
-		st[g] = &nodeState{}
+		ns := &nodeState{}
+		// Seed rr_time from the persisted cross-cycle stamp so groups the
+		// round robin served recently sort after ones still waiting.
+		if rr != nil {
+			if t, ok := rr.GetGroupRRTime(g.Name); ok {
+				ns.rrTime = t
+			}
+		}
+		st[g] = ns
 	}
 	a := &allocator{root: root, groups: groups, cfg: cfg, usage: usage, sortExpr: sortExpr, st: st}
 
@@ -542,12 +565,16 @@ func NegotiateAllGroups(root *negotiator.GroupNode, totalQuota float64, cfg Grou
 		}
 	}
 
-	// Update rr_time after all rounds (cross-cycle RR fairness). Note: this
-	// state is per-call here; see the GroupNode field-gap note.
+	// Update rr_time after all rounds (GroupEntry.cpp:523-535) and persist the
+	// new stamps so the NEXT cycle's round robin favors the groups that were
+	// not served this time (cross-cycle RR fairness).
 	now := float64(time.Now().Unix())
 	for _, g := range groups {
 		if st[g].rr || g.Requested <= 0 {
 			st[g].rrTime = now
+			if rr != nil {
+				rr.SetGroupRRTime(g.Name, now)
+			}
 		}
 	}
 

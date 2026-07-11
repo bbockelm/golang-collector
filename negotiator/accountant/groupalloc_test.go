@@ -26,7 +26,7 @@ func runNegotiate(t *testing.T, cfg GroupConfig, ads []*classad.ClassAd, total f
 	}
 	PrepareForMatchmaking(root, ads, total, cfg, usage)
 	res := &negoResult{root: root, limit: map[string]float64{}, count: map[string]int{}}
-	err = NegotiateAllGroups(root, total, cfg, usage, func(g *negotiator.GroupNode, gAlloc float64) error {
+	err = NegotiateAllGroups(root, total, cfg, usage, nil, func(g *negotiator.GroupNode, gAlloc float64) error {
 		res.order = append(res.order, g.Name)
 		res.limit[g.Name] = gAlloc
 		res.count[g.Name]++
@@ -175,7 +175,7 @@ func TestMultiRoundConvergence(t *testing.T) {
 		u := mapUsage(usg)
 		PrepareForMatchmaking(root, ads, 10, cfg, u)
 		calls := 0
-		_ = NegotiateAllGroups(root, 10, cfg, u, func(g *negotiator.GroupNode, a float64) error {
+		_ = NegotiateAllGroups(root, 10, cfg, u, nil, func(g *negotiator.GroupNode, a float64) error {
 			calls++
 			usg[g.Name] = a // fully satisfy
 			return nil
@@ -192,7 +192,7 @@ func TestMultiRoundConvergence(t *testing.T) {
 		u := mapUsage(usg)
 		PrepareForMatchmaking(root, ads, 10, cfg, u)
 		calls := 0
-		_ = NegotiateAllGroups(root, 10, cfg, u, func(g *negotiator.GroupNode, a float64) error {
+		_ = NegotiateAllGroups(root, 10, cfg, u, nil, func(g *negotiator.GroupNode, a float64) error {
 			calls++
 			usg[g.Name] = usg[g.Name] + 1 // only one slot filled per round
 			return nil
@@ -222,6 +222,75 @@ func TestRoundRobinWholeSlots(t *testing.T) {
 	gApprox(t, "a", gAlloc(res.root, "a"), 6)
 	gApprox(t, "b", gAlloc(res.root, "b"), 2)
 	gApprox(t, "c", gAlloc(res.root, "c"), 2)
+}
+
+// (j) rr_time persistence: with the accountant as the RRTimeStore, the group
+// the round robin served in one NegotiateAllGroups call is stamped, so the
+// NEXT call (a fresh tree, as every cycle rebuilds it) serves the other group
+// first — the whole surplus slot flips between the two calls.
+func TestRoundRobinTimePersistsAcrossCycles(t *testing.T) {
+	acct, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = acct.Close() }()
+
+	newCfg := func() GroupConfig {
+		return cfgWith([]string{"a", "b"}, func(c *GroupConfig) {
+			// Equal binary-exact fractions: fairshare 5.5 each of 11 slots,
+			// remainders recover exactly one whole slot for the round robin.
+			c.GroupQuotaDynamic = map[string]float64{"a": 0.5, "b": 0.5}
+			c.GroupAcceptSurplus = map[string]bool{"a": true, "b": true}
+			c.MaxAllocationRounds = 1
+			c.UsingWeightedSlots = false
+		})
+	}
+	ads := func() []*classad.ClassAd {
+		return []*classad.ClassAd{subAd("a.u@d", 100, 0), subAd("b.u@d", 100, 0)}
+	}
+
+	run := func() map[string]float64 {
+		cfg := newCfg()
+		root, _, err := BuildGroupTree(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The per-run usage tracks each group's negotiated allocation, so the
+		// end-of-round reassessment sees every served group fully satisfied
+		// (usage == allocated). That keeps the UNSERVED group's demand > 0,
+		// which is what exempts it from the end-of-run rr_time stamp — the
+		// state the cross-cycle round robin keys on.
+		usg := map[string]float64{}
+		u := mapUsage(usg)
+		PrepareForMatchmaking(root, ads(), 11, cfg, u)
+		if err := NegotiateAllGroups(root, 11, cfg, u, acct,
+			func(g *negotiator.GroupNode, alloc float64) error {
+				usg[g.Name] = alloc
+				return nil
+			}); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]float64{}
+		for _, n := range BreadthFirst(root) {
+			out[n.Name] = n.Allocated
+		}
+		return out
+	}
+
+	// Cycle 1: on a full rr_time tie the RR order is deterministic (breadth-
+	// first index) — "a" gets the extra whole slot and is stamped.
+	first := run()
+	gApprox(t, "cycle1 a", first["a"], 6)
+	gApprox(t, "cycle1 b", first["b"], 5)
+	if rt, ok := acct.GetGroupRRTime("a"); !ok || rt <= 0 {
+		t.Fatalf("cycle 1 did not persist a's rr_time (got %v ok=%v)", rt, ok)
+	}
+
+	// Cycle 2 (fresh tree): "b" still carries the older (absent -> zero)
+	// rr_time, so the round robin serves it first — the slot flips.
+	second := run()
+	gApprox(t, "cycle2 a", second["a"], 5)
+	gApprox(t, "cycle2 b", second["b"], 6)
 }
 
 // Determinism: identical inputs must yield identical allocations and callback

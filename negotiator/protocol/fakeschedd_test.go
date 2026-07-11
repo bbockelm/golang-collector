@@ -476,4 +476,25 @@ func TestEnrichHelpers(t *testing.T) {
 	if v, ok := reqAd.EvaluateAttrString("SubmitterGroup"); !ok || v != "physics" {
 		t.Errorf("SubmitterGroup = %q ok=%v", v, ok)
 	}
+	if v, ok := reqAd.EvaluateAttrString("SubmitterNegotiatingGroup"); !ok || v != "physics" {
+		t.Errorf("SubmitterNegotiatingGroup = %q ok=%v", v, ok)
+	}
+	if v, ok := reqAd.EvaluateAttrBool("SubmitterAutoregroup"); !ok || !v {
+		t.Errorf("SubmitterAutoregroup = %v ok=%v", v, ok)
+	}
+
+	// Flat pool (no group): the negotiating-group context is STILL stamped
+	// (C++ matchmaker.cpp:4257-4258), defaulting to the root group name; the
+	// SubmitterGroup* family is not.
+	flatAd := classad.New()
+	EnrichRequestAd(flatAd, SubmitterContext{UserPrio: 1.0})
+	if v, ok := flatAd.EvaluateAttrString("SubmitterNegotiatingGroup"); !ok || v != "<none>" {
+		t.Errorf("flat SubmitterNegotiatingGroup = %q ok=%v, want \"<none>\"", v, ok)
+	}
+	if v, ok := flatAd.EvaluateAttrBool("SubmitterAutoregroup"); !ok || v {
+		t.Errorf("flat SubmitterAutoregroup = %v ok=%v, want false", v, ok)
+	}
+	if _, ok := flatAd.Lookup("SubmitterGroup"); ok {
+		t.Error("flat pool must not stamp SubmitterGroup")
+	}
 }

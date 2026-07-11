@@ -66,6 +66,13 @@ const (
 	// transient, not persisted across a decay tick (cleared each cycle).
 	attrSubmitterShare = "SubmitterShare"
 	attrSubmitterLimit = "SubmitterLimit"
+
+	// attrRoundRobinTime persists a group's round-robin timestamp (the C++
+	// GroupEntry rr_time) on the group's Customer record. Go-native attr: the
+	// C++ keeps rr_time in its in-memory group tree (which lives as long as
+	// the process), while our tree is rebuilt every cycle, so the value
+	// round-trips through the state store instead (see RRTimeStore).
+	attrRoundRobinTime = "RoundRobinTime"
 )
 
 // slot ad attribute names.
@@ -261,6 +268,22 @@ func (a *Accountant) groupTreeLocked() *negotiator.GroupNode {
 		root.Usage = u
 	}
 	return root
+}
+
+// GetGroupRRTime returns a group's persisted round-robin timestamp (Unix
+// seconds), or (0, false) when the group has never been stamped. Part of the
+// RRTimeStore surface the group allocator uses for cross-cycle RR fairness.
+func (a *Accountant) GetGroupRRTime(group string) (float64, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.store.getFloat(tableCustomer, group, attrRoundRobinTime)
+}
+
+// SetGroupRRTime persists a group's round-robin timestamp (see GetGroupRRTime).
+func (a *Accountant) SetGroupRRTime(group string, t float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store.setFloat(tableCustomer, group, attrRoundRobinTime, t)
 }
 
 // GetWeightedResourcesUsed returns the weighted usage for a submitter or bare

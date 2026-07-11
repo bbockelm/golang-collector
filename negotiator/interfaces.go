@@ -68,6 +68,11 @@ type Accountant interface {
 	// SET_FLOOR 530); a negative value clears the cap.
 	SetCeiling(submitter string, ceiling int64) error
 	SetFloor(submitter string, floor int64) error
+	// SetSubmitterShare stamps the spin-1 fair-share figures on the
+	// submitter's accounting record (transient SubmitterShare/SubmitterLimit
+	// attrs, zeroed by the next decay tick; C++ matchmaker.cpp:2647-2655).
+	// They surface in ReportState and the published Accounting ads.
+	SetSubmitterShare(submitter string, share, limit float64) error
 	ResetUsage(submitter string) error
 	ResetAllUsage() error
 	DeleteRecord(submitter string) error

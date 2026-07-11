@@ -277,7 +277,15 @@ func (c *Cycle) sortSubmitters(subs []*subState, env *spinEnv) {
 // negotiateOne computes one submitter's limit/ceiling and either skips it
 // (the optimization ladder at matchmaker.cpp:2718-2768) or negotiates it.
 func (c *Cycle) negotiateOne(ctx context.Context, st *runState, ri roundInfo, sub *subState, env *spinEnv) mmResult {
-	limit, _, _, prio := c.calculateSubmitterLimit(sub.name, ri, env, ri.isFloor)
+	limit, share, _, prio := c.calculateSubmitterLimit(sub.name, ri, env, ri.isFloor)
+
+	// Spin 1 only: save the fair-share figures on the submitter's accounting
+	// record — SubmitterShare and SubmitterLimit = share x slotWeightTotal
+	// (NOT the starved/capped limit) — for ReportState and the published
+	// Accounting ads (matchmaker.cpp:2647-2655).
+	if env.spin == 1 {
+		_ = c.acct.SetSubmitterShare(sub.name, share, share*env.slotWeightTotal)
+	}
 
 	// Starvation cap: never hand a submitter more than what is left of the
 	// pie this spin (:2657-2667).
@@ -512,16 +520,19 @@ func (c *Cycle) nextRequest(ctx context.Context, sub *subState, rejectedACs map[
 // enrichRequest folds the submitter/group context into the request ad before
 // matching (matchmaker.cpp:4256-4275).
 func (c *Cycle) enrichRequest(st *runState, ri roundInfo, sub *subState, req *negotiator.Request, prio float64, env *spinEnv) {
+	// The negotiating-group context is stamped on EVERY request, flat pool or
+	// not (matchmaker.cpp:4257-4258); the SubmitterGroup* family only when the
+	// submitter maps to a real accounting group.
 	sc := protocol.SubmitterContext{
 		UserPrio:           prio,
 		UserResourcesInUse: c.acct.GetWeightedResourcesUsed(sub.name),
+		NegotiatingGroup:   c.negotiatingGroupName(ri),
+		Autoregroup:        ri.autoregroupRoot,
 	}
 	if g := c.assignedGroup(st, sub); g != nil {
 		sc.Group = g.Name
 		sc.GroupResourcesInUse = c.acct.GetWeightedResourcesUsed(g.Name)
 		sc.GroupQuota = g.Quota
-		sc.NegotiatingGroup = c.negotiatingGroupName(ri)
-		sc.Autoregroup = ri.autoregroupRoot
 	}
 	protocol.EnrichRequestAd(req.Ad, sc)
 	_ = env

@@ -33,6 +33,11 @@ const (
 	attrSubmitterAutoregroup       = "SubmitterAutoregroup"
 )
 
+// rootGroupName is the fixed name of the root accounting group (the same value
+// as accountant.RootGroupName, duplicated here so protocol does not depend on
+// the accountant package). It is the C++ hgq_root_group->name.
+const rootGroupName = "<none>"
+
 // MatchContext carries the per-request group context the negotiator folds into
 // the offer ad before delivering PERMISSION_AND_AD (design doc section 5).
 type MatchContext struct {
@@ -112,23 +117,29 @@ type SubmitterContext struct {
 }
 
 // EnrichRequestAd folds the submitter/group context into a request ad in place,
-// before the matchmaker evaluates it. Mirrors the C++ negotiator's
-// insertion of SubmitterUserPrio / SubmitterUserResourcesInUse (and the
-// SubmitterGroup* family when the submitter belongs to an accounting group).
+// before the matchmaker evaluates it. Mirrors the C++ negotiator's insertion
+// of SubmitterUserPrio / SubmitterUserResourcesInUse and — UNCONDITIONALLY,
+// even on a flat pool (matchmaker.cpp:4257-4258) — SubmitterNegotiatingGroup
+// and SubmitterAutoregroup; the SubmitterGroup* family is added only when the
+// submitter belongs to an accounting group.
 func EnrichRequestAd(reqAd *classad.ClassAd, sc SubmitterContext) {
 	if reqAd == nil {
 		return
 	}
+	// The C++ negGroupName is never empty: it falls back to the root group's
+	// name when negotiating without group accounting.
+	negGroup := sc.NegotiatingGroup
+	if negGroup == "" {
+		negGroup = rootGroupName
+	}
+	_ = reqAd.Set(attrSubmitterNegotiatingGroup, negGroup)
+	_ = reqAd.Set(attrSubmitterAutoregroup, sc.Autoregroup)
 	_ = reqAd.Set(attrSubmitterUserPrio, sc.UserPrio)
 	_ = reqAd.Set(attrSubmitterUserResourcesUsed, sc.UserResourcesInUse)
 	if sc.Group != "" {
 		_ = reqAd.Set(attrSubmitterGroup, sc.Group)
 		_ = reqAd.Set(attrSubmitterGroupResourcesUse, sc.GroupResourcesInUse)
 		_ = reqAd.Set(attrSubmitterGroupQuota, sc.GroupQuota)
-		if sc.NegotiatingGroup != "" {
-			_ = reqAd.Set(attrSubmitterNegotiatingGroup, sc.NegotiatingGroup)
-		}
-		_ = reqAd.Set(attrSubmitterAutoregroup, sc.Autoregroup)
 	}
 }
 

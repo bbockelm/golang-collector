@@ -248,6 +248,22 @@ func (a *Accountant) SetFloor(submitter string, floor int64) error {
 	return nil
 }
 
+// SetSubmitterShare stamps the spin-1 fair-share figures on the submitter's
+// Customer record. The C++ writes SubmitterShare/SubmitterLimit onto the
+// in-memory accounting ad on the first pie spin (matchmaker.cpp:2647-2655);
+// they are transient — the next decay tick zeroes them (priority.go) — and
+// surface in ReportState and the published Accounting ads.
+func (a *Accountant) SetSubmitterShare(submitter string, share, limit float64) error {
+	if submitter == "" {
+		return errNoName
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store.setFloat(tableCustomer, submitter, attrSubmitterShare, share)
+	a.store.setFloat(tableCustomer, submitter, attrSubmitterLimit, limit)
+	return nil
+}
+
 // SetBeginTime sets a submitter's BeginUsageTime (SET_BEGINTIME,
 // Accountant.cpp:794).
 func (a *Accountant) SetBeginTime(submitter string, t time.Time) error {
