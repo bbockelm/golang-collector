@@ -11,13 +11,25 @@ gives what/why, the Go touchpoints, the C++ reference, and scope. Read
 [`NEGOTIATOR_CPP_DIFFERENCES.md`](NEGOTIATOR_CPP_DIFFERENCES.md) first — several
 of these are the deferrals it calls out.
 
-**Suggested order:** do #1 (differential harness) first — it validates
-everything after it. Then #2 (preemption) and #3 (concurrency limits) close the
-"decisions match C++ by default" gap. The rest are independent.
+**Progress:** #1 (differential harness) and #2 (preemption) are **DONE**
+(commits `e14353b`, `a6ce298`). #3 (concurrency limits) and #4 (Accountantnew.log
+importer) are **in progress**. Remaining order is otherwise independent; the
+differential harness (#1) is now available to validate later features against a
+preemption-*on* C++ config.
 
 ---
 
-## 1. C++ differential test harness  (P0 — do first; it de-risks the rest)
+## 1. C++ differential test harness  ✅ DONE (`e14353b`)
+
+Delivered: an accountant differential (identical `condor_userprio` SET_*
+sequences into real `condor_negotiator` vs Go, comparing `-l -modular` output --
+exact agreement on all submitters + decay-to-floor) and a fair-share allocation
+differential (same pool under C++ vs Go -> identical slots-per-submitter split).
+Both in `negtest/differential.go` + `integration/negotiator_differential_test.go`,
+pinned to the MVP feature set. Extend it to preemption-on configs to validate #2
+against C++.
+
+_Original brief:_ C++ differential test harness (the oracle).
 
 **What:** run the real `condor_negotiator` and the Go negotiator against the same
 static fixture pool and assert they make the same matches and the same accountant
@@ -38,7 +50,17 @@ state. Today we only prove *compat==fast* (Go vs Go) and one live e2e.
 
 **Scope:** medium. No production code — pure test infrastructure. Highest ROI.
 
-## 2. Preemption  (P0 — the biggest default-behavior gap)
+## 2. Preemption  ✅ DONE (`a6ce298`)
+
+Delivered: the full C++ per-candidate preemption pipeline in the matchmaker
+(RANK/PRIO tiers, `PREEMPTION_REQUIREMENTS`/`PREEMPTION_RANK`, rank conditions,
+`only_for_startdrank`), cycle-side `addRemoteUserPrios` + claimed-slot retention
++ full/unclaimed submitter-limit split, and **`NEGOTIATOR_CONSIDER_PREEMPTION`
+flipped to default `true`** (C++ parity), preemption-off byte-identical.
+`compat==fast` holds with preemption on. Not ported (roadmap #6 / documented):
+`NEGOTIATOR_CROSS_SLOT_PRIOS`, `pslotMultiMatch`.
+
+_Original brief:_ preemption (the biggest default-behavior gap).
 
 **What:** `PREEMPTION_REQUIREMENTS` / `PREEMPTION_RANK`, the three preemption
 tiers (NO_PREEMPTION > RANK > PRIO), remote-user determination, the rank
