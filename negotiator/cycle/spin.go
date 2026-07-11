@@ -466,6 +466,7 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 			LimitUsedUnclaimed:      limitUsedUnclaimed,
 			OnlyForStartdRank:       onlyForStartdRank,
 			SubmitterName:           sub.name,
+			Concurrency:             st.limits,
 		}
 		cand, rej, err := c.mm.Match(sctx, cur, st.view, limits)
 		if err != nil {
@@ -517,7 +518,17 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 		if !c.sendMatch(ctx, sub, mr) {
 			return mmError
 		}
-		c.acct.AddMatch(sub.name, cand.Slot, c.now())
+		// Account the match off the ENRICHED ad: it carries MatchedConcurrencyLimits
+		// (from EnrichMatchAd), which the accountant persists on the Resource record
+		// and folds into the cross-cycle concurrency counts (mirrors the C++ AddMatch
+		// on the offer). Name/StartdIpAddr/SlotWeight are copied unchanged, so the
+		// weighted-usage accounting is identical to charging cand.Slot.
+		c.acct.AddMatch(sub.name, enriched, c.now())
+		// Charge the request's concurrency limits against the per-cycle tracker the
+		// matchmaker gate reads (roadmap #3).
+		if cl, ok := cur.Ad.EvaluateAttrString("ConcurrencyLimits"); ok && cl != "" {
+			st.limits.add(cl)
+		}
 		st.view.Consume(cand.ScanIndex)
 		st.stats.Matches++
 		limitUsed += cost

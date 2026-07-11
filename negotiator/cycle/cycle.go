@@ -87,6 +87,10 @@ type runState struct {
 	// shared between the floor round and the main round.
 	subs map[*classad.ClassAd]*subState
 
+	// limits is the per-cycle concurrency-limit usage view the matchmaker gate
+	// reads and the commit path increments (roadmap #3).
+	limits *concurrencyTracker
+
 	// Group context (nil tree = flat pool).
 	tree        *negotiator.GroupNode
 	nameMap     map[string]*negotiator.GroupNode
@@ -162,6 +166,7 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		untrimmedTotal: untrimmedTotal,
 		stats:          stats,
 		subs:           make(map[*classad.ClassAd]*subState, len(snap.Submitters)),
+		limits:         c.newConcurrencyTracker(),
 	}
 	defer c.drainWorkers(st)
 

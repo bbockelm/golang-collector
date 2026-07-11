@@ -81,6 +81,14 @@ type Config struct {
 	// (single-root) path. Callers should start from DefaultConfig(), which
 	// seeds this with accountant.DefaultGroupConfig().
 	Group accountant.GroupConfig
+
+	// ConcurrencyLimitMax resolves a concurrency limit's configured maximum
+	// (roadmap #3): <NAME>_LIMIT, else CONCURRENCY_LIMIT_DEFAULT_<PREFIX>, else
+	// CONCURRENCY_LIMIT_DEFAULT, else a large "unlimited" default. ConfigFromKnobs
+	// wires it to accountant.GetLimitMax over the KnobGetter. A nil resolver means
+	// every limit is unlimited, so concurrency limits never reject -- the
+	// safe-by-default behavior when no limits are configured.
+	ConcurrencyLimitMax func(name string) float64
 }
 
 // DefaultConfig returns a Config populated with the HTCondor defaults.

@@ -54,6 +54,12 @@ func ConfigFromKnobs(get accountant.KnobGetter) Config {
 	}
 	cfg.DisableAccountingAds = !knobBool(get, "NEGOTIATOR_ADVERTISE_ACCOUNTING", true)
 	cfg.Group = accountant.GroupConfigFromKnobs(get)
+	// Concurrency-limit max resolver (roadmap #3): the <NAME>_LIMIT /
+	// CONCURRENCY_LIMIT_DEFAULT[_<PREFIX>] config, resolved live per limit name
+	// over the same KnobGetter (the accountant holds no concurrency config).
+	cfg.ConcurrencyLimitMax = func(name string) float64 {
+		return accountant.GetLimitMax(get, name)
+	}
 	return cfg
 }
 

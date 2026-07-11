@@ -58,6 +58,15 @@ const (
 	reasonPreemptionPolicy = "PREEMPTION_REQUIREMENTS == False"
 )
 
+// reasonConcurrencyLimit builds the verbatim C++ concurrency-limit reject
+// message: "concurrency limit " + <joined rejected limit names> + " reached"
+// (matchmaker.cpp:4351-4352, diagnostic_message). The short D_MATCH diag_reason
+// is "concurrency limit reached", but the reason string sent on the wire is the
+// message form, which names the offending limit(s).
+func reasonConcurrencyLimit(names string) string {
+	return "concurrency limit " + names + " reached"
+}
+
 // rankCondStd / rankCondPrioPreempt are the fixed rank-condition expressions the
 // C++ negotiator parses once in its ctor (matchmaker.cpp:419-423). Both are
 // evaluated in the machine (MY=candidate) context with TARGET=request, so
@@ -214,6 +223,22 @@ func (m *Matchmaker) Match(ctx context.Context, req *negotiator.Request, view ne
 	}
 	if limits == nil {
 		return nil, nil, fmt.Errorf("matchmaker: nil match limits")
+	}
+
+	// Concurrency-limit gate (roadmap #3): reject the whole request up front if
+	// it would push a named limit over its max (the C++ literal-string path,
+	// matchmaker.cpp:4730-4737). Done before the scan so the sharded scan stays
+	// a pure function of its inputs. Only the literal ConcurrencyLimits string is
+	// honored (see concurrency.go).
+	if limits.Concurrency != nil {
+		if cl, ok := req.Ad.EvaluateAttrString("ConcurrencyLimits"); ok && cl != "" {
+			if rejected, names := rejectForConcurrencyLimits(cl, limits.Concurrency); rejected {
+				return nil, &negotiator.RejectInfo{
+					ForConcurrencyLim: 1,
+					Reason:            reasonConcurrencyLimit(names),
+				}, nil
+			}
+		}
 	}
 
 	cands := gather(view)

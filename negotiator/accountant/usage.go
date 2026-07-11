@@ -98,10 +98,10 @@ func (a *Accountant) AddMatch(submitter string, slotAd *classad.ClassAd, now tim
 	if !ok {
 		return
 	}
-	a.addMatchLocked(submitter, name, a.getSlotWeight(slotAd), now.Unix())
+	a.addMatchLocked(submitter, name, a.getSlotWeight(slotAd), concurrencyLimitsOf(slotAd), now.Unix())
 }
 
-func (a *Accountant) addMatchLocked(customer, resourceName string, weight float64, T int64) {
+func (a *Accountant) addMatchLocked(customer, resourceName string, weight float64, limits string, T int64) {
 	delta := T - a.lastUpdate
 
 	// Submitter record.
@@ -135,6 +135,14 @@ func (a *Accountant) addMatchLocked(customer, resourceName string, weight float6
 	a.store.setString(tableResource, resourceName, attrRemoteUser, customer)
 	a.store.setFloat(tableResource, resourceName, attrSlotWeight, weight)
 	a.store.setInt(tableResource, resourceName, attrStartTime, T)
+
+	// Concurrency limits: stamp the matched list on the Resource record (so
+	// RemoveMatch can undo exactly these) and increment the per-limit counts
+	// (Accountant.cpp:925-928).
+	if limits != "" {
+		a.store.setString(tableResource, resourceName, attrMatchedConcurrencyLimits, limits)
+		a.incrementLimitsLocked(limits)
+	}
 }
 
 // RemoveMatch settles and removes a match by resource name: charges the elapsed
@@ -211,6 +219,12 @@ func (a *Accountant) removeMatchLocked(resourceName string, T int64) {
 		a.store.setFloat(tableCustomer, part, attrHierWeightedResourcesUsed, h)
 	}
 
+	// Concurrency limits: give back exactly the limits this match consumed
+	// (recorded on the Resource record by addMatchLocked; Accountant.cpp).
+	if limits, ok := rec.getString(attrMatchedConcurrencyLimits); ok && limits != "" {
+		a.decrementLimitsLocked(limits)
+	}
+
 	a.store.deleteRecord(tableResource, resourceName)
 }
 
@@ -260,12 +274,17 @@ func (a *Accountant) CheckMatches(slotAds []*classad.ClassAd, now time.Time) {
 		a.store.setFloat(tableCustomer, name, attrWeightedResourcesUsed, 0)
 	}
 
+	// Zero the per-limit concurrency counts too; they are rebuilt authoritatively
+	// from the live claimed slots below (Accountant::LoadLimits -> ClearLimits +
+	// IncrementLimits, Accountant.cpp:1938-1969).
+	a.clearLimitsLocked()
+
 	// Re-add every currently-claimed slot.
 	T := now.Unix()
 	for _, ad := range slotAds {
 		if cust, ok := a.isClaimed(ad); ok {
 			if name, ok := getResourceName(ad); ok {
-				a.addMatchLocked(cust, name, a.getSlotWeight(ad), T)
+				a.addMatchLocked(cust, name, a.getSlotWeight(ad), concurrencyLimitsOf(ad), T)
 			}
 		}
 	}

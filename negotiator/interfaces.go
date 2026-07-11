@@ -153,6 +153,31 @@ type MatchLimits struct {
 	// SubmitterName is the negotiating submitter's accounting principal, needed
 	// for the remoteUser != submitterName prio-preemption test.
 	SubmitterName string
+
+	// Concurrency is the cycle's live concurrency-limit view. When non-nil and
+	// the request carries a ConcurrencyLimits attribute, the matchmaker gates the
+	// whole request (before the candidate scan, mirroring the C++
+	// evaluate_limits_with_match==false literal-string path): a request is
+	// rejected if consuming its limits would push any named limit over its
+	// configured max (RejectInfo.ForConcurrencyLim). It is read-only from the
+	// matchmaker's side -- the cycle owns the mutable usage and seeds/increments
+	// it -- so the gate stays a pure function of its inputs.
+	Concurrency ConcurrencyLimits
+}
+
+// ConcurrencyLimits gives the matchmaker's concurrency-limit gate its two
+// inputs: the current in-cycle usage of a named limit and that limit's
+// configured maximum. Names are the lowercased limit names parsed out of a
+// request's ConcurrencyLimits attribute (an optional ":weight" suffix is
+// stripped by the caller). The cycle owns the concrete implementation
+// (cycle.concurrencyTracker); tests may supply a simple map-backed stub.
+type ConcurrencyLimits interface {
+	// Usage returns the current weighted in-cycle usage of a limit, including
+	// the cross-cycle carryover seeded from the accountant at cycle start.
+	Usage(name string) float64
+	// Max returns the configured maximum for a limit (a large default means
+	// effectively unlimited, matching CONCURRENCY_LIMIT_DEFAULT).
+	Max(name string) float64
 }
 
 // RejectInfo explains a no-match for REJECTED_WITH_REASON.
