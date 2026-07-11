@@ -15,6 +15,7 @@ package accountant
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -114,6 +115,13 @@ type Config struct {
 	GroupPrioFactor func(group string) float64
 	// LogFile is ACCOUNTANT_DATABASE_FILE; "" means memory-only (tests).
 	LogFile string
+	// ImportFrom, when non-empty, is the path to a C++ negotiator
+	// Accountantnew.log (ClassAdLog journal) whose accumulated priority/usage
+	// is imported ONCE into a fresh native store, so a Go negotiator can take
+	// over a running C++ pool in place (roadmap #4). The import is a no-op when
+	// the native store already holds Customer records (an earlier run already
+	// imported), so it is safe to leave configured. See import.go.
+	ImportFrom string
 }
 
 // DefaultConfig returns a Config populated with the HTCondor default values,
@@ -160,6 +168,21 @@ func New(cfg Config) (*Accountant, error) {
 	store, err := OpenStore(cfg.LogFile)
 	if err != nil {
 		return nil, fmt.Errorf("accountant: %w", err)
+	}
+	// One-shot import of a C++ Accountantnew.log. IDEMPOTENCY GUARD: only when
+	// the freshly replayed native store holds no Customer records yet (a fresh
+	// native log). A later run replays the native log we wrote below, finds
+	// Customer records, and skips -- so ImportFrom may stay configured
+	// permanently (NEGOTIATOR_CPP_DIFFERENCES.md §3). Must run before the root
+	// group / reconcile bootstrap below, which itself writes Customer records.
+	if cfg.ImportFrom != "" && store.count(tableCustomer) == 0 {
+		n, err := store.loadCppAccountantLog(cfg.ImportFrom)
+		if err != nil {
+			store.Close()
+			return nil, fmt.Errorf("accountant: importing %q: %w", cfg.ImportFrom, err)
+		}
+		slog.Info("accountant: imported C++ Accountantnew.log into native store",
+			"path", cfg.ImportFrom, "records", n)
 	}
 	a := &Accountant{
 		store:    store,

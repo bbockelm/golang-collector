@@ -50,6 +50,7 @@ func run() error {
 	// our launch. -local-name additionally scopes config lookups.
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
+	importLog := flag.String("import", "", "path to a C++ negotiator Accountantnew.log to import ONCE into the native accountant store (overrides ACCOUNTANT_IMPORT_LOG); imported only when the native store has no existing Customer records")
 	flag.Parse()
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "NEGOTIATOR", LocalName: *localName})
@@ -133,6 +134,20 @@ func run() error {
 	// 3.4). Point the knob at a fresh path when migrating from C++.
 	acctCfg := accountant.ConfigFromKnobs(cfg.Get)
 	acctCfg.LogFile = accountantLogFile(cfg)
+	// One-shot C++ Accountantnew.log import: the -import flag, else the
+	// ACCOUNTANT_IMPORT_LOG knob. The accountant applies it only when its native
+	// store has no existing Customer records (idempotent across restarts), so a
+	// pool can migrate its accumulated priority/usage in place from a running
+	// C++ negotiator without resetting fair-share history.
+	if v := strings.TrimSpace(*importLog); v != "" {
+		acctCfg.ImportFrom = v
+	} else {
+		acctCfg.ImportFrom = configString(cfg, "ACCOUNTANT_IMPORT_LOG")
+	}
+	if acctCfg.ImportFrom != "" {
+		log.Info(logging.DestinationGeneral, "accountant one-shot C++ log import configured (applied once, only when the native store has no Customer records)",
+			"import_from", acctCfg.ImportFrom, "native_store", acctCfg.LogFile)
+	}
 	acct, err := accountant.New(acctCfg)
 	if err != nil {
 		return err
