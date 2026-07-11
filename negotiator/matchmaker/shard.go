@@ -9,14 +9,19 @@ import (
 )
 
 // rejCounters tallies the per-scan rejection reasons the reject-info selection
-// needs. Preemption/concurrency/network counters are deferred (design doc 4.3),
-// so only the submitter-limit counter is live.
+// needs, mirroring the C++ rej* counters (matchmaker.cpp). Concurrency/network
+// counters are deferred (roadmap #3), so only submitter-limit and the two
+// preemption counters are live.
 type rejCounters struct {
-	submitterLimit int
+	submitterLimit int // rejForSubmitterLimit
+	preemptPolicy  int // rejPreemptForPolicy (PREEMPTION_REQUIREMENTS == False)
+	preemptRank    int // rejPreemptForRank   (rankCondPrioPreempt false)
 }
 
 func (r *rejCounters) add(o rejCounters) {
 	r.submitterLimit += o.submitterLimit
+	r.preemptPolicy += o.preemptPolicy
+	r.preemptRank += o.preemptRank
 }
 
 // parallelScan evaluates every candidate against reqAd, sharding the candidate
@@ -115,11 +120,15 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 	return best, rej
 }
 
-// evalCandidate runs the full per-candidate pipeline for one offer:
+// evalCandidate runs the full per-candidate pipeline for one offer, porting the
+// C++ matchmakingAlgorithm inner body (matchmaker.cpp:4950-5078):
 //  1. bilateral Requirements (job.Requirements with TARGET=machine AND
 //     machine.Requirements with TARGET=job) via MatchClassAd.Symmetry;
-//  2. the submitter-limit gate (SubmitterLimitPermits);
-//  3. the rank tuple (calculateRanks).
+//  2. preemption classification (when ConsiderPreemption): determine remoteUser
+//     and set the preemption tier (NO/RANK/PRIO), gating PRIO on
+//     PREEMPTION_REQUIREMENTS and rankCondPrioPreempt;
+//  3. the tier-specific submitter-limit gate (SubmitterLimitPermits);
+//  4. the rank tuple (calculateRanks), including PREEMPTION_RANK when preempting.
 //
 // Returns nil (and bumps the appropriate reject counter) when the candidate is
 // filtered out. Requirements failures bump NO counter, matching the C++ `continue`
@@ -127,28 +136,131 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, rej *rejCounters) *negotiator.Candidate {
 	mc.ReplaceRightAd(c.slot)
 
-	// (1) bilateral Requirements.
+	// (1) bilateral Requirements. (The C++ pslotMultiMatch retry for
+	// WantPslotPreemption jobs is deferred, roadmap #6; a Requirements failure
+	// is simply "not a match".)
 	if !mc.Symmetry("Requirements", "Requirements") {
 		return nil
 	}
 
-	// (2) submitter-limit gate (unclaimed variant; preemption deferred).
+	// (2) preemption classification + (3) submitter-limit gate.
+	tier := noPreemption
+	if m.considerPreemption {
+		var ok bool
+		if tier, ok = m.classifyPreemption(mc, c.slot, limits, rej); !ok {
+			return nil
+		}
+	}
+
 	cost := m.slotWeight(c.slot)
-	if !submitterLimitPermits(limits.LimitUsed, limits.SubmitterLimit, cost) {
+	if !m.submitterLimitGate(tier, limits, cost) {
 		rej.submitterLimit++
 		return nil
 	}
 
-	// (3) rank tuple (calculateRanks).
+	// (4) rank tuple (calculateRanks). PreemptRank is the NO_PREEMPTION sentinel
+	// unless this is a preempting match (matchmaker.cpp:5231-5236).
+	preemptRank := preemptRankDef
+	if tier != noPreemption {
+		preemptRank = rankRight(mc, m.preemptionRank)
+	}
 	return &negotiator.Candidate{
 		Slot:        c.slot,
 		PreJobRank:  rankRight(mc, m.preJobRank),
 		Rank:        jobRank(mc),
 		PostJobRank: rankRight(mc, m.postJobRank),
-		PreemptTier: noPreemption,
-		PreemptRank: preemptRankDef,
+		PreemptTier: tier,
+		PreemptRank: preemptRank,
 		ScanIndex:   c.idx,
 	}
+}
+
+// classifyPreemption ports the remoteUser lookup + preemption-tier decision
+// (matchmaker.cpp:4961-5064). It returns the tier and ok=false when the
+// candidate must be skipped (bumping the relevant reject counter). Only called
+// when ConsiderPreemption is on. mc's right ad is already the candidate.
+func (m *Matchmaker) classifyPreemption(mc *classad.MatchClassAd, slot *classad.ClassAd, limits *negotiator.MatchLimits, rej *rejCounters) (tier int, ok bool) {
+	// remoteUser: preempting user if any, else the running user. Lookup order
+	// matches matchmaker.cpp:4963-4968 exactly.
+	remoteUser := lookupRemoteUser(slot)
+
+	// only_for_startdrank branch (matchmaker.cpp:4977-5006): only claimed slots
+	// this offer strictly prefers become RANK_PREEMPTION candidates; everything
+	// else is skipped (no reject counter, matching the C++ `continue`).
+	if limits.OnlyForStartdRank {
+		if remoteUser == "" {
+			return 0, false // unclaimed: cannot eval startd rank
+		}
+		if !evalBoolRight(mc, m.rankCondStd) {
+			return 0, false // offer does not strictly prefer this request
+		}
+		return rankPreemption, true
+	}
+
+	// Normal branch (matchmaker.cpp:5010-5064): classify a claimed slot.
+	if remoteUser != "" {
+		switch {
+		case evalBoolRight(mc, m.rankCondStd):
+			// Offer strictly prefers this request: preempt for rank.
+			return rankPreemption, true
+		case remoteUser != limits.SubmitterName:
+			// Different user (or same user, different group): prio preemption,
+			// gated by PREEMPTION_REQUIREMENTS then rankCondPrioPreempt.
+			if m.preemptionReq != nil && !evalBoolRight(mc, m.preemptionReq) {
+				rej.preemptPolicy++
+				return 0, false
+			}
+			if !evalBoolRight(mc, m.rankCondPrioPreempt) {
+				rej.preemptRank++
+				return 0, false
+			}
+			return prioPreemption, true
+		default:
+			// Same user and not startd-rank-preferred: skip.
+			return 0, false
+		}
+	}
+
+	// Unclaimed slot: a plain (no-preemption) match.
+	return noPreemption, true
+}
+
+// submitterLimitGate applies the tier-specific submitter-limit check
+// (matchmaker.cpp:5066-5070). With preemption off, every candidate is
+// NO_PREEMPTION and gates on SubmitterLimit/LimitUsed (byte-identical to the
+// MVP). With preemption on, NO_PREEMPTION gates on the Unclaimed variant, PRIO
+// on the full limit, and RANK bypasses the limit (startd-rank preemptions are
+// allowed regardless of user priority).
+func (m *Matchmaker) submitterLimitGate(tier int, limits *negotiator.MatchLimits, cost float64) bool {
+	if !m.considerPreemption {
+		return submitterLimitPermits(limits.LimitUsed, limits.SubmitterLimit, cost)
+	}
+	switch tier {
+	case rankPreemption:
+		return true
+	case prioPreemption:
+		return submitterLimitPermits(limits.LimitUsed, limits.SubmitterLimit, cost)
+	default: // noPreemption
+		return submitterLimitPermits(limits.LimitUsedUnclaimed, limits.SubmitterLimitUnclaimed, cost)
+	}
+}
+
+// lookupRemoteUser returns the accounting principal to preempt on a slot,
+// using the C++ precedence: PreemptingAccountingGroup, PreemptingUser,
+// AccountingGroup, RemoteUser (matchmaker.cpp:4963-4968). "" means the slot is
+// unclaimed.
+func lookupRemoteUser(slot *classad.ClassAd) string {
+	for _, attr := range []string{
+		"PreemptingAccountingGroup",
+		"PreemptingUser",
+		"AccountingGroup",
+		"RemoteUser",
+	} {
+		if v, ok := slot.EvaluateAttrString(attr); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // cloneAd makes a shallow copy of src: a fresh ClassAd carrying the same

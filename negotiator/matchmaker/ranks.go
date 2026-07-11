@@ -45,3 +45,21 @@ func jobRank(mc *classad.MatchClassAd) float64 {
 	}
 	return 0.0
 }
+
+// evalBoolRight evaluates a parsed boolean expression in the machine (right)
+// context with the job as TARGET, mirroring the C++
+// EvalExprToBool(expr, candidate, &request, result) && result.IsBooleanValue(val)
+// && val idiom used for rankCondStd, rankCondPrioPreempt and PREEMPTION_REQUIREMENTS
+// (matchmaker.cpp:4991, :5017, :5030, :5041). A nil expr, a non-boolean result,
+// or a false result all yield false.
+func evalBoolRight(mc *classad.MatchClassAd, expr ast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	v := mc.EvaluateExprRight(expr)
+	if !v.IsBool() {
+		return false
+	}
+	b, err := v.BoolValue()
+	return err == nil && b
+}

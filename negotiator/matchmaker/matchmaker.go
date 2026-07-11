@@ -30,10 +30,15 @@ import (
 	"github.com/bbockelm/golang-collector/negotiator"
 )
 
-// Preemption tier constant. Preemption is deferred (design doc 4.3), so every
-// match is NO_PREEMPTION; the value 2 matches the C++ PreemptState enum where
-// NO_PREEMPTION=2 beats RANK_PREEMPTION=1 beats PRIO_PREEMPTION=0.
-const noPreemption = 2
+// Preemption tier constants, matching the C++ PreemptState enum where
+// NO_PREEMPTION=2 beats RANK_PREEMPTION=1 beats PRIO_PREEMPTION=0 (more is
+// better in Candidate.Better). With preemption off every candidate is
+// noPreemption.
+const (
+	prioPreemption = 0
+	rankPreemption = 1
+	noPreemption   = 2
+)
 
 // Rank defaults, mirroring the C++ negotiator:
 //   - EvalNegotiatorMatchRank returns -(DBL_MAX) when the expr is absent or does
@@ -45,10 +50,25 @@ const (
 	preemptRankDef = -math.MaxFloat32
 )
 
-// Reject reason strings, verbatim from matchmaker.cpp:4324 / :4360.
+// Reject reason strings, verbatim from the C++ reject-reason ladder
+// (matchmaker.cpp:4336-4361).
 const (
-	reasonNoMatch        = "no match found"
-	reasonSubmitterLimit = "submitter limit exceeded"
+	reasonNoMatch          = "no match found"
+	reasonSubmitterLimit   = "submitter limit exceeded"
+	reasonPreemptionPolicy = "PREEMPTION_REQUIREMENTS == False"
+)
+
+// rankCondStd / rankCondPrioPreempt are the fixed rank-condition expressions the
+// C++ negotiator parses once in its ctor (matchmaker.cpp:419-423). Both are
+// evaluated in the machine (MY=candidate) context with TARGET=request, so
+// MY.Rank is the machine's Rank expression scored against this request and
+// MY.CurrentRank is the machine's rank of the job it is currently running.
+//
+//	rankCondStd         = MY.Rank >  MY.CurrentRank   (strictly prefers)
+//	rankCondPrioPreempt = MY.Rank >= MY.CurrentRank   (at least as good)
+const (
+	rankCondStdExpr         = "MY.Rank > MY.CurrentRank"
+	rankCondPrioPreemptExpr = "MY.Rank >= MY.CurrentRank"
 )
 
 // Config configures a Matchmaker. PreJobRank/PostJobRank are the
@@ -65,6 +85,22 @@ type Config struct {
 	Serial             bool
 	Workers            int
 	DisableSlotWeights bool
+
+	// ConsiderPreemption mirrors NEGOTIATOR_CONSIDER_PREEMPTION. When false the
+	// matchmaker pins every candidate to NO_PREEMPTION and gates on the single
+	// SubmitterLimit (the preemption-off path, byte-identical to the MVP). When
+	// true, claimed candidates are classified into RANK/PRIO preemption tiers.
+	ConsiderPreemption bool
+	// PreemptionRequirements / PreemptionRank are the PREEMPTION_REQUIREMENTS /
+	// PREEMPTION_RANK expressions, parsed once here (like Pre/PostJobRank). Both
+	// evaluate with MY=candidate (machine), TARGET=request (job) --
+	// EvalExprToBool(PreemptionReq, candidate, &request) / EvalNegotiatorMatchRank
+	// (matchmaker.cpp:5030-5031, :5234-5236, :1633-1634). Cross-ad references
+	// must be qualified TARGET.<attr> (the Go classad evaluator does not fall
+	// unqualified references through to TARGET, matching how job Requirements/
+	// Rank already qualify their references in this port).
+	PreemptionRequirements string
+	PreemptionRank         string
 }
 
 // Matchmaker implements negotiator.Matchmaker. It is safe for sequential Match
@@ -72,6 +108,12 @@ type Config struct {
 type Matchmaker struct {
 	preJobRank  ast.Expr // parsed NEGOTIATOR_PRE_JOB_RANK, nil if unset
 	postJobRank ast.Expr // parsed NEGOTIATOR_POST_JOB_RANK, nil if unset
+
+	considerPreemption  bool
+	preemptionReq       ast.Expr // parsed PREEMPTION_REQUIREMENTS, nil if unset (=> always allow)
+	preemptionRank      ast.Expr // parsed PREEMPTION_RANK, nil if unset
+	rankCondStd         ast.Expr // MY.Rank > MY.CurrentRank
+	rankCondPrioPreempt ast.Expr // MY.Rank >= MY.CurrentRank
 
 	serial         bool
 	workers        int
@@ -85,9 +127,10 @@ var _ negotiator.Matchmaker = (*Matchmaker)(nil)
 // default is true).
 func New(cfg Config) (*Matchmaker, error) {
 	m := &Matchmaker{
-		serial:         cfg.Serial,
-		workers:        cfg.Workers,
-		useSlotWeights: !cfg.DisableSlotWeights,
+		serial:             cfg.Serial,
+		workers:            cfg.Workers,
+		useSlotWeights:     !cfg.DisableSlotWeights,
+		considerPreemption: cfg.ConsiderPreemption,
 	}
 
 	var err error
@@ -96,6 +139,20 @@ func New(cfg Config) (*Matchmaker, error) {
 	}
 	if m.postJobRank, err = parseRankExpr("NEGOTIATOR_POST_JOB_RANK", cfg.PostJobRank); err != nil {
 		return nil, err
+	}
+	if m.preemptionReq, err = parseRankExpr("PREEMPTION_REQUIREMENTS", cfg.PreemptionRequirements); err != nil {
+		return nil, err
+	}
+	if m.preemptionRank, err = parseRankExpr("PREEMPTION_RANK", cfg.PreemptionRank); err != nil {
+		return nil, err
+	}
+	// The rank-condition expressions are fixed; parse errors are impossible but
+	// checked for defensiveness.
+	if m.rankCondStd, err = parser.ParseExpr(rankCondStdExpr); err != nil {
+		return nil, fmt.Errorf("parsing rankCondStd: %w", err)
+	}
+	if m.rankCondPrioPreempt, err = parser.ParseExpr(rankCondPrioPreemptExpr); err != nil {
+		return nil, fmt.Errorf("parsing rankCondPrioPreempt: %w", err)
 	}
 
 	if m.serial {
@@ -141,8 +198,13 @@ func parseRankExpr(name, s string) (ast.Expr, error) {
 //     matchmakingAlgorithm. MatchLimits.Ceiling is therefore ignored by Match;
 //     the cycle orchestrator stops offering to a submitter once its ceiling is
 //     hit.
-//   - Preemption: deferred; every candidate is NO_PREEMPTION so we only ever
-//     apply the "unclaimed" submitter-limit variant (design doc 4.3).
+//   - Preemption: when Config.ConsiderPreemption is false every candidate is
+//     NO_PREEMPTION and only the SubmitterLimit/LimitUsed gate applies (the
+//     unclaimed variant). When true, claimed candidates are classified into
+//     RANK/PRIO preemption tiers (evalCandidate, shard.go) and the tier selects
+//     which submitter-limit accumulator gates them (matchmaker.cpp:5066-5070):
+//     PRIO uses SubmitterLimit/LimitUsed, NO_PREEMPTION uses the Unclaimed
+//     variant, and RANK bypasses the submitter limit entirely.
 func (m *Matchmaker) Match(ctx context.Context, req *negotiator.Request, view negotiator.SlotView, limits *negotiator.MatchLimits) (*negotiator.Candidate, *negotiator.RejectInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -161,16 +223,26 @@ func (m *Matchmaker) Match(ctx context.Context, req *negotiator.Request, view ne
 		return best, nil, nil
 	}
 
-	// No candidate. Reproduce the C++ dominant-reason selection
-	// (matchmaker.cpp:4324-4361): "no match found" unless a submitter-limit
-	// rejection occurred, in which case "submitter limit exceeded". Requirements
-	// failures increment no counter (they just `continue`), so an all-fail scan
-	// reports "no match found".
-	ri := &negotiator.RejectInfo{}
-	if rej.submitterLimit > 0 {
+	// No candidate. Reproduce the C++ dominant-reason ladder
+	// (matchmaker.cpp:4336-4361), in priority order. Only the counters this
+	// matchmaker tracks are represented: network/bandwidth (never set here) and
+	// concurrency (deferred, roadmap #3) are omitted, so the reachable ladder is
+	//   PREEMPTION_REQUIREMENTS == False  (rejPreemptForPolicy)
+	//   submitter limit exceeded          (rejForSubmitterLimit)
+	//   no match found                    (fallthrough)
+	// Note rejPreemptForRank is tracked for diagnostics but, as in C++, is NOT a
+	// distinct reason: on its own the scan falls through to "no match found".
+	ri := &negotiator.RejectInfo{
+		ForSubmitterLimit:   rej.submitterLimit,
+		ForPreemptionPolicy: rej.preemptPolicy,
+		ForPreemptionRank:   rej.preemptRank,
+	}
+	switch {
+	case rej.preemptPolicy > 0:
+		ri.Reason = reasonPreemptionPolicy
+	case rej.submitterLimit > 0:
 		ri.Reason = reasonSubmitterLimit
-		ri.ForSubmitterLimit = rej.submitterLimit
-	} else {
+	default:
 		ri.Reason = reasonNoMatch
 	}
 	return nil, ri, nil

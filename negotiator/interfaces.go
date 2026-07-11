@@ -126,11 +126,33 @@ type Matchmaker interface {
 
 // MatchLimits carries the pie-spin bookkeeping the matchmaker's submitter-limit
 // gate needs (design doc 4.2/4.3).
+//
+// The Unclaimed variants and OnlyForStartdRank/SubmitterName fields only matter
+// when preemption is enabled (NEGOTIATOR_CONSIDER_PREEMPTION). With preemption
+// off the matchmaker uses SubmitterLimit/LimitUsed exclusively and every
+// candidate is NO_PREEMPTION, so the zero values of the preemption fields keep
+// the preemption-off path byte-identical. The C++ negotiate() tracks the claimed
+// (SubmitterLimit/LimitUsed) and unclaimed (SubmitterLimitUnclaimed/
+// LimitUsedUnclaimed) accumulators separately and passes only_for_startdrank
+// into matchmakingAlgorithm (matchmaker.cpp:4145-4146, :4196-4213, :5066-5070).
 type MatchLimits struct {
 	SubmitterLimit float64
 	LimitUsed      float64
 	PieLeft        float64
 	Ceiling        float64 // remaining ceiling headroom; MaxFloat64 = none
+
+	// SubmitterLimitUnclaimed / LimitUsedUnclaimed are the "unclaimed" submitter
+	// limit and its running use, gating NO_PREEMPTION (unclaimed) candidates.
+	// Equal to SubmitterLimit/LimitUsed on a flat pool with preemption off.
+	SubmitterLimitUnclaimed float64
+	LimitUsedUnclaimed      float64
+	// OnlyForStartdRank is the C++ only_for_startdrank flag: when set, only
+	// startd-rank-preferred (RANK_PREEMPTION) candidates are eligible (the
+	// submitter is over its fair share but ignore_submitter_limit is in effect).
+	OnlyForStartdRank bool
+	// SubmitterName is the negotiating submitter's accounting principal, needed
+	// for the remoteUser != submitterName prio-preemption test.
+	SubmitterName string
 }
 
 // RejectInfo explains a no-match for REJECTED_WITH_REASON.
@@ -139,6 +161,17 @@ type RejectInfo struct {
 	ForSubmitterLimit int
 	ForConcurrencyLim int
 	ForNetworkShare   int
+	// ForPreemptionPolicy counts candidates rejected because
+	// PREEMPTION_REQUIREMENTS evaluated false (C++ rejPreemptForPolicy); it maps
+	// to the "PREEMPTION_REQUIREMENTS == False" reject reason.
+	ForPreemptionPolicy int
+	// ForPreemptionRank counts candidates rejected because the machine did not
+	// rank the preempting job at least as well as its current job
+	// (rankCondPrioPreempt false; C++ rejPreemptForRank). C++ tracks this
+	// counter for diagnostics but does NOT surface it as a distinct reject
+	// reason (the ladder at matchmaker.cpp:4336-4361 has no rejPreemptForRank
+	// branch), so on its own it yields "no match found".
+	ForPreemptionRank int
 }
 
 // ScheddSession is the negotiator side of one NEGOTIATE conversation with a

@@ -39,6 +39,13 @@ func ConfigFromKnobs(get accountant.KnobGetter) Config {
 		cfg.PostJobRank = strings.TrimSpace(v)
 	}
 	cfg.DisableSlotWeights = !knobBool(get, "NEGOTIATOR_USE_SLOT_WEIGHTS", true)
+	cfg.ConsiderPreemption = knobBool(get, "NEGOTIATOR_CONSIDER_PREEMPTION", true)
+	if v, ok := get("PREEMPTION_REQUIREMENTS"); ok {
+		cfg.PreemptionRequirements = strings.TrimSpace(v)
+	}
+	if v, ok := get("PREEMPTION_RANK"); ok {
+		cfg.PreemptionRank = strings.TrimSpace(v)
+	}
 	if v, ok := get("NEGOTIATOR_NAME"); ok {
 		cfg.NegotiatorName = strings.TrimSpace(v)
 	}

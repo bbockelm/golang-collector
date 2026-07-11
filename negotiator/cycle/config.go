@@ -47,12 +47,23 @@ type Config struct {
 	// keeps the zero-value Config on the HTCondor default (weights on).
 	DisableSlotWeights bool
 
-	// ConsiderPreemption mirrors NEGOTIATOR_CONSIDER_PREEMPTION. Preemption is
-	// deferred (design doc scope): the only supported value is false, which
-	// selects the C++ preemption-off code paths everywhere (claimed non-pslot
-	// ads trimmed up-front, unclaimed submitter limits, submitter limits
-	// respected on every spin). New rejects a true value.
+	// ConsiderPreemption mirrors NEGOTIATOR_CONSIDER_PREEMPTION (C++ default
+	// true; DefaultConfig sets true). When false the C++ preemption-off code
+	// paths are selected everywhere (claimed non-pslot ads trimmed up-front,
+	// unclaimed submitter limits, submitter limits respected on every spin) --
+	// this is the preemption-off regression path and what the differential
+	// harness sets for a fair comparison against a preemption-off C++ pool.
+	// When true, claimed slots are retained as preemption candidates, spin-1
+	// bypasses the submitter limit for startd-rank-preferred jobs, and the
+	// matchmaker classifies candidates into RANK/PRIO preemption tiers.
 	ConsiderPreemption bool
+
+	// PreemptionRequirements / PreemptionRank are the PREEMPTION_REQUIREMENTS /
+	// PREEMPTION_RANK expressions, passed through to the matchmaker. Empty means
+	// unset: an unset PREEMPTION_REQUIREMENTS allows prio preemption (subject to
+	// rankCondPrioPreempt), matching the C++ `if (PreemptionReq && ...)` guard.
+	PreemptionRequirements string
+	PreemptionRank         string
 
 	// NegotiatorName is NEGOTIATOR_NAME, stamped in NEGOTIATE headers and on
 	// the published accounting ads.
@@ -73,12 +84,16 @@ type Config struct {
 }
 
 // DefaultConfig returns a Config populated with the HTCondor defaults.
+// ConsiderPreemption defaults true, matching the C++
+// NEGOTIATOR_CONSIDER_PREEMPTION default (matchmaker.cpp:820); set it false to
+// select the preemption-off path (e.g. the differential harness).
 func DefaultConfig() Config {
 	return Config{
 		RequestListSize:     200,
 		MaxTimePerCycle:     1200 * time.Second,
 		MaxTimePerSubmitter: 60 * time.Second,
 		MaxTimePerSpin:      120 * time.Second,
+		ConsiderPreemption:  true,
 		Group:               accountant.DefaultGroupConfig(),
 	}
 }
@@ -106,5 +121,8 @@ func (c Config) withDefaults() Config {
 	// UsingWeightedSlots feeds the group allocator's unweighted-pool special
 	// cases (remainder recovery + round robin); it tracks the slot-weight knob.
 	c.Group.UsingWeightedSlots = !c.DisableSlotWeights
+	// The group allocator's surplus/quota-halt logic depends on preemption too
+	// (groupalloc.go): keep the accountant's view in sync with the cycle knob.
+	c.Group.ConsiderPreemption = c.ConsiderPreemption
 	return c
 }

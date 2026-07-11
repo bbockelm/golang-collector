@@ -40,6 +40,11 @@ type spinEnv struct {
 	slotWeightTotal float64
 	pieLeft         float64
 	prios           map[string]float64 // per-spin effective-priority cache
+	// ignoreSubmitterLimit is the C++ ignore_submitter_limit: on spin 1 with
+	// preemption enabled, a submitter that exceeds its fair share keeps
+	// negotiating but only for startd-rank-preferred (RANK) preemptions
+	// (matchmaker.cpp:2484).
+	ignoreSubmitterLimit bool
 }
 
 // negotiateWithGroup is the pie-spin do/while, a port of
@@ -60,26 +65,39 @@ func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundIn
 		spin++
 		st.stats.PieSpins++
 
+		// ignore_submitter_limit: spin 1 with preemption on lets over-limit
+		// submitters keep negotiating for startd-rank preemptions, and (like
+		// C++ :2487) suppresses the group-quota halt so those rank preemptions
+		// are still considered.
+		ignoreSubmitterLimit := spin == 1 && c.cfg.ConsiderPreemption
+
 		// Group-quota halt check at the top of each spin (:2486-2491).
 		groupusage := 0.0
-		if ri.name != "" {
+		if !ignoreSubmitterLimit && ri.name != "" {
 			groupusage = c.acct.GetWeightedResourcesUsed(ri.name)
 			if groupusage >= ri.quota {
 				break
 			}
+		} else if ri.name != "" {
+			groupusage = c.acct.GetWeightedResourcesUsed(ri.name)
 		}
 
-		// Preemption off: drop submitters with no idle jobs before the
-		// normalization so they do not dilute fair share (:2499-2501).
-		subs = filterIdle(subs)
+		// Preemption off only: drop submitters with no idle jobs before the
+		// normalization so they do not dilute fair share (:2499-2501). With
+		// preemption on the C++ keeps them (they still count toward the
+		// normalization factor); negotiateOne skips them via mmDone.
+		if !c.cfg.ConsiderPreemption {
+			subs = filterIdle(subs)
+		}
 		if len(subs) == 0 {
 			break
 		}
 
 		env := &spinEnv{
-			spin:       spin,
-			groupusage: groupusage,
-			prios:      make(map[string]float64, len(subs)),
+			spin:                 spin,
+			groupusage:           groupusage,
+			prios:                make(map[string]float64, len(subs)),
+			ignoreSubmitterLimit: ignoreSubmitterLimit,
 		}
 		c.calculateNormalizationFactor(subs, env)
 
@@ -90,8 +108,10 @@ func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundIn
 		}
 
 		env.pieLeft = c.calculatePieLeft(subs, ri, env)
-		if env.pieLeft <= 0 {
-			// Preemption off: nothing left to hand out (:2527-2532).
+		if !c.cfg.ConsiderPreemption && env.pieLeft <= 0 {
+			// Preemption off: nothing left to hand out (:2527-2532). With
+			// preemption on, startd-rank preemptions may still match even with
+			// no fair-share pie; the outer progress check terminates the loop.
 			break
 		}
 
@@ -121,7 +141,8 @@ func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundIn
 				continue
 			}
 			// Group quota met mid-spin: halt (matchmaker.cpp:2584-2588).
-			if ri.name != "" && c.acct.GetWeightedResourcesUsed(ri.name) >= ri.quota {
+			// Suppressed on spin 1 with preemption on (ignore_submitter_limit).
+			if !env.ignoreSubmitterLimit && ri.name != "" && c.acct.GetWeightedResourcesUsed(ri.name) >= ri.quota {
 				halted = true
 				c.endRound(sub, false)
 				next = append(next, sub)
@@ -192,10 +213,18 @@ func (c *Cycle) calculateNormalizationFactor(subs []*subState, env *spinEnv) {
 }
 
 // calculateSubmitterLimit is Matchmaker::calculateSubmitterLimit
-// (matchmaker.cpp:5513-5574) in its preemption-off form: the fair-share limit
-// is capped by the unclaimed group headroom (quota - groupusage), and floor
-// rounds additionally cap at the submitter's Floor.
-func (c *Cycle) calculateSubmitterLimit(name string, ri roundInfo, env *spinEnv, isFloorRound bool) (limit, share, usage, prio float64) {
+// (matchmaker.cpp:5513-5574). It returns both the full submitter limit and the
+// "unclaimed" variant:
+//
+//   - limitUnclaimed = fair-share limit capped by the group-quota headroom
+//     (quota - groupusage);
+//   - limit          = fair-share limit; with preemption OFF it collapses to
+//     limitUnclaimed (:5556), with preemption ON it stays uncapped by the group
+//     headroom (claimed/prio-preemption matches may exceed it).
+//
+// Floor rounds additionally cap the full limit at the submitter's Floor (applied
+// after the ConsiderPreemption collapse, matching :5568-5572).
+func (c *Cycle) calculateSubmitterLimit(name string, ri roundInfo, env *spinEnv, isFloorRound bool) (limit, limitUnclaimed, share, usage, prio float64) {
 	prio = c.getPrio(env, name)
 	usage = c.acct.GetWeightedResourcesUsed(name)
 	share = env.maxPrio / (prio * env.normalFactor)
@@ -203,23 +232,27 @@ func (c *Cycle) calculateSubmitterLimit(name string, ri roundInfo, env *spinEnv,
 	if limit < 0 {
 		limit = 0
 	}
-	// Unclaimed variant: cap at the group-quota headroom; with preemption off
-	// the unclaimed variant IS the submitter limit (:5547-5556).
+	// Unclaimed variant: cap at the group-quota headroom (:5547-5556).
+	limitUnclaimed = limit
 	if ri.name != "" {
 		maxAllowed := ri.quota - env.groupusage
 		if maxAllowed < 0 {
 			maxAllowed = 0
 		}
-		if limit > maxAllowed {
-			limit = maxAllowed
+		if limitUnclaimed > maxAllowed {
+			limitUnclaimed = maxAllowed
 		}
+	}
+	// Preemption off: the unclaimed variant IS the submitter limit (:5556).
+	if !c.cfg.ConsiderPreemption {
+		limit = limitUnclaimed
 	}
 	if isFloorRound {
 		if floor := c.acct.GetFloor(name); floor < limit {
 			limit = floor
 		}
 	}
-	return limit, share, usage, prio
+	return limit, limitUnclaimed, share, usage, prio
 }
 
 // calculatePieLeft is matchmaker.cpp:5577-5630: the sum of every submitter's
@@ -228,7 +261,7 @@ func (c *Cycle) calculateSubmitterLimit(name string, ri roundInfo, env *spinEnv,
 func (c *Cycle) calculatePieLeft(subs []*subState, ri roundInfo, env *spinEnv) float64 {
 	pie := 0.0
 	for _, sub := range subs {
-		limit, _, usage, _ := c.calculateSubmitterLimit(sub.name, ri, env, false)
+		limit, _, _, usage, _ := c.calculateSubmitterLimit(sub.name, ri, env, false)
 		sub.starvation = starvationRatio(usage, usage+limit)
 		pie += limit
 	}
@@ -277,7 +310,7 @@ func (c *Cycle) sortSubmitters(subs []*subState, env *spinEnv) {
 // negotiateOne computes one submitter's limit/ceiling and either skips it
 // (the optimization ladder at matchmaker.cpp:2718-2768) or negotiates it.
 func (c *Cycle) negotiateOne(ctx context.Context, st *runState, ri roundInfo, sub *subState, env *spinEnv) mmResult {
-	limit, share, _, prio := c.calculateSubmitterLimit(sub.name, ri, env, ri.isFloor)
+	limit, limitUnclaimed, share, _, prio := c.calculateSubmitterLimit(sub.name, ri, env, ri.isFloor)
 
 	// Spin 1 only: save the fair-share figures on the submitter's accounting
 	// record — SubmitterShare and SubmitterLimit = share x slotWeightTotal
@@ -320,7 +353,7 @@ func (c *Cycle) negotiateOne(ctx context.Context, st *runState, ri roundInfo, su
 		result = mmDone // ceiling exhausted (:2764-2768)
 	default:
 		deadline := now.Add(minDuration(c.cfg.MaxTimePerSpin, minDuration(remainingCycle, remainingSubmitter)))
-		result = c.negotiateSubmitter(ctx, st, ri, sub, env, prio, limit, headroom, deadline)
+		result = c.negotiateSubmitter(ctx, st, ri, sub, env, prio, limit, limitUnclaimed, headroom, deadline)
 		sub.timeUsed += c.now().Sub(now)
 	}
 
@@ -352,7 +385,7 @@ func minDuration(a, b time.Duration) time.Duration {
 //   - limit/deadline/ceiling breaks return MM_RESUME (the C++ falls out of
 //     the loop to endNegotiate + MM_RESUME); running out of requests returns
 //     MM_DONE unless the submitter was limited this round (:4244-4248).
-func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundInfo, sub *subState, env *spinEnv, prio, submitterLimit, ceilingHeadroom float64, deadline time.Time) mmResult {
+func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundInfo, sub *subState, env *spinEnv, prio, submitterLimit, submitterLimitUnclaimed, ceilingHeadroom float64, deadline time.Time) mmResult {
 	if err := sub.err(); err != nil {
 		return mmError // prefetch already failed
 	}
@@ -367,8 +400,12 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 	sctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
+	// Two match-cost accumulators (matchmaker.cpp:4145-4146): limitUsed counts
+	// every match, limitUsedUnclaimed only unclaimed (NO_PREEMPTION) matches.
 	limitUsed := 0.0
+	limitUsedUnclaimed := 0.0
 	limitedBySubmitterLimit := false
+	onlyForStartdRank := false
 	rejectedACs := make(map[int]bool)
 
 	var cur *negotiator.Request
@@ -382,8 +419,17 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 		if !now.Before(deadline) {
 			break // deadline reached (:4185-4193) -> MM_RESUME
 		}
+		// Over the submitter limit: normally stop, but with ignore_submitter_limit
+		// (spin 1 + preemption) keep going for startd-rank preemptions only
+		// (matchmaker.cpp:4196-4213).
 		if limitUsed >= submitterLimit {
-			break // submitter resource limit (:4196-4213) -> MM_RESUME
+			if env.ignoreSubmitterLimit {
+				onlyForStartdRank = true
+			} else {
+				break // submitter resource limit -> MM_RESUME
+			}
+		} else {
+			onlyForStartdRank = false
 		}
 		if limitUsed >= ceilingHeadroom {
 			break // ceiling (:4216-4219) -> MM_RESUME; next spin sees MM_DONE
@@ -412,10 +458,14 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 		c.enrichRequest(st, ri, sub, cur, prio, env)
 
 		limits := &negotiator.MatchLimits{
-			SubmitterLimit: submitterLimit, // already pieLeft-capped by the caller
-			LimitUsed:      limitUsed,
-			PieLeft:        env.pieLeft,
-			Ceiling:        ceilingHeadroom,
+			SubmitterLimit:          submitterLimit, // already pieLeft-capped by the caller
+			LimitUsed:               limitUsed,
+			PieLeft:                 env.pieLeft,
+			Ceiling:                 ceilingHeadroom,
+			SubmitterLimitUnclaimed: submitterLimitUnclaimed,
+			LimitUsedUnclaimed:      limitUsedUnclaimed,
+			OnlyForStartdRank:       onlyForStartdRank,
+			SubmitterName:           sub.name,
 		}
 		cand, rej, err := c.mm.Match(sctx, cur, st.view, limits)
 		if err != nil {
@@ -437,7 +487,7 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 			}
 			if rej != nil && rej.ForSubmitterLimit > 0 {
 				limitedBySubmitterLimit = true
-				if c.cfg.DisableSlotWeights {
+				if c.cfg.DisableSlotWeights && !c.cfg.ConsiderPreemption {
 					// Unweighted + preemption-off: a submitter-limit reject
 					// means we are done this spin (:4450-4459).
 					break
@@ -471,6 +521,11 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 		st.view.Consume(cand.ScanIndex)
 		st.stats.Matches++
 		limitUsed += cost
+		// Only unclaimed (NO_PREEMPTION) matches count against the unclaimed
+		// accumulator (matchmaker.cpp:4502: `if (remoteUser == "")`).
+		if remoteUserOf(cand.Slot) == "" {
+			limitUsedUnclaimed += cost
+		}
 		env.pieLeft -= cost
 		curOffers++
 	}

@@ -49,15 +49,15 @@ func New(src negotiator.AdSource, acct negotiator.Accountant, sf negotiator.Sess
 	if src == nil || acct == nil || sf == nil {
 		return nil, fmt.Errorf("cycle: nil AdSource, Accountant, or SessionFactory")
 	}
-	if cfg.ConsiderPreemption {
-		return nil, fmt.Errorf("cycle: NEGOTIATOR_CONSIDER_PREEMPTION=true is not supported (preemption is deferred)")
-	}
 	cfg = cfg.withDefaults()
 	mm, err := matchmaker.New(matchmaker.Config{
-		PreJobRank:         cfg.PreJobRank,
-		PostJobRank:        cfg.PostJobRank,
-		Serial:             cfg.CompatMode,
-		DisableSlotWeights: cfg.DisableSlotWeights,
+		PreJobRank:             cfg.PreJobRank,
+		PostJobRank:            cfg.PostJobRank,
+		Serial:                 cfg.CompatMode,
+		DisableSlotWeights:     cfg.DisableSlotWeights,
+		ConsiderPreemption:     cfg.ConsiderPreemption,
+		PreemptionRequirements: cfg.PreemptionRequirements,
+		PreemptionRank:         cfg.PreemptionRank,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cycle: %w", err)
@@ -129,11 +129,23 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 	}
 	effectivePoolsize := countEffectiveSlots(snap.Slots)
 
-	// Trim (preemption off): claimed/preempting non-pslot ads leave the
-	// candidate set (trimStartdAds_PreemptionLogic, matchmaker.cpp:2986-3007).
-	trimmed := trimSlots(snap.Slots)
+	// Trim (trimStartdAds_PreemptionLogic, matchmaker.cpp:2941-3010). Preemption
+	// off: claimed/preempting non-pslot ads leave the candidate set. Preemption
+	// on (with early preemption off, as here): keep claimed slots as preemption
+	// candidates but drop ads still in retirement.
+	trimmed := trimSlots(snap.Slots, c.cfg.ConsiderPreemption)
 	stats.TrimmedSlots = len(snap.Slots) - len(trimmed)
 	stats.CandidateSlots = len(trimmed)
+
+	// addRemoteUserPrios: stamp RemoteUserPrio and friends on the (trimmed) slot
+	// ads so PREEMPTION_* expressions can reference them during matchmaking
+	// (matchmaker.cpp:2046-2048, addRemoteUserPrios :5686). Only meaningful when
+	// preemption is on and claimed slots survive the trim.
+	if c.cfg.ConsiderPreemption {
+		for _, s := range trimmed {
+			c.addRemoteUserPrios(s)
+		}
+	}
 
 	trimSnap := &negotiator.PoolSnapshot{
 		Slots:      trimmed,
@@ -337,12 +349,26 @@ func countEffectiveSlots(slots []*classad.ClassAd) int {
 	return sum
 }
 
-// trimSlots drops Claimed/Preempting non-partitionable slots, matching
-// trimStartdAds_PreemptionLogic with ConsiderPreemption=false
-// (matchmaker.cpp:2986-3007). Claimed pslots stay (they still accept jobs).
-func trimSlots(slots []*classad.ClassAd) []*classad.ClassAd {
+// trimSlots ports trimStartdAds_PreemptionLogic (matchmaker.cpp:2941-3010).
+//
+// With considerPreemption=false (ConsiderPreemption off): drop Claimed/Preempting
+// non-partitionable slots -- they cannot be matched without preemption. Claimed
+// pslots stay (they still accept jobs).
+//
+// With considerPreemption=true (and early preemption off, which is the only mode
+// this port supports): keep claimed slots as preemption candidates, but drop ads
+// still draining (RetirementTimeRemaining > 0), matching the C++
+// ConsiderEarlyPreemption=false branch (matchmaker.cpp:2950-2976).
+func trimSlots(slots []*classad.ClassAd, considerPreemption bool) []*classad.ClassAd {
 	out := make([]*classad.ClassAd, 0, len(slots))
 	for _, s := range slots {
+		if considerPreemption {
+			if rt, ok := s.EvaluateAttrInt("RetirementTimeRemaining"); ok && rt > 0 {
+				continue
+			}
+			out = append(out, s)
+			continue
+		}
 		state, _ := s.EvaluateAttrString("State")
 		if state == "Claimed" || state == "Preempting" {
 			if pslot, ok := s.EvaluateAttrBool("PartitionableSlot"); !ok || !pslot {
@@ -352,6 +378,50 @@ func trimSlots(slots []*classad.ClassAd) []*classad.ClassAd {
 		out = append(out, s)
 	}
 	return out
+}
+
+// addRemoteUserPrios stamps the preemption-context attributes the C++
+// addRemoteUserPrios (matchmaker.cpp:5686-5730) inserts on each slot ad, so the
+// PREEMPTION_* expressions can reference them (MY.RemoteUserPrio, etc.). The ad
+// is a fresh snapshot copy, mutated in place.
+//
+// Faithful subset: RemoteUserPrio, RemoteUserFloor, RemoteUserResourcesInUse,
+// and CurrentRank <- PreemptingRank. The C++ writes RemoteUserResourcesInUse as
+// a lazy ResourcesInUseByUser(user) call and adds RemoteGroup* usage attrs for
+// grouped users; the Go port has no such classad function, so it stamps the
+// already-computed weighted usage as a literal (the default PREEMPTION_*
+// expressions reference RemoteUserPrio / SubmitterUserPrio, not the group
+// usage). The per-slot cross-slot loop (NEGOTIATOR_CROSS_SLOT_PRIOS, default
+// off) is not ported.
+func (c *Cycle) addRemoteUserPrios(ad *classad.ClassAd) {
+	remoteUser := remoteUserOf(ad)
+	if remoteUser != "" {
+		ad.InsertAttrFloat("RemoteUserPrio", c.acct.GetPriority(remoteUser))
+		ad.InsertAttrFloat("RemoteUserFloor", c.acct.GetFloor(remoteUser))
+		ad.InsertAttrFloat("RemoteUserResourcesInUse", c.acct.GetWeightedResourcesUsed(remoteUser))
+	}
+	// A pending preempting claim already outranks the running job, so any new
+	// preemption must beat the preempting rank (matchmaker.cpp:5719-5724).
+	if pr, ok := evalNumber(ad, "PreemptingRank"); ok {
+		ad.InsertAttrFloat("CurrentRank", pr)
+	}
+}
+
+// remoteUserOf returns the accounting principal to preempt on a slot ad, using
+// the C++ precedence (matchmaker.cpp:5700-5703): PreemptingAccountingGroup,
+// PreemptingUser, AccountingGroup, RemoteUser. "" means unclaimed.
+func remoteUserOf(ad *classad.ClassAd) string {
+	for _, attr := range []string{
+		"PreemptingAccountingGroup",
+		"PreemptingUser",
+		"AccountingGroup",
+		"RemoteUser",
+	} {
+		if v, ok := ad.EvaluateAttrString(attr); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // evalNumber evaluates attr to a float64, accepting integers and reals.
