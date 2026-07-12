@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
+	"github.com/bbockelm/golang-collector/negotiator/protocol"
 )
 
 // Config carries the cycle orchestrator's tunables (design doc section 9,
@@ -71,6 +72,18 @@ type Config struct {
 	// JobConstraint is NEGOTIATOR_JOB_CONSTRAINT (optional), forwarded in the
 	// NEGOTIATE header and folded into the significant-attribute computation.
 	JobConstraint string
+
+	// MatchExprs is NEGOTIATOR_MATCH_EXPRS: expressions the negotiator injects
+	// as NegotiatorMatchExpr<name> into every match ad sent to the schedd
+	// (matchmaker.cpp:728-746, :5268-5274). Empty leaves match ads unchanged.
+	// Ordered so injection is deterministic (compat==fast).
+	MatchExprs []protocol.MatchExpr
+
+	// InformStartd is NEGOTIATOR_INFORM_STARTD (default false, matchmaker.cpp:826):
+	// when true and a match carries a real claim id, the negotiator sends the
+	// startd a MATCH_INFO notification (matchmaker.cpp:5412-5426). Default off, so
+	// default behavior is a schedd-only conversation, unchanged.
+	InformStartd bool
 
 	// DisableAccountingAds mirrors NEGOTIATOR_ADVERTISE_ACCOUNTING=false: skip
 	// publishing per-submitter/group Accounting ads at the end of the cycle.

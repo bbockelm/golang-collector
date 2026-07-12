@@ -140,8 +140,35 @@ func (s *RemoteSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot, 
 // entries are harmless because the map is only consulted for slots that already
 // survived the public constraint.
 func (s *RemoteSource) queryPrivateAds(ctx context.Context) ([]*classad.ClassAd, error) {
-	addr := firstAddr(s.cfg.CollectorAddr)
+	// COLLECTOR_HOST may list several collectors; try each in order and fail
+	// over on error, mirroring the C++ CollectorList (the htcondor client's
+	// public queries already race the list, but the direct-CEDAR private-ad
+	// query dials one address at a time). The first that answers wins.
+	addrs := splitAddrs(s.cfg.CollectorAddr)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no collector address configured")
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		ads, err := s.queryPrivateAdsFrom(ctx, addr)
+		if err == nil {
+			return ads, nil
+		}
+		// A cancelled/expired context is terminal, not a per-collector failure:
+		// stop rather than hammering the remaining addresses.
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		lastErr = err
+		s.log.Warn("private-ad query collector failed, trying next",
+			"collector", addr, "error", err)
+	}
+	return nil, fmt.Errorf("all collectors failed for private-ad query: %w", lastErr)
+}
 
+// queryPrivateAdsFrom runs the QUERY_STARTD_PVT_ADS exchange against a single
+// collector address.
+func (s *RemoteSource) queryPrivateAdsFrom(ctx context.Context, addr string) ([]*classad.ClassAd, error) {
 	// Copy the security policy so we can set the connection command without
 	// mutating the shared config.
 	sec := *s.cfg.Security
@@ -214,12 +241,44 @@ func (s *RemoteSource) PublishAccountingAds(ctx context.Context, ads []*classad.
 	return nil
 }
 
-// firstAddr returns the first entry of a comma-separated collector address
-// list (the cedar client dials a single address; the htcondor client handles
-// the full list for the public queries).
-func firstAddr(list string) string {
-	if i := strings.IndexByte(list, ','); i >= 0 {
-		return strings.TrimSpace(list[:i])
+// splitAddrs parses an HTCondor-style COLLECTOR_HOST list into its individual
+// collector addresses, in order, for the private-ad query's failover loop.
+// Entries are separated by top-level commas or whitespace; empty entries are
+// dropped.
+//
+// Bracket awareness: a sinful string "<host:port?k=v&...>" is an opaque blob
+// whose CCB contacts are space-separated INSIDE the angle brackets, so a naive
+// whitespace split would shatter it. We therefore track angle-bracket depth and
+// only treat a comma or space at depth 0 as a separator (mirroring the htcondor
+// client's own splitCollectorList; unbalanced brackets clamp at zero).
+func splitAddrs(list string) []string {
+	var (
+		out   []string
+		cur   strings.Builder
+		depth int
+	)
+	flush := func() {
+		if t := strings.TrimSpace(cur.String()); t != "" {
+			out = append(out, t)
+		}
+		cur.Reset()
 	}
-	return strings.TrimSpace(list)
+	for _, r := range list {
+		switch {
+		case r == '<':
+			depth++
+			cur.WriteRune(r)
+		case r == '>':
+			if depth > 0 {
+				depth--
+			}
+			cur.WriteRune(r)
+		case depth == 0 && (r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'):
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return out
 }

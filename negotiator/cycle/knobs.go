@@ -6,7 +6,12 @@ import (
 	"time"
 
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
+	"github.com/bbockelm/golang-collector/negotiator/protocol"
 )
+
+// negotiatorMatchExprPrefix is the C++ ATTR_NEGOTIATOR_MATCH_EXPR
+// (condor_attributes.h:1127): the attribute-name prefix the schedd expects.
+const negotiatorMatchExprPrefix = "NegotiatorMatchExpr"
 
 // ConfigFromKnobs builds the cycle configuration from HTCondor knobs (design
 // doc section 9, cycle set): NEGOTIATOR_RESOURCE_REQUEST_LIST_SIZE, the
@@ -52,6 +57,8 @@ func ConfigFromKnobs(get accountant.KnobGetter) Config {
 	if v, ok := get("NEGOTIATOR_JOB_CONSTRAINT"); ok {
 		cfg.JobConstraint = strings.TrimSpace(v)
 	}
+	cfg.MatchExprs = matchExprsFromKnobs(get)
+	cfg.InformStartd = knobBool(get, "NEGOTIATOR_INFORM_STARTD", false)
 	cfg.DisableAccountingAds = !knobBool(get, "NEGOTIATOR_ADVERTISE_ACCOUNTING", true)
 	cfg.Group = accountant.GroupConfigFromKnobs(get)
 	// Concurrency-limit max resolver (roadmap #3): the <NAME>_LIMIT /
@@ -61,6 +68,40 @@ func ConfigFromKnobs(get accountant.KnobGetter) Config {
 		return accountant.GetLimitMax(get, name)
 	}
 	return cfg
+}
+
+// matchExprsFromKnobs parses NEGOTIATOR_MATCH_EXPRS (matchmaker.cpp:728-746):
+// a whitespace/comma-separated list of names. Each name is resolved to its
+// expression the way the C++ does -- param(name) reads the macro's value -- and
+// renamed with the NegotiatorMatchExpr prefix the schedd expects. As a
+// convenience the Go form also accepts an inline "name=expr" entry (no separate
+// macro needed). A name that resolves to no value is skipped (the C++ logs a
+// warning and continues). Order is preserved so the injection is deterministic.
+func matchExprsFromKnobs(get accountant.KnobGetter) []protocol.MatchExpr {
+	raw, ok := get("NEGOTIATOR_MATCH_EXPRS")
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []protocol.MatchExpr
+	for _, tok := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		name, expr := tok, ""
+		if i := strings.IndexByte(tok, '='); i >= 0 {
+			name = strings.TrimSpace(tok[:i])
+			expr = strings.TrimSpace(tok[i+1:])
+		} else if v, ok := get(tok); ok {
+			expr = strings.TrimSpace(v)
+		}
+		if name == "" || expr == "" {
+			continue // undefined macro: warn-and-skip, as the C++ does
+		}
+		if !strings.HasPrefix(name, negotiatorMatchExprPrefix) {
+			name = negotiatorMatchExprPrefix + name
+		}
+		out = append(out, protocol.MatchExpr{Name: name, Expr: expr})
+	}
+	return out
 }
 
 // knobSeconds reads an integer-seconds knob as a duration.

@@ -249,18 +249,32 @@ future leases); a future `golang-htcondor/authz` user-map for the WRITE path.
 **Scope:** GET_RESLIST small (done); leases + user-map each need cross-cutting
 infra first.
 
-## 9. Multi-pool / job-prio / match-expr knobs  (P2)
+## 9. Multi-pool / job-prio / match-expr knobs  (mostly DONE)
 
-Smaller cycle-side C++ features not yet ported, each independent:
-- `USE_GLOBAL_JOB_PRIOS` — submitter-ad fan-out per `JobPrioArray`, the
-  `want_globaljobprio` key in `submitterLessThan`, and `JOBPRIO_MIN/MAX` in the
-  NEGOTIATE header (matchmaker.cpp :817, :3455-3477).
-- `NEGOTIATOR_MATCH_EXPRS` (`MatchExprX` injected into match ads),
-  `NEGOTIATOR_JOB_CONSTRAINT`, `STARTD_AD_REEVAL_EXPR`.
-- `NEGOTIATOR_INFORM_STARTD` (`MATCH_INFO` to the startd; default off).
-- Multi-collector query with failover for `RemoteSource` (`CollectorList`),
-  and flocking `SubmitterTag` handling across pools.
+Smaller cycle-side C++ features, each independent:
+- **`NEGOTIATOR_MATCH_EXPRS` — ✅ DONE.** Config list of bare macro names
+  (resolved via the knob getter, like C++ `param`) or inline `name=expr`,
+  injected into every match ad as `NegotiatorMatchExpr<name>` (unevaluated
+  expression, string-literal fallback). Ordered → deterministic
+  (matchmaker.cpp:728-746, :5268-5274).
+- **`NEGOTIATOR_JOB_CONSTRAINT` — ✅ DONE (now enforced).** Previously only
+  forwarded in the NEGOTIATE header + folded into significant attrs; now compiled
+  in `cycle.New` and evaluated against each returned request in `nextRequest`
+  (non-matching requests silently skipped), so an older/looser schedd cannot slip
+  through excluded jobs. Deterministic; runs in both compat and fast modes.
+- **`NEGOTIATOR_INFORM_STARTD` (default false) — ✅ DONE.** Full `MATCH_INFO`
+  wire send (`put_secret(claimID)+EOM`, dc_startd.h:301-402) via a
+  `startdInformer` type-assertion on the SessionFactory (no `interfaces.go`
+  change); best-effort, ordered after schedd delivery, never fails the match.
+  Default-off keeps behavior byte-identical.
+- **Multi-collector failover — ✅ DONE.** The direct-CEDAR private-ad query now
+  iterates a bracket-aware `COLLECTOR_HOST` list and fails over on error (context
+  cancellation is terminal); the htcondor client already races the list for
+  public queries.
+- **`USE_GLOBAL_JOB_PRIOS` — DEFERRED.** The meatiest item (submitter-ad fan-out
+  per `JobPrioArray`, `want_globaljobprio` in the submitter sort, `JOBPRIO_MIN/MAX`
+  in the NEGOTIATE header, matchmaker.cpp:817, :3455-3477). Touches the submitter
+  loop + header; left rather than risk half-breaking the spin.
+- `STARTD_AD_REEVAL_EXPR` and flocking `SubmitterTag` handling remain unported.
 
 **Where:** `negotiator/cycle`, `negotiator/source`, `negotiator/protocol`.
-
-**Scope:** small each; pick as needed by target deployments.

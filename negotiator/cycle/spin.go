@@ -534,6 +534,11 @@ func (c *Cycle) negotiateSubmitter(ctx context.Context, st *runState, ri roundIn
 		if !c.sendMatch(ctx, sub, mr) {
 			return mmError
 		}
+		// NEGOTIATOR_INFORM_STARTD (default off): best-effort MATCH_INFO to the
+		// startd, ordered after the schedd delivery (matchmaker.cpp:5412-5426).
+		if c.cfg.InformStartd {
+			c.informStartd(ctx, sub, enriched, claim)
+		}
 		// Account the match off the ENRICHED ad: it carries MatchedConcurrencyLimits
 		// (from EnrichMatchAd), which the accountant persists on the Resource record
 		// and folds into the cross-cycle concurrency counts (mirrors the C++ AddMatch
@@ -573,6 +578,14 @@ func (c *Cycle) nextRequest(ctx context.Context, sub *subState, rejectedACs map[
 			sub.queue = sub.queue[1:]
 			if r.AutoClusterID >= 0 && rejectedACs[r.AutoClusterID] {
 				continue // skip rejected autocluster silently
+			}
+			// NEGOTIATOR_JOB_CONSTRAINT: the constraint rode the NEGOTIATE header
+			// so a modern schedd already filters, but defensively skip any request
+			// that fails it locally too (matchmaker.cpp:4088 sends it; the schedd
+			// is trusted to honor it). Silently dropped, exactly as if the schedd
+			// had never offered it -- no reject is sent.
+			if c.jobConstraint != nil && !c.jobConstraint.Matches(r.Ad) {
+				continue
 			}
 			return r, nil
 		}
@@ -633,6 +646,7 @@ func (c *Cycle) matchContext(st *runState, ri roundInfo, sub *subState, req *neg
 		mc.RemoteAutoregroup = ri.autoregroupRoot
 		mc.HasAutoregroup = true
 	}
+	mc.MatchExprs = c.matchExprs
 	return mc
 }
 
