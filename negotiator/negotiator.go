@@ -185,6 +185,10 @@ func (n *Negotiator) LastCycleStats() *CycleStats {
 func (n *Negotiator) RegisterOn(cs *cedarserver.Server) {
 	n.handle(cs, commands.GET_PRIORITY, n.handleGetState(false), "READ")
 	n.handle(cs, commands.GET_PRIORITY_ROLLUP, n.handleGetState(true), "READ")
+	// GET_RESLIST (condor_userprio -getreslist): the per-submitter resource list
+	// (matchmaker.cpp:603-605, READ). Referenced by SCHED_VERS offset because
+	// cedar/commands does not yet name it.
+	n.handle(cs, commandGetResList, n.handleGetResList(), "READ")
 
 	// The collector-style direct queries a modern condor_userprio -modular /
 	// condor_status -direct sends to the negotiator instead of GET_PRIORITY
@@ -287,6 +291,32 @@ func (n *Negotiator) handleGetState(rollup bool) cedarserver.HandlerFunc {
 			Options: message.PutClassAdNoTypes,
 		}); err != nil {
 			return fmt.Errorf("negotiator: sending priority state: %w", err)
+		}
+		return out.FinishMessage(ctx)
+	}
+}
+
+// commandGetResList is GET_RESLIST (condor_userprio -getreslist): SCHED_VERS+63
+// (463). cedar/commands does not name it yet, so it is referenced by offset —
+// the same base the named userprio commands use (commands.GET_PRIORITY = +51).
+const commandGetResList = commands.SCHED_VERS + 63
+
+// handleGetResList serves GET_RESLIST: wire "string submitter + EOM", reply the
+// per-submitter resource-list ad (Name<i>/StartTime<i>) WITHOUT the
+// MyType/TargetType trailer, which condor_userprio reads with getClassAdNoTypes
+// (user_prio.cpp:1122; matchmaker.cpp GET_RESLIST_commandHandler).
+func (n *Negotiator) handleGetResList() cedarserver.HandlerFunc {
+	return func(ctx context.Context, c *cedarserver.Conn) error {
+		submitter, err := payload(c).GetString(ctx)
+		if err != nil {
+			return fmt.Errorf("negotiator: GET_RESLIST: reading submitter: %w", err)
+		}
+		ad := n.cfg.Accountant.ResList(submitter)
+		out := message.NewMessageForStream(c.Stream)
+		if err := out.PutClassAdWithOptions(ctx, ad, &message.PutClassAdConfig{
+			Options: message.PutClassAdNoTypes,
+		}); err != nil {
+			return fmt.Errorf("negotiator: GET_RESLIST: sending reply: %w", err)
 		}
 		return out.FinishMessage(ctx)
 	}

@@ -144,7 +144,20 @@ transaction records into the existing record model. Add a one-shot import path
 
 **Scope:** medium; isolated to the store.
 
-## 5. Performance benchmarks + matchmaker allocation reduction  (P1)
+## 5. Performance benchmarks + matchmaker allocation reduction  ✅ DONE
+
+Delivered: a deterministic synthetic-pool generator (`negtest.Generate`) and
+scale benchmarks (`BenchmarkMatchScale` 10k/100k × serial/sharded,
+`BenchmarkPieSpin`). The sharded scan measures 1.5× (10k) to **5.5× (100k)**
+faster than serial, confirming the concurrency thesis (§1). The matchmaker hot
+path (`shard.go`) now writes the rank tuple into a caller-owned scratch
+`Candidate` and keeps the winner in one `best` value — O(1) `Candidate` allocs
+per scan range instead of one per matching candidate (~19% fewer bytes/op, ~10%
+fewer allocs/op), worker-local so the sharded winner stays byte-identical to
+serial. Remaining ~9 allocs/candidate live inside the `PelicanPlatform/classad`
+evaluator (a library-boundary follow-up, as is `NEGOTIATOR_MATCHLIST_CACHING`).
+
+_Original brief:_
 
 **What:** quantify the concurrency thesis — Go vs C++ negotiation-cycle wall-clock
 on large synthetic pools (10k-100k slots, many schedds, deep RRLs) — and cut the
@@ -207,21 +220,34 @@ is advertised promptly/queryably so `condor_userprio`'s locate succeeds.
 
 **Scope:** small-medium.
 
-## 8. Userprio completeness: GET_RESLIST, leases, PRIORITY_FACTOR_AUTHORIZATION  (P2)
+## 8. Userprio completeness: GET_RESLIST, leases, PRIORITY_FACTOR_AUTHORIZATION  (partial)
 
-**What:** the userprio surface still missing:
-- `GET_RESLIST` (463) — `condor_userprio -getreslist`. **Its command int isn't in
-  `cedar/commands` yet** — add the constant there first (a cedar PR), then the
-  handler (returns per-submitter `Name<i>`/`StartTime<i>`).
-- The ceiling/floor/priority-factor **lease** commands (a local HTCondor
-  extension; `MANAGE_*`).
-- `PRIORITY_FACTOR_AUTHORIZATION` user-map for `SET_PRIORITYFACTOR` at WRITE (Go
-  currently requires ADMINISTRATOR; the user-map path is stubbed with the
-  versioned `{ErrorCode}` reply).
+- **`GET_RESLIST` (463) — ✅ DONE.** `condor_userprio -getreslist`: the handler
+  (`handleGetResList`) reads the submitter and replies with the per-submitter
+  resource list (`Name<i>`/`StartTime<i>`) via a new `Accountant.ResList`
+  (mirrors `Accountant::ReportState(customer)`, Accountant.cpp:1344). Registered
+  at READ by `SCHED_VERS+63` — cedar/commands does not name it yet, so it is
+  referenced by offset rather than blocking on a cedar tag. Covered by
+  `TestResList` + `TestGetResListWire`.
+- **Ceiling/floor/priority-factor lease commands (`MANAGE_*`) — DEFERRED.** They
+  need new cedar command ints (`MANAGE_CEILING`/`MANAGE_FLOOR`/
+  `MANAGE_PRIORITY_FACTOR`) *and* lease storage on the accountant record; a niche
+  local HTCondor extension. Do the cedar command-int PR first, then the
+  accountant `SetCeilingLease` / expiry.
+- **`PRIORITY_FACTOR_AUTHORIZATION` user-map — DEFERRED (needs infra).** The C++
+  path (matchmaker.cpp:1107-1140) maps the authenticated identity through the
+  `CLASSAD_USER_MAP` mechanism (`NEGOTIATOR_CLASSAD_USER_MAP_NAMES`, regex map
+  files) and authorizes at WRITE when the mapped output prefixes the submitter.
+  The Go stack has **no user-map facility yet** — that is a general HTCondor
+  feature that belongs in `golang-htcondor/authz`, not the negotiator. Until it
+  exists, `SET_PRIORITYFACTOR` stays ADMINISTRATOR-only (the versioned
+  `{ErrorCode}` reply already in place).
 
-**Where:** `negotiator/negotiator.go` handlers; `cedar/commands` for GET_RESLIST.
+**Where:** `negotiator/negotiator.go` handlers; `negotiator/accountant` (ResList,
+future leases); a future `golang-htcondor/authz` user-map for the WRITE path.
 
-**Scope:** small each.
+**Scope:** GET_RESLIST small (done); leases + user-map each need cross-cutting
+infra first.
 
 ## 9. Multi-pool / job-prio / match-expr knobs  (P2)
 

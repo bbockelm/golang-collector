@@ -81,6 +81,36 @@ func TestQueryAccountingAds(t *testing.T) {
 	}
 }
 
+// TestGetResListWire exercises the GET_RESLIST command roundtrip (condor_userprio
+// -getreslist): a "string submitter + EOM" request, a NO_TYPES resource-list ad
+// reply. The fresh daemon accountant has no charged resources, so the reply is a
+// well-formed empty ad; ResList content is covered by accountant TestResList.
+func TestGetResListWire(t *testing.T) {
+	ctx := testCtx(t)
+	addr, _, _ := newDaemon(t, ctx, allowAll, nil)
+
+	cl := dialCmd(t, ctx, addr, commands.SCHED_VERS+63) // GET_RESLIST
+	req := message.NewMessageForStream(cl.GetStream())
+	if err := req.PutString(ctx, "alice@pool.test"); err != nil {
+		t.Fatalf("GET_RESLIST: sending submitter: %v", err)
+	}
+	if err := req.FinishMessage(ctx); err != nil {
+		t.Fatalf("GET_RESLIST: finishing request: %v", err)
+	}
+	// The NO_TYPES reply is an expression count followed by that many strings
+	// (the same framing getPriorityAd reads).
+	rm := message.NewMessageFromStream(cl.GetStream())
+	n, err := rm.GetInt(ctx)
+	if err != nil {
+		t.Fatalf("GET_RESLIST: reading reply expression count: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := rm.GetString(ctx); err != nil {
+			t.Fatalf("GET_RESLIST: reading reply expr %d/%d: %v", i, n, err)
+		}
+	}
+}
+
 // queryAds sends a collector-style query ad to the negotiator and reads back the
 // PutInt32(1)+ad stream terminated by PutInt32(0).
 func queryAds(t *testing.T, ctx context.Context, addr string, cmd int, queryAd *classad.ClassAd) []*classad.ClassAd {

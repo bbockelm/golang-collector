@@ -3,6 +3,7 @@ package accountant
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -198,6 +199,42 @@ func (a *Accountant) accountingAds(negotiatorName string, now time.Time, onlyWit
 		return true
 	})
 	return ads
+}
+
+// ResList renders the per-resource list for one submitter (GET_RESLIST /
+// condor_userprio -getreslist): Name<i>/StartTime<i> for every Resource record
+// currently charged to the submitter. Mirrors Accountant::ReportState(customer)
+// (Accountant.cpp:1344-1382): a traditional submitter matches Resource records
+// by RemoteUser; a group name matches by assigned group (and, as in C++, only
+// advances the resource index for a group -- no Name<i> is emitted).
+func (a *Accountant) ResList(submitter string) *classad.ClassAd {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	ad := classad.New()
+	group := isGroupName(submitter)
+	n := 1
+	a.store.forEach(tableResource, func(key string, r *record) bool {
+		rname, ok := r.getString(attrRemoteUser)
+		if !ok || rname == "" {
+			return true
+		}
+		if group {
+			if AssignedGroupName(rname) != submitter {
+				return true
+			}
+		} else {
+			if rname != submitter {
+				return true
+			}
+			suf := strconv.Itoa(n)
+			ad.InsertAttrString("Name"+suf, key)
+			ad.InsertAttr("StartTime"+suf, intOr(r, attrStartTime, 0))
+		}
+		n++
+		return true
+	})
+	return ad
 }
 
 // ---- Userprio mutators (SET_* / RESET_* / DELETE_USER handlers) ----

@@ -62,6 +62,9 @@ type Accountant interface {
 	// usage filter — the set a direct QUERY_ACCOUNTING_ADS returns (the C++
 	// Accountant::ReportState(queryAd, ads), Accountant.cpp:1686).
 	ReportStateAds(negotiatorName string, now time.Time) []*classad.ClassAd
+	// ResList renders the per-resource list of a submitter (GET_RESLIST):
+	// Name<i>/StartTime<i> per charged Resource record (Accountant.cpp:1344).
+	ResList(submitter string) *classad.ClassAd
 	// Userprio mutation surface (SET_* / RESET_* / DELETE_USER handlers).
 	SetPriorityFactor(submitter string, factor float64) error
 	SetPriority(submitter string, priority float64) error
