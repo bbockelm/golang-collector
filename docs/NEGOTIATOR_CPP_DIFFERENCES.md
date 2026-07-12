@@ -133,10 +133,17 @@ it behind `AdSource` so both modes get it.
   **address file** (`$(LOG)/.collector_address`) over `COLLECTOR_HOST`, so a
   co-located negotiator finds a collector on a shared/ephemeral port. C++ resolves
   `COLLECTOR_HOST` via `CollectorList`. Same result for a normal CM on port 9618.
-- **`condor_userprio` locate.** `condor_userprio` may print "Can't locate
-  negotiator in local pool" before the table (the NegotiatorAd hasn't propagated
-  / the locate falls back); the priority query itself works. NegotiatorAd-locate
-  polish is on the Phase 7 list.
+- **`condor_userprio` locate.** For `DT_NEGOTIATOR`, `condor_daemon_client`
+  locates strictly through the collector's NegotiatorAd (never the address file:
+  `_is_local` is false for negotiators, daemon.cpp:1290), and `getInfoFromAd`
+  (daemon.cpp:2052) fails the locate unless the ad carries an address, `Machine`,
+  **and `CondorVersion`** (ATTR_VERSION, :2098-2101). The real negotiator gets
+  `CondorVersion` free from `daemonCore->publish()`; the Go ad must set it
+  explicitly. It now does (`buildNegotiatorAd`, guarded by
+  `TestNegotiatorAdLocateContract`) — without it, a stock `condor_userprio`
+  reports "Can't locate negotiator in local pool" even though the query would
+  otherwise work. (A lenient/locally-built `condor_userprio` may locate without
+  it, which masked the gap until a distro build ran it in CI.)
 
 ## Faithfully replicated — do NOT "simplify" these
 

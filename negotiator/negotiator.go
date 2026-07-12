@@ -483,6 +483,20 @@ func (n *Negotiator) publishAd(ctx context.Context) {
 	}
 }
 
+// negotiatorCondorVersion / negotiatorCondorPlatform are the identity banners
+// stamped on the NegotiatorAd. The real condor_negotiator gets these for free
+// from daemonCore->publish() (matchmaker.cpp:6193); the Go ad must set them
+// explicitly. CondorVersion in particular is *load-bearing for locate*:
+// condor_daemon_client Daemon::locate(DT_NEGOTIATOR) runs getInfoFromAd(), which
+// returns false — failing the whole locate — if the ad has no ATTR_VERSION
+// (daemon.cpp:2098-2101). Without it, condor_userprio reports "Can't locate
+// negotiator in local pool" even though the ad (with a valid address) is in the
+// collector. See buildNegotiatorAd's test for the required-attribute contract.
+const (
+	negotiatorCondorVersion  = "$CondorVersion: 25.4.0 2025-11-07 BuildID: golang-negotiator $"
+	negotiatorCondorPlatform = "$CondorPlatform: X86_64-golang $"
+)
+
 // buildNegotiatorAd renders the negotiator's daemon ad: identity (the C++
 // init_public_ad, matchmaker.cpp:6176-6193) plus the last completed cycle's
 // stats (a documented subset of publishNegotiationCycleStats,
@@ -492,6 +506,10 @@ func (n *Negotiator) buildNegotiatorAd() *classad.ClassAd {
 	_ = ad.Set("MyType", "Negotiator")
 	_ = ad.Set("Name", n.cfg.NegotiatorName)
 	_ = ad.Set("Machine", n.cfg.Machine)
+	// Identity banners the C++ negotiator publishes via daemonCore->publish();
+	// ATTR_VERSION is required for Daemon::locate(DT_NEGOTIATOR) to succeed.
+	_ = ad.Set("CondorVersion", negotiatorCondorVersion)
+	_ = ad.Set("CondorPlatform", negotiatorCondorPlatform)
 	if n.cfg.AdvertisedAddr != "" {
 		sinful := bracketAddr(n.cfg.AdvertisedAddr)
 		_ = ad.Set("NegotiatorIpAddr", sinful)
