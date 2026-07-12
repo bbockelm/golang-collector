@@ -94,6 +94,15 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 
 // scanRange evaluates a contiguous slice of candidates with a single reused
 // MatchClassAd, returning the local best and reject counters.
+//
+// Allocation note: the per-candidate rank tuple is evaluated into a single
+// reused scratch Candidate (cand), and only the running winner is retained in
+// best; neither is heap-allocated per candidate. best escapes once (the returned
+// pointer), so the whole range costs O(1) Candidate allocations instead of one
+// per matching candidate. cand and best are worker-local -- scanRange runs on a
+// disjoint index sub-range per goroutine -- so this reuse is race-free and does
+// not touch the deterministic reduce (Candidate.Better still tie-breaks on
+// ScanIndex, so the sharded winner is byte-identical to the serial one).
 func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits) (*negotiator.Candidate, rejCounters) {
 	if len(cands) == 0 {
 		return nil, rejCounters{}
@@ -105,19 +114,24 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 	job := cloneAd(reqAd)
 	mc := classad.NewMatchClassAd(job, nil)
 
-	var best *negotiator.Candidate
+	var best negotiator.Candidate
+	var cand negotiator.Candidate
+	haveBest := false
 	var rej rejCounters
 
 	for _, c := range cands {
-		cand := m.evalCandidate(mc, c, limits, &rej)
-		if cand == nil {
+		if !m.evalCandidate(mc, c, limits, &rej, &cand) {
 			continue
 		}
-		if best == nil || cand.Better(best) {
+		if !haveBest || cand.Better(&best) {
 			best = cand
+			haveBest = true
 		}
 	}
-	return best, rej
+	if !haveBest {
+		return nil, rej
+	}
+	return &best, rej
 }
 
 // evalCandidate runs the full per-candidate pipeline for one offer, porting the
@@ -130,17 +144,21 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 //  3. the tier-specific submitter-limit gate (SubmitterLimitPermits);
 //  4. the rank tuple (calculateRanks), including PREEMPTION_RANK when preempting.
 //
-// Returns nil (and bumps the appropriate reject counter) when the candidate is
-// filtered out. Requirements failures bump NO counter, matching the C++ `continue`
-// (matchmaker.cpp:4951-4954).
-func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, rej *rejCounters) *negotiator.Candidate {
+// On a match it fills *out with the candidate's rank tuple and returns true; on
+// a filtered-out candidate it returns false (bumping the appropriate reject
+// counter) and leaves *out untouched. Writing into a caller-owned scratch
+// Candidate -- rather than returning a fresh *Candidate -- keeps the per-
+// candidate path allocation-free (the caller reuses one scratch across the whole
+// scan range). Requirements failures bump NO counter, matching the C++
+// `continue` (matchmaker.cpp:4951-4954).
+func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, rej *rejCounters, out *negotiator.Candidate) bool {
 	mc.ReplaceRightAd(c.slot)
 
 	// (1) bilateral Requirements. (The C++ pslotMultiMatch retry for
 	// WantPslotPreemption jobs is deferred, roadmap #6; a Requirements failure
 	// is simply "not a match".)
 	if !mc.Symmetry("Requirements", "Requirements") {
-		return nil
+		return false
 	}
 
 	// (2) preemption classification + (3) submitter-limit gate.
@@ -148,14 +166,14 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 	if m.considerPreemption {
 		var ok bool
 		if tier, ok = m.classifyPreemption(mc, c.slot, limits, rej); !ok {
-			return nil
+			return false
 		}
 	}
 
 	cost := m.slotWeight(c.slot)
 	if !m.submitterLimitGate(tier, limits, cost) {
 		rej.submitterLimit++
-		return nil
+		return false
 	}
 
 	// (4) rank tuple (calculateRanks). PreemptRank is the NO_PREEMPTION sentinel
@@ -164,7 +182,7 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 	if tier != noPreemption {
 		preemptRank = rankRight(mc, m.preemptionRank)
 	}
-	return &negotiator.Candidate{
+	*out = negotiator.Candidate{
 		Slot:        c.slot,
 		PreJobRank:  rankRight(mc, m.preJobRank),
 		Rank:        jobRank(mc),
@@ -173,6 +191,7 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 		PreemptRank: preemptRank,
 		ScanIndex:   c.idx,
 	}
+	return true
 }
 
 // classifyPreemption ports the remoteUser lookup + preemption-tier decision
