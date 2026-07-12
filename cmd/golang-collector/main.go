@@ -23,12 +23,18 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
+	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	collector "github.com/bbockelm/golang-collector"
 	"github.com/bbockelm/golang-collector/metrics"
+	"github.com/bbockelm/golang-collector/negotiator"
+	"github.com/bbockelm/golang-collector/negotiator/accountant"
+	"github.com/bbockelm/golang-collector/negotiator/cycle"
+	"github.com/bbockelm/golang-collector/negotiator/protocol"
+	"github.com/bbockelm/golang-collector/negotiator/source"
 	"github.com/bbockelm/golang-collector/store"
 )
 
@@ -121,6 +127,13 @@ func run() error {
 		return err
 	}
 
+	// Optional embedded negotiator (NEGOTIATOR_EMBEDDED), reading this
+	// collector's ad store directly and serving the userprio/RESCHEDULE
+	// protocol on the same command socket.
+	if err := maybeStartEmbeddedNegotiator(ctx, d, cfg, srv, st, collectorAddr(d, ln)); err != nil {
+		return err
+	}
+
 	// Optional Prometheus metrics endpoint reporting the compressed storage
 	// footprint per ad type (plus Go/process metrics), so a pool can be sized from
 	// live numbers rather than a profiler.
@@ -209,6 +222,107 @@ func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Co
 	ccbSrv.StartBackground(ctx)
 	slog.Info("embedded CCB server enabled", "public_address", pubAddr)
 	return nil
+}
+
+// maybeStartEmbeddedNegotiator starts an embedded negotiator when
+// NEGOTIATOR_EMBEDDED is set (default false), following the embedded-CCB
+// pattern: it reads the pool directly from this collector's store (no
+// self-queries), registers the userprio + RESCHEDULE handlers onto srv (so
+// they arrive on the shared command socket), and runs the cycle timer +
+// NegotiatorAd publisher in the background. pubAddr is the collector's
+// reachable address, advertised as the negotiator's own.
+//
+// The accountant state lives in ACCOUNTANT_DATABASE_FILE, defaulting to
+// $(SPOOL)/GoAccountant.log — the Go-native transaction-log format, NOT the
+// C++ Accountantnew.log ClassAdLog (whose importer is deferred; design doc
+// 3.4). Point the knob at a fresh path when migrating from a C++ negotiator.
+func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st *store.Store, pubAddr string) error {
+	if !configBool(cfg, "NEGOTIATOR_EMBEDDED", false) {
+		return nil
+	}
+
+	src, err := source.NewEmbedded(st, source.Config{
+		SlotConstraint:      configString(cfg, "NEGOTIATOR_SLOT_CONSTRAINT"),
+		SubmitterConstraint: configString(cfg, "NEGOTIATOR_SUBMITTER_CONSTRAINT"),
+		Logger:              d.Slog(),
+	})
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: %w", err)
+	}
+
+	acctCfg := accountant.ConfigFromKnobs(cfg.Get)
+	acctCfg.LogFile = accountantLogFile(cfg)
+	acct, err := accountant.New(acctCfg)
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: %w", err)
+	}
+
+	// Client security for the NEGOTIATE sessions toward schedds. Encryption is
+	// REQUIRED: the claim ids in PERMISSION_AND_AD are secrets the C++ schedd
+	// reads with get_secret, which is a plain string on an encrypted channel.
+	sessionSec, err := htcondor.GetSecurityConfig(cfg, commands.NEGOTIATE, "CLIENT")
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: schedd security config: %w", err)
+	}
+	sessionSec.Encryption = security.SecurityRequired
+
+	cycleCfg := cycle.ConfigFromKnobs(cfg.Get)
+	sf := protocol.NewFactory(sessionSec, protocol.WithNegotiatorName(cycleCfg.NegotiatorName))
+	cyc, err := cycle.New(src, acct, sf, cycleCfg)
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: %w", err)
+	}
+
+	// Per-command ALLOW_/DENY_ authorization for the userprio setters
+	// (enforced inside the negotiator's handlers; the collector's own
+	// handlers are unaffected).
+	policy, err := authz.NewPolicy(cfg, "NEGOTIATOR")
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: authorization policy: %w", err)
+	}
+
+	neg, err := negotiator.New(negotiator.Config{
+		Source:         src,
+		Accountant:     acct,
+		Cycle:          cyc,
+		NegotiatorName: cycleCfg.NegotiatorName,
+		AdvertisedAddr: pubAddr,
+		Interval:       configSeconds(cfg, "NEGOTIATOR_INTERVAL", 60*time.Second),
+		CycleDelay:     configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
+		MinInterval:    configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
+		UpdateInterval: configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
+		Authorizer:     policy.Authorize,
+		Logger:         d.Slog(),
+	})
+	if err != nil {
+		return fmt.Errorf("embedded negotiator: %w", err)
+	}
+	neg.RegisterOn(srv)
+	neg.StartBackground(ctx)
+	slog.Info("embedded negotiator enabled", "advertised_address", pubAddr,
+		"accountant_db", acctCfg.LogFile)
+	return nil
+}
+
+// accountantLogFile resolves the accountant state file: ACCOUNTANT_DATABASE_FILE
+// if set, else $(SPOOL)/GoAccountant.log, else "" (memory-only, with a warning).
+// GoAccountant.log is the Go-native format — deliberately NOT Accountantnew.log,
+// so a C++ negotiator's ClassAdLog is never clobbered or misparsed.
+func accountantLogFile(cfg *config.Config) string {
+	if v, ok := cfg.Get("ACCOUNTANT_DATABASE_FILE"); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if spool, ok := cfg.Get("SPOOL"); ok && strings.TrimSpace(spool) != "" {
+		return filepath.Join(strings.TrimSpace(spool), "GoAccountant.log")
+	}
+	slog.Warn("no ACCOUNTANT_DATABASE_FILE or SPOOL configured; accountant state is memory-only")
+	return ""
+}
+
+// configString reads a string knob, trimmed ("" when unset).
+func configString(cfg *config.Config, key string) string {
+	v, _ := cfg.Get(key)
+	return strings.TrimSpace(v)
 }
 
 // configBool reads an HTCondor boolean knob (true/t/yes/1, case-insensitive).
