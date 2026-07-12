@@ -18,8 +18,9 @@ import (
 // the usage-filtered collector-publish AccountingAds.
 func TestQueryAccountingAds(t *testing.T) {
 	ctx := testCtx(t)
-	addr, _, _ := newDaemon(t, ctx, allowAll, nil)
+	addr, acct, _ := newDaemon(t, ctx, allowAll, nil)
 	const alice = "alice@pool.test"
+	const carol = "carol@pool.test"
 
 	// Seed alice exactly like the differential harness: an explicit factor and
 	// real priority, but no usage.
@@ -29,16 +30,22 @@ func TestQueryAccountingAds(t *testing.T) {
 	sendSetter(t, ctx, addr, commands.SET_PRIORITY, alice, func(m *message.Message) error {
 		return m.PutDouble(ctx, 4.0)
 	})
+	// Seed carol with ONLY a real priority (no factor). Her reported
+	// PriorityFactor must be the write-on-read DEFAULT, not the raw 0 — the exact
+	// divergence a stock condor_userprio -modular caught in CI.
+	sendSetter(t, ctx, addr, commands.SET_PRIORITY, carol, func(m *message.Message) error {
+		return m.PutDouble(ctx, 0.5)
+	})
 
 	ads := queryAds(t, ctx, addr, commands.QUERY_ACCOUNTING_ADS, classad.New())
 
-	var found *classad.ClassAd
+	byName := map[string]*classad.ClassAd{}
 	for _, ad := range ads {
-		if v, ok := ad.EvaluateAttrString("Name"); ok && v == alice {
-			found = ad
-			break
+		if v, ok := ad.EvaluateAttrString("Name"); ok {
+			byName[v] = ad
 		}
 	}
+	found := byName[alice]
 	if found == nil {
 		t.Fatalf("QUERY_ACCOUNTING_ADS returned no ad for %s (got %d ads)", alice, len(ads))
 	}
@@ -48,6 +55,16 @@ func TestQueryAccountingAds(t *testing.T) {
 	// Priority is the effective priority: real (4.0) x factor (2000).
 	if v, _ := classad.GetAs[float64](found, "Priority"); !approx(v, 8000) {
 		t.Errorf("Priority = %v, want ~8000 (real 4 x factor 2000)", v)
+	}
+
+	// carol's factor must be the default the accountant would report, not 0.
+	if cad := byName[carol]; cad == nil {
+		t.Errorf("QUERY_ACCOUNTING_ADS returned no ad for %s (factor-only submitter)", carol)
+	} else {
+		wantFactor := acct.GetPriorityFactor(carol)
+		if v, _ := classad.GetAs[float64](cad, "PriorityFactor"); !approx(v, wantFactor) {
+			t.Errorf("carol PriorityFactor = %v, want default %v (write-on-read, not raw 0)", v, wantFactor)
+		}
 	}
 
 	// A projection restricts the returned attributes.

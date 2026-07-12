@@ -170,6 +170,11 @@ func (a *Accountant) accountingAds(negotiatorName string, now time.Time, onlyWit
 		}
 		ad.InsertAttr("LastUpdate", now.Unix())
 		ad.InsertAttrFloat(attrPriority, a.getPriorityLocked(name))
+		// recordToAd copied the RAW stored factor (0 for a submitter seeded with
+		// only SET_PRIORITY); overwrite with the effective/write-on-read factor so
+		// the ad matches C++, whose ReportState builds the ad AFTER GetPriority has
+		// persisted the default factor (Accountant.cpp:1712-1717).
+		ad.InsertAttrFloat(attrPriorityFactor, a.getPriorityFactorLocked(name))
 		ad.InsertAttr(attrCeiling, ceilingOf(r))
 		ad.InsertAttr(attrFloor, floorOf(r))
 		ad.InsertAttrBool("IsAccountingGroup", group)
