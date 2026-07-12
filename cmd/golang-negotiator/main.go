@@ -172,17 +172,18 @@ func run() error {
 	}
 
 	neg, err := negotiator.New(negotiator.Config{
-		Source:         src,
-		Accountant:     acct,
-		Cycle:          cyc,
-		NegotiatorName: cycleCfg.NegotiatorName,
-		AdvertisedAddr: negotiatorAddr(d, ln),
-		Interval:       configSeconds(cfg, "NEGOTIATOR_INTERVAL", 60*time.Second),
-		CycleDelay:     configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
-		MinInterval:    configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
-		UpdateInterval: configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
-		Authorizer:     policy.Authorize,
-		Logger:         d.Slog(),
+		Source:           src,
+		Accountant:       acct,
+		Cycle:            cyc,
+		NegotiatorName:   cycleCfg.NegotiatorName,
+		AdvertisedAddr:   negotiatorAddr(d, ln),
+		Interval:         configSeconds(cfg, "NEGOTIATOR_INTERVAL", 60*time.Second),
+		CycleDelay:       configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
+		MinInterval:      configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
+		UpdateInterval:   configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
+		CycleStatsLength: configInt(cfg, "NEGOTIATOR_CYCLE_STATS_LENGTH", 3),
+		Authorizer:       policy.Authorize,
+		Logger:           d.Slog(),
 	})
 	if err != nil {
 		return err
@@ -295,6 +296,16 @@ func configSeconds(cfg *config.Config, key string, def time.Duration) time.Durat
 	if v, ok := cfg.Get(key); ok {
 		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
+		}
+	}
+	return def
+}
+
+// configInt reads a positive integer knob, falling back to def.
+func configInt(cfg *config.Config, key string, def int) int {
+	if v, ok := cfg.Get(key); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
 		}
 	}
 	return def

@@ -53,13 +53,25 @@ type spinEnv struct {
 func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundInfo, submitters []*subState) error {
 	subs := append([]*subState(nil), submitters...)
 
+	// A non-floor round divides one "pie" for this group (C++ pies counter).
+	if !ri.isFloor {
+		st.stats.Pies++
+	}
+
 	spin := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			// Cycle deadline / cancellation: close out any open rounds.
+			// Cycle deadline / cancellation: close out any open rounds and tally
+			// the submitters/schedds that ran out of time.
+			outSchedds := make(map[string]struct{}, len(subs))
 			for _, sub := range subs {
 				c.endRound(sub, true)
+				if sub.scheddName != "" {
+					outSchedds[sub.scheddName] = struct{}{}
+				}
 			}
+			st.stats.SubmittersOutOfTime += len(subs)
+			st.stats.ScheddsOutOfTime += len(outSchedds)
 			return err
 		}
 		spin++
@@ -151,7 +163,10 @@ func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundIn
 			switch c.negotiateOne(ctx, st, ri, sub, env) {
 			case mmResume:
 				next = append(next, sub)
-			case mmDone, mmError:
+			case mmError:
+				st.stats.SubmittersFailed++
+				// removed from the list (:2795-2827)
+			case mmDone:
 				// removed from the list (:2795-2827)
 			}
 		}
@@ -310,6 +325,7 @@ func (c *Cycle) sortSubmitters(subs []*subState, env *spinEnv) {
 // negotiateOne computes one submitter's limit/ceiling and either skips it
 // (the optimization ladder at matchmaker.cpp:2718-2768) or negotiates it.
 func (c *Cycle) negotiateOne(ctx context.Context, st *runState, ri roundInfo, sub *subState, env *spinEnv) mmResult {
+	st.stats.SlotShareIter++
 	limit, limitUnclaimed, share, _, prio := c.calculateSubmitterLimit(sub.name, ri, env, ri.isFloor)
 
 	// Spin 1 only: save the fair-share figures on the submitter's accounting

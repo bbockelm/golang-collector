@@ -100,6 +100,7 @@ type runState struct {
 // Run executes one negotiation cycle (design doc 4.1).
 func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 	start := c.now()
+	cpuStart := processCPUTime()
 	stats := newStats(start)
 
 	// Enforce the whole-cycle time budget through the context so even a
@@ -246,7 +247,21 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		}
 	}
 
+	// Distinct-entity counts over the submitters actually wrapped for
+	// negotiation (C++ active_submitters / active_schedds .size()).
+	names := make(map[string]struct{}, len(st.subs))
+	schedds := make(map[string]struct{}, len(st.subs))
+	for _, sub := range st.subs {
+		names[sub.name] = struct{}{}
+		if sub.scheddName != "" {
+			schedds[sub.scheddName] = struct{}{}
+		}
+	}
+	stats.ActiveSubmitters = len(names)
+	stats.NumSchedulers = len(schedds)
+
 	stats.End = c.now()
+	stats.CpuTime = processCPUTime() - cpuStart
 	return stats, nil
 }
 

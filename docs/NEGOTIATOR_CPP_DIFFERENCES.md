@@ -137,10 +137,16 @@ it behind `AdSource` so both modes get it.
   `Requirements`/`Rank` expression yields **ERROR** in the Go classad library vs.
   **UNDEFINED** in C++ (a pre-existing library-wide convention, not introduced by
   the negotiator). Both mean "no match," so matchmaking outcomes agree.
-- **NegotiatorAd cycle stats.** Go publishes only the **last** cycle (suffix `0`)
-  and the subset of counters `CycleStats` tracks; C++ keeps a ring of the last N
-  cycles and adds CpuTime/MatchRate/Pies/etc. Enough for liveness and basic
-  dashboards, not yet a full stats history.
+- **NegotiatorAd cycle stats.** Go now keeps a **ring of the last N cycles**
+  (`NEGOTIATOR_CYCLE_STATS_LENGTH`, default 3, cap 100), published newest-first
+  with suffix `0..N-1`, and the full C++ attribute set: Period, MatchRate/
+  MatchRateSustained, Pies, SlotShareIter, NumSchedulers, ActiveSubmitterCount,
+  ScheddsOutOfTime, SubmittersFailed/OutOfTime. Two deviations remain:
+  **CpuTime** is whole-process (getrusage, all goroutines) rather than the C++
+  single-threaded per-phase rusage — only the aggregate `LastNegotiationCycleCpuTime<i>`
+  is published, not the per-phase CPU splits; and **SubmittersShareLimit** (a
+  submitter halted purely by its fair-share limit) is not yet classified and is
+  published as 0.
 - **Collector discovery (standalone).** The Go daemon prefers the collector's
   **address file** (`$(LOG)/.collector_address`) over `COLLECTOR_HOST`, so a
   co-located negotiator finds a collector on a shared/ephemeral port. C++ resolves

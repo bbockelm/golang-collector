@@ -97,20 +97,40 @@ type MatchResult struct {
 }
 
 // CycleStats summarizes one negotiation cycle (published on the NegotiatorAd).
+// The field set mirrors the C++ NegotiationCycleStats
+// (matchmaker.cpp:publishNegotiationCycleStats, :6455-6544); the daemon keeps a
+// ring of the last N and publishes each with a "0..N-1" suffix (0 = newest).
 type CycleStats struct {
 	Start, End       time.Time
 	TotalSlots       int
 	TrimmedSlots     int
 	CandidateSlots   int
-	Submitters       int
+	Submitters       int // submitter ADS seen (a flocking submitter appears once per schedd)
+	ActiveSubmitters int // distinct submitter NAMES negotiated (C++ active_submitters.size())
+	NumSchedulers    int // distinct schedds negotiated (C++ active_schedds.size())
 	IdleJobs         int
 	JobsConsidered   int
 	Matches          int
 	Rejections       int
+	Pies             int // number of group pies divided this cycle
 	PieSpins         int
-	PrefetchDuration time.Duration
-	Phase1Duration   time.Duration // obtain ads
-	Phase2Duration   time.Duration // accounting
-	Phase3Duration   time.Duration // sort submitters
-	Phase4Duration   time.Duration // matchmaking
+	SlotShareIter    int // submitter slot-share calculations performed
+	// Outcome tallies. SubmittersOutOfTime/ScheddsOutOfTime are populated when
+	// the cycle deadline fires; SubmittersFailed counts per-submitter negotiate
+	// errors. SubmittersShareLimit (submitters halted purely by their fair-share
+	// limit) is not yet classified and stays 0 (see NEGOTIATOR_CPP_DIFFERENCES).
+	ScheddsOutOfTime     int
+	SubmittersFailed     int
+	SubmittersOutOfTime  int
+	SubmittersShareLimit int
+	PrefetchDuration     time.Duration
+	Phase1Duration       time.Duration // obtain ads
+	Phase2Duration       time.Duration // accounting
+	Phase3Duration       time.Duration // sort submitters
+	Phase4Duration       time.Duration // matchmaking
+	// CpuTime is the process CPU time (user+system, via getrusage) consumed
+	// across the cycle. Unlike the single-threaded C++ negotiator this is
+	// whole-process (all goroutines), so on the sharded scan it can exceed the
+	// wall-clock duration -- a documented consequence of the concurrency model.
+	CpuTime time.Duration
 }

@@ -178,7 +178,18 @@ is unchanged.
 
 **Scope:** medium; opt-in, low risk to the default path.
 
-## 7. Full NegotiatorAd stats + userprio-locate polish  (P2)
+## 7. Full NegotiatorAd stats + userprio-locate polish  ✅ DONE
+
+Delivered: the NegotiatorAd now carries a **ring of the last N cycles**
+(`NEGOTIATOR_CYCLE_STATS_LENGTH`, default 3, cap 100), newest-first suffix
+`0..N-1`, with the full C++ attribute set — Period, MatchRate/MatchRateSustained,
+Pies, SlotShareIter, NumSchedulers, ActiveSubmitterCount, ScheddsOutOfTime,
+SubmittersFailed/OutOfTime, and aggregate CpuTime (getrusage). The
+userprio-locate issue was fixed separately (CondorVersion on the ad; see
+NEGOTIATOR_CPP_DIFFERENCES.md). Remaining deviations: CpuTime is whole-process
+not per-phase; SubmittersShareLimit stays 0 (not classified).
+
+_Original brief:_
 
 **What:** the C++ NegotiatorAd keeps a ring of the last N cycles (suffixes
 `0..N-1`) and publishes CpuTime/MatchRate/Pies/ScheddsOutOfTime/
