@@ -1,0 +1,96 @@
+package negotiator_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/bbockelm/cedar/commands"
+	"github.com/bbockelm/cedar/message"
+)
+
+// TestQueryAccountingAds exercises the direct QUERY_ACCOUNTING_ADS command a
+// modern condor_userprio -modular / condor_status -direct sends straight to the
+// negotiator (instead of GET_PRIORITY). Without a handler the stock tool prints
+// "Can't query negotiator for ads". The response must include submitters seeded
+// only via SET_PRIORITY / SET_PRIORITYFACTOR (no accrued usage) — the case the
+// differential harness relies on — so it uses ReportStateAds (unfiltered), not
+// the usage-filtered collector-publish AccountingAds.
+func TestQueryAccountingAds(t *testing.T) {
+	ctx := testCtx(t)
+	addr, _, _ := newDaemon(t, ctx, allowAll, nil)
+	const alice = "alice@pool.test"
+
+	// Seed alice exactly like the differential harness: an explicit factor and
+	// real priority, but no usage.
+	sendSetter(t, ctx, addr, commands.SET_PRIORITYFACTOR, alice, func(m *message.Message) error {
+		return m.PutDouble(ctx, 2000)
+	})
+	sendSetter(t, ctx, addr, commands.SET_PRIORITY, alice, func(m *message.Message) error {
+		return m.PutDouble(ctx, 4.0)
+	})
+
+	ads := queryAds(t, ctx, addr, commands.QUERY_ACCOUNTING_ADS, classad.New())
+
+	var found *classad.ClassAd
+	for _, ad := range ads {
+		if v, ok := ad.EvaluateAttrString("Name"); ok && v == alice {
+			found = ad
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("QUERY_ACCOUNTING_ADS returned no ad for %s (got %d ads)", alice, len(ads))
+	}
+	if v, ok := found.EvaluateAttrString("MyType"); !ok || v != "Accounting" {
+		t.Errorf("accounting ad MyType = %q (ok=%v), want %q", v, ok, "Accounting")
+	}
+	// Priority is the effective priority: real (4.0) x factor (2000).
+	if v, _ := classad.GetAs[float64](found, "Priority"); !approx(v, 8000) {
+		t.Errorf("Priority = %v, want ~8000 (real 4 x factor 2000)", v)
+	}
+
+	// A projection restricts the returned attributes.
+	projQ := classad.New()
+	projQ.InsertAttrString("ProjectionAttributes", "Name,Priority")
+	projected := queryAds(t, ctx, addr, commands.QUERY_ACCOUNTING_ADS, projQ)
+	for _, ad := range projected {
+		if v, _ := ad.EvaluateAttrString("Name"); v != alice {
+			continue
+		}
+		if _, ok := ad.EvaluateAttrString("MyType"); ok {
+			t.Errorf("projection Name,Priority should have dropped MyType; ad: %s", ad)
+		}
+	}
+}
+
+// queryAds sends a collector-style query ad to the negotiator and reads back the
+// PutInt32(1)+ad stream terminated by PutInt32(0).
+func queryAds(t *testing.T, ctx context.Context, addr string, cmd int, queryAd *classad.ClassAd) []*classad.ClassAd {
+	t.Helper()
+	cl := dialCmd(t, ctx, addr, cmd)
+	req := message.NewMessageForStream(cl.GetStream())
+	if err := req.PutClassAd(ctx, queryAd); err != nil {
+		t.Fatalf("sending query ad: %v", err)
+	}
+	if err := req.FlushFrame(ctx, true); err != nil {
+		t.Fatalf("flushing query ad: %v", err)
+	}
+	rm := message.NewMessageFromStream(cl.GetStream())
+	var ads []*classad.ClassAd
+	for {
+		more, err := rm.GetInt32(ctx)
+		if err != nil {
+			t.Fatalf("reading more-flag: %v", err)
+		}
+		if more == 0 {
+			break
+		}
+		ad, err := rm.GetClassAd(ctx)
+		if err != nil {
+			t.Fatalf("reading query-result ad: %v", err)
+		}
+		ads = append(ads, ad)
+	}
+	return ads
+}

@@ -202,8 +202,9 @@ PRIORITY_HALFLIFE = 1000000000000
 			{"-setlast", "dave@differ.test", "1700000900"},
 		}
 
-		cppState := runSeedRead(t, "", frozen, seedCmds)
-		goState := runSeedRead(t, goBin, frozen, seedCmds)
+		cppState, goState := runPairParallel(t, goBin, func(t *testing.T, goBin string) map[string]negtest.SubmitterPrio {
+			return runSeedRead(t, goBin, frozen, seedCmds)
+		})
 
 		// 1) Differential: C++ vs Go agree on every seeded submitter.
 		diffs := negtest.DiffPrioStates(cppState, goState, diffAbsTol, diffRelTol)
@@ -271,8 +272,9 @@ PRIORITY_HALFLIFE = 2
 		}
 		const settle = 24 * time.Second // ~12 half-lives: 100/2^12 << 0.5 floor
 
-		cppState := runSeedReadDelay(t, "", fast, seedCmds, settle)
-		goState := runSeedReadDelay(t, goBin, fast, seedCmds, settle)
+		cppState, goState := runPairParallel(t, goBin, func(t *testing.T, goBin string) map[string]negtest.SubmitterPrio {
+			return runSeedReadDelay(t, goBin, fast, seedCmds, settle)
+		})
 
 		const floorEff = 0.5 * 5.0
 		// Loose tolerance: both must have converged to the floor.
@@ -322,6 +324,22 @@ func runSeedReadDelay(t *testing.T, goBin, knobs string, cmds [][]string, settle
 	return p.readState(t)
 }
 
+// runPairParallel runs the C++ pool (goBin "") and the Go pool concurrently —
+// each in its own parallel subtest, so t.Fatalf stays on the correct goroutine —
+// and returns both results once both have finished. The per-pool startup, settle
+// and negotiation waits overlap, roughly halving the wall time versus running
+// the two pools back to back. The enclosing "pools" subtest blocks until both
+// parallel children complete, so the results are ready when it returns. Only two
+// condor pools are ever live at once (the differential units run serially).
+func runPairParallel[T any](t *testing.T, goBin string, run func(t *testing.T, goBin string) T) (cppRes, goRes T) {
+	t.Helper()
+	t.Run("pools", func(t *testing.T) {
+		t.Run("cpp", func(t *testing.T) { t.Parallel(); cppRes = run(t, "") })
+		t.Run("go", func(t *testing.T) { t.Parallel(); goRes = run(t, goBin) })
+	})
+	return cppRes, goRes
+}
+
 // ---- Flavor B: fair-share allocation differential (best-effort) ----
 
 // fairShareFactors: submitter fair share is proportional to 1/(realPrio x
@@ -357,8 +375,7 @@ func TestFairShareAllocationDifferential(t *testing.T) {
 	}
 	goBin := buildGoNegotiatorBin(t)
 
-	cppSplit := runFairShare(t, "")
-	goSplit := runFairShare(t, goBin)
+	cppSplit, goSplit := runPairParallel(t, goBin, runFairShare)
 
 	t.Logf("fair-share split: C++ %v  Go %v (slots=%d, factor %g:%g)", cppSplit, goSplit, fairSlots, fairFactorA, fairFactorB)
 

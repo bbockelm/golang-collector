@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	cedarserver "github.com/bbockelm/cedar/server"
@@ -155,6 +156,19 @@ func (n *Negotiator) RegisterOn(cs *cedarserver.Server) {
 	n.handle(cs, commands.GET_PRIORITY, n.handleGetState(false), "READ")
 	n.handle(cs, commands.GET_PRIORITY_ROLLUP, n.handleGetState(true), "READ")
 
+	// The collector-style direct queries a modern condor_userprio -modular /
+	// condor_status -direct sends to the negotiator instead of GET_PRIORITY
+	// (matchmaker.cpp:606-611, both READ). Without QUERY_ACCOUNTING_ADS a stock
+	// condor_userprio -modular reports "Can't query negotiator for ads".
+	n.handle(cs, commands.QUERY_ACCOUNTING_ADS,
+		n.handleQueryAds(func() []*classad.ClassAd {
+			return n.cfg.Accountant.ReportStateAds(n.cfg.NegotiatorName, time.Now())
+		}), "READ")
+	n.handle(cs, commands.QUERY_NEGOTIATOR_ADS,
+		n.handleQueryAds(func() []*classad.ClassAd {
+			return []*classad.ClassAd{n.buildNegotiatorAd()}
+		}), "READ")
+
 	n.handle(cs, commands.SET_PRIORITY,
 		n.handleSetDouble("SET_PRIORITY", n.cfg.Accountant.SetPriority), "ADMINISTRATOR")
 	n.handle(cs, commands.SET_ACCUMUSAGE,
@@ -246,6 +260,98 @@ func (n *Negotiator) handleGetState(rollup bool) cedarserver.HandlerFunc {
 		}
 		return out.FinishMessage(ctx)
 	}
+}
+
+// handleQueryAds serves the collector-style QUERY_*_ADS commands a modern
+// condor_userprio -modular / condor_status -direct sends STRAIGHT to the
+// negotiator (QUERY_ACCOUNTING_ADS, QUERY_NEGOTIATOR_ADS) rather than the legacy
+// GET_PRIORITY. It mirrors Matchmaker::QUERY_ADS_commandHandler
+// (matchmaker.cpp:1535): read the query ad, gather the candidate ads, drop those
+// that fail its Requirements, honor a projection, and stream the matches as
+// PutInt32(1)+ad per ad terminated by PutInt32(0) — the same framing the
+// collector query protocol uses (server queryHandler). gather() produces the
+// candidate ads for this command.
+func (n *Negotiator) handleQueryAds(gather func() []*classad.ClassAd) cedarserver.HandlerFunc {
+	return func(ctx context.Context, c *cedarserver.Conn) error {
+		queryAd, err := message.NewMessageFromStream(c.Stream).GetClassAd(ctx)
+		if err != nil {
+			return fmt.Errorf("negotiator: query: reading query ad: %w", err)
+		}
+		matcher, projection, limit, err := parseAdQuery(queryAd)
+		if err != nil {
+			return fmt.Errorf("negotiator: query: bad constraint: %w", err)
+		}
+		resp := message.NewMessageForStream(c.Stream)
+		count := 0
+		for _, ad := range gather() {
+			if limit > 0 && count >= limit {
+				break
+			}
+			if matcher != nil && !matcher.Matches(ad) {
+				continue
+			}
+			if err := resp.PutInt32(ctx, 1); err != nil {
+				return err
+			}
+			if err := resp.PutClassAd(ctx, projectAd(ad, projection)); err != nil {
+				return err
+			}
+			count++
+		}
+		if err := resp.PutInt32(ctx, 0); err != nil {
+			return err
+		}
+		return resp.FlushFrame(ctx, true)
+	}
+}
+
+// parseAdQuery pulls the constraint (Requirements), projection and result limit
+// out of a query ad, mirroring the collector's parseQuery. A nil *vm.Query means
+// "match everything" (absent or literally-true Requirements). It accepts either
+// the whitespace-separated Projection or the comma-separated ProjectionAttributes.
+func parseAdQuery(queryAd *classad.ClassAd) (*vm.Query, []string, int, error) {
+	var q *vm.Query
+	if expr, ok := queryAd.Lookup("Requirements"); ok {
+		s := strings.TrimSpace(expr.String())
+		if s != "" && !strings.EqualFold(s, "true") {
+			var err error
+			if q, err = vm.Parse(s); err != nil {
+				return nil, nil, 0, err
+			}
+		}
+	}
+	var projection []string
+	if s, ok := queryAd.EvaluateAttrString("Projection"); ok && strings.TrimSpace(s) != "" {
+		projection = splitQueryAttrs(s)
+	} else if s, ok := queryAd.EvaluateAttrString("ProjectionAttributes"); ok && strings.TrimSpace(s) != "" {
+		projection = splitQueryAttrs(s)
+	}
+	limit := 0
+	if l, ok := queryAd.EvaluateAttrInt("LimitResults"); ok && l > 0 {
+		limit = int(l)
+	}
+	return q, projection, limit, nil
+}
+
+func splitQueryAttrs(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+}
+
+// projectAd returns a copy of ad holding only the whitelisted attributes that
+// are present; an empty whitelist returns ad unchanged.
+func projectAd(ad *classad.ClassAd, attrs []string) *classad.ClassAd {
+	if len(attrs) == 0 {
+		return ad
+	}
+	out := classad.New()
+	for _, a := range attrs {
+		if e, ok := ad.Lookup(a); ok {
+			out.InsertExpr(a, e)
+		}
+	}
+	return out
 }
 
 // handleSetName serves the "string submitter + EOM" mutators (RESET_USAGE,

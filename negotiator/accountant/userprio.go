@@ -127,13 +127,26 @@ func (a *Accountant) reportGroup(ad *classad.ClassAd, n *negotiator.GroupNode, g
 	maxInto(ad, "LastUsageTime"+pnum, intOr(r, attrLastUsageTime, 0))
 }
 
-// Accounting AdvertiseAccounting: renders the per-submitter / per-group
-// Accounting ads for the collector (design doc 3.6). Each ad is the full
-// Customer record plus Name, NegotiatorName, effective Priority, Ceiling,
-// Floor, IsAccountingGroup, AccountingGroup, LastUpdate (and, for groups, the
-// quota fields). Submitters with no recorded usage are skipped. Mirrors
-// Accountant::ReportState(queryAd,...) (Accountant.cpp:1686).
+// AccountingAds renders the per-submitter / per-group Accounting ads for the
+// collector publish (design doc 3.6). Each ad is the full Customer record plus
+// Name, NegotiatorName, effective Priority, Ceiling, Floor, IsAccountingGroup,
+// AccountingGroup, LastUpdate (and, for groups, the quota fields). Submitters
+// with no recorded usage are skipped so idle records do not spam the collector.
 func (a *Accountant) AccountingAds(negotiatorName string, now time.Time) []*classad.ClassAd {
+	return a.accountingAds(negotiatorName, now, true)
+}
+
+// ReportStateAds renders one Accounting ad per Customer record with NO usage
+// filter — the set the C++ Accountant::ReportState(queryAd, ads) returns for a
+// direct QUERY_ACCOUNTING_ADS (Accountant.cpp:1701 iterates every customer).
+// This is what a modern condor_userprio -modular reads straight from the
+// negotiator, so it must include submitters seeded via SET_PRIORITY /
+// SET_PRIORITYFACTOR that have not yet accrued any usage.
+func (a *Accountant) ReportStateAds(negotiatorName string, now time.Time) []*classad.ClassAd {
+	return a.accountingAds(negotiatorName, now, false)
+}
+
+func (a *Accountant) accountingAds(negotiatorName string, now time.Time, onlyWithUsage bool) []*classad.ClassAd {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -145,8 +158,8 @@ func (a *Accountant) AccountingAds(negotiatorName string, now time.Time) []*clas
 	var ads []*classad.ClassAd
 	a.store.forEach(tableCustomer, func(name string, r *record) bool {
 		group := isGroupName(name)
-		if !group && !r.has(attrResourcesUsed) {
-			// Only advertise submitters that have accrued usage.
+		if onlyWithUsage && !group && !r.has(attrResourcesUsed) {
+			// Collector publish only: skip submitters with no accrued usage.
 			return true
 		}
 		ad := recordToAd(r)

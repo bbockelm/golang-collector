@@ -56,8 +56,12 @@ type Accountant interface {
 	// rollup sums children into parents).
 	ReportState(rollup bool) *classad.ClassAd
 	// AccountingAds renders the per-submitter/per-group Accounting ads for
-	// the collector.
+	// the collector publish (usage-less submitters skipped).
 	AccountingAds(negotiatorName string, now time.Time) []*classad.ClassAd
+	// ReportStateAds renders one Accounting ad per Customer record with NO
+	// usage filter — the set a direct QUERY_ACCOUNTING_ADS returns (the C++
+	// Accountant::ReportState(queryAd, ads), Accountant.cpp:1686).
+	ReportStateAds(negotiatorName string, now time.Time) []*classad.ClassAd
 	// Userprio mutation surface (SET_* / RESET_* / DELETE_USER handlers).
 	SetPriorityFactor(submitter string, factor float64) error
 	SetPriority(submitter string, priority float64) error

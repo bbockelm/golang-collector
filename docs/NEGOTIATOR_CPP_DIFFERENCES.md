@@ -116,6 +116,18 @@ it behind `AdSource` so both modes get it.
 
 ## Smaller differences (worth knowing, unlikely to bite)
 
+- **Direct modular queries ARE handled.** A modern `condor_userprio -modular` /
+  `condor_status -direct` sends the negotiator a collector-style `CondorQuery`
+  (`QUERY_ACCOUNTING_ADS` 78, `QUERY_NEGOTIATOR_ADS` 50) rather than
+  `GET_PRIORITY`; both are served (`handleQueryAds`, mirroring
+  `Matchmaker::QUERY_ADS_commandHandler`) — Requirements + projection honored,
+  streamed with the collector `more`-flag framing. The accounting response uses
+  the **unfiltered** `ReportStateAds` (every Customer, like C++ `ReportState`),
+  not the usage-filtered `AccountingAds` used for the collector publish, so
+  submitters seeded via `SET_PRIORITY`/`SET_PRIORITYFACTOR` with no usage still
+  appear. (An older `condor_userprio` that falls back to `GET_PRIORITY` doesn't
+  exercise this path, which is why it went unnoticed until a distro build hit it
+  in CI.)
 - **Unimplemented userprio bits.** `GET_RESLIST` (463) is skipped — the command
   int isn't in `cedar/commands` yet. `SET_PRIORITYFACTOR` requires `ADMINISTRATOR`
   (the C++ `PRIORITY_FACTOR_AUTHORIZATION` user-map path is deferred). The
