@@ -21,6 +21,13 @@ type Config struct {
 	// submitter ads the same way.
 	SubmitterConstraint string
 
+	// SlotWeightExpr is SLOT_WEIGHT (default "Cpus"): the cost expression the
+	// negotiator defaults a slot's weight to when the ad carries no usable
+	// SlotWeight. It lets an operator weight matchmaking cost and fair-share
+	// usage by something other than CPUs (e.g. "Cpus + Memory/1024"). A slot that
+	// already advertises its own SlotWeight is left untouched.
+	SlotWeightExpr string
+
 	// CollectorAddr is the collector address (host:port / sinful, or a
 	// comma-separated list) the remote source queries. Required for the remote
 	// source; ignored by the embedded source.
@@ -63,6 +70,7 @@ func NewEmbedded(st *store.Store, cfg Config) (*EmbeddedSource, error) {
 		log:   cfg.logger(),
 		slotQ: slotQ,
 		subQ:  subQ,
+		defaultWeight: ParseSlotWeight(cfg.SlotWeightExpr),
 	}, nil
 }
 
@@ -87,5 +95,6 @@ func NewRemote(cfg Config) (*RemoteSource, error) {
 	return &RemoteSource{
 		cfg: cfg,
 		log: cfg.logger(),
+		defaultWeight: ParseSlotWeight(cfg.SlotWeightExpr),
 	}, nil
 }

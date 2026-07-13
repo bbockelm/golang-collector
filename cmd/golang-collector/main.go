@@ -244,6 +244,7 @@ func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *co
 	src, err := source.NewEmbedded(st, source.Config{
 		SlotConstraint:      configString(cfg, "NEGOTIATOR_SLOT_CONSTRAINT"),
 		SubmitterConstraint: configString(cfg, "NEGOTIATOR_SUBMITTER_CONSTRAINT"),
+		SlotWeightExpr:      configString(cfg, "SLOT_WEIGHT"),
 		Logger:              d.Slog(),
 	})
 	if err != nil {

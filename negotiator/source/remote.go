@@ -28,6 +28,10 @@ type RemoteSource struct {
 	log *slog.Logger
 	col *htcondor.Collector
 
+	// defaultWeight is the parsed SLOT_WEIGHT cost expression, applied by
+	// FixupSlot to slots lacking their own SlotWeight (shared read-only).
+	defaultWeight *classad.Expr
+
 	once sync.Once
 }
 
@@ -78,7 +82,7 @@ func (s *RemoteSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot, 
 			return
 		}
 		for _, ad := range ads {
-			FixupSlot(ad)
+			FixupSlot(ad, s.defaultWeight)
 		}
 		slots = ads
 	}()

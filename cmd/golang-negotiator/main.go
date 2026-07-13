@@ -120,6 +120,7 @@ func run() error {
 	src, err := source.NewRemote(source.Config{
 		SlotConstraint:      configString(cfg, "NEGOTIATOR_SLOT_CONSTRAINT"),
 		SubmitterConstraint: configString(cfg, "NEGOTIATOR_SUBMITTER_CONSTRAINT"),
+		SlotWeightExpr:      configString(cfg, "SLOT_WEIGHT"),
 		CollectorAddr:       collectorHost,
 		Security:            querySec,
 		Logger:              d.Slog(),
