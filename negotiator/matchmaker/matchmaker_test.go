@@ -269,7 +269,10 @@ func TestSlotWeight(t *testing.T) {
 		{"[ Cpus = 4 ]", 4},                     // fallback to Cpus
 		{"[ SlotWeight = -1; Cpus = 6 ]", 6},    // negative weight -> Cpus
 		{"[ Foo = 1 ]", 1.0},                    // neither -> 1.0
-		{"[ SlotWeight = 2 * 3; Cpus = 1 ]", 6}, // expression
+		{"[ SlotWeight = 2 * 3; Cpus = 1 ]", 6},                       // constant expression
+		{"[ SlotWeight = Cpus * 2; Cpus = 8 ]", 16},                   // references a machine attr
+		{"[ SlotWeight = Cpus + Memory / 1024; Cpus = 4; Memory = 2048 ]", 6}, // multi-attr cost expression
+		{"[ SlotWeight = ifThenElse(Gpus > 0, Gpus * 10, Cpus); Gpus = 2; Cpus = 4 ]", 20}, // conditional cost
 	}
 	for _, tc := range cases {
 		if got := m.slotWeight(mustAd(t, tc.ad)); got != tc.want {

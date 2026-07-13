@@ -147,6 +147,45 @@ func TestConcurrencyGateNoLimitsAttrIgnored(t *testing.T) {
 	}
 }
 
+// TestConcurrencyGateExpression verifies that ConcurrencyLimits may be an
+// EXPRESSION over the job's own attributes (not just a literal string): the
+// negotiator evaluates it to a string once per request (EvaluateAttrString) and
+// gates on the resulting limit name. This is the per-request expression path
+// (evaluate_limits_with_match == false); a TARGET-referencing per-candidate
+// expression stays out of scope (documented in concurrency.go).
+func TestConcurrencyGateExpression(t *testing.T) {
+	m := mustNew(t, Config{})
+	view := viewOf(mustAd(t, "[ Requirements = true ]"))
+	// ConcurrencyLimits is strcat("cms_", AcctGroup) -> "cms_prod".
+	req := func() *negotiator.Request {
+		return reqOf(mustAd(t, `[ Requirements = true; AcctGroup = "prod"; ConcurrencyLimits = strcat("cms_", AcctGroup) ]`))
+	}
+
+	// usage 3 + 1 <= 4 -> admit against the evaluated limit "cms_prod".
+	admit := stubLimits{usage: map[string]float64{"cms_prod": 3}, max: map[string]float64{"cms_prod": 4}}
+	if cand, rej, err := m.Match(context.Background(), req(), view, limitsWith(admit)); err != nil {
+		t.Fatalf("Match: %v", err)
+	} else if cand == nil {
+		t.Fatalf("expected match (cms_prod 3+1<=4), got reject %+v", rej)
+	}
+
+	// usage 4 + 1 > 4 -> reject; proves the expression resolved to the gated name.
+	full := stubLimits{usage: map[string]float64{"cms_prod": 4}, max: map[string]float64{"cms_prod": 4}}
+	cand, rej, err := m.Match(context.Background(), req(), view, limitsWith(full))
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if cand != nil {
+		t.Fatalf("expected rejection (cms_prod at max), got match %v", cand.Slot)
+	}
+	if rej == nil || rej.ForConcurrencyLim != 1 {
+		t.Fatalf("expected ForConcurrencyLim=1, got %+v", rej)
+	}
+	if want := "concurrency limit cms_prod reached"; rej.Reason != want {
+		t.Fatalf("reason: got %q want %q", rej.Reason, want)
+	}
+}
+
 func TestParseLimitToken(t *testing.T) {
 	cases := []struct {
 		in   string
