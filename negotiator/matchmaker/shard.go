@@ -9,19 +9,21 @@ import (
 )
 
 // rejCounters tallies the per-scan rejection reasons the reject-info selection
-// needs, mirroring the C++ rej* counters (matchmaker.cpp). Concurrency/network
-// counters are deferred (roadmap #3), so only submitter-limit and the two
-// preemption counters are live.
+// needs, mirroring the C++ rej* counters (matchmaker.cpp). concurrency counts the
+// per-match ConcurrencyLimits rejections (the up-front literal path rejects the
+// whole request before the scan and never reaches here).
 type rejCounters struct {
 	submitterLimit int // rejForSubmitterLimit
 	preemptPolicy  int // rejPreemptForPolicy (PREEMPTION_REQUIREMENTS == False)
 	preemptRank    int // rejPreemptForRank   (rankCondPrioPreempt false)
+	concurrency    int // rejForConcurrencyLimit, per-match path (evaluate_limits_with_match)
 }
 
 func (r *rejCounters) add(o rejCounters) {
 	r.submitterLimit += o.submitterLimit
 	r.preemptPolicy += o.preemptPolicy
 	r.preemptRank += o.preemptRank
+	r.concurrency += o.concurrency
 }
 
 // parallelScan evaluates every candidate against reqAd, sharding the candidate
@@ -37,7 +39,7 @@ func (r *rejCounters) add(o rejCounters) {
 // shared request ad would be a data race under -race. Candidate (right) ads are
 // disjoint across workers (each owns a contiguous index range), so mutating
 // their TARGET pointers is safe.
-func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits) (*negotiator.Candidate, rejCounters) {
+func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits, matchConc bool) (*negotiator.Candidate, rejCounters) {
 	n := len(cands)
 	if n == 0 {
 		return nil, rejCounters{}
@@ -48,7 +50,7 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 		nw = n
 	}
 	if nw <= 1 {
-		best, rej := m.scanRange(reqAd, cands, limits)
+		best, rej := m.scanRange(reqAd, cands, limits, matchConc)
 		return best, rej
 	}
 
@@ -73,7 +75,7 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 		wg.Add(1)
 		go func(w, lo, hi int) {
 			defer wg.Done()
-			results[w].best, results[w].rej = m.scanRange(reqAd, cands[lo:hi], limits)
+			results[w].best, results[w].rej = m.scanRange(reqAd, cands[lo:hi], limits, matchConc)
 		}(w, lo, hi)
 	}
 	wg.Wait()
@@ -103,7 +105,7 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 // disjoint index sub-range per goroutine -- so this reuse is race-free and does
 // not touch the deterministic reduce (Candidate.Better still tie-breaks on
 // ScanIndex, so the sharded winner is byte-identical to the serial one).
-func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits) (*negotiator.Candidate, rejCounters) {
+func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits, matchConc bool) (*negotiator.Candidate, rejCounters) {
 	if len(cands) == 0 {
 		return nil, rejCounters{}
 	}
@@ -120,7 +122,7 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 	var rej rejCounters
 
 	for _, c := range cands {
-		if !m.evalCandidate(mc, c, limits, &rej, &cand) {
+		if !m.evalCandidate(mc, c, limits, matchConc, &rej, &cand) {
 			continue
 		}
 		if !haveBest || cand.Better(&best) {
@@ -151,7 +153,7 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 // candidate path allocation-free (the caller reuses one scratch across the whole
 // scan range). Requirements failures bump NO counter, matching the C++
 // `continue` (matchmaker.cpp:4951-4954).
-func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, rej *rejCounters, out *negotiator.Candidate) bool {
+func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, matchConc bool, rej *rejCounters, out *negotiator.Candidate) bool {
 	mc.ReplaceRightAd(c.slot)
 
 	// (1) bilateral Requirements. (The C++ pslotMultiMatch retry for
@@ -159,6 +161,23 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 	// is simply "not a match".)
 	if !mc.Symmetry("Requirements", "Requirements") {
 		return false
+	}
+
+	// (1b) per-match concurrency limits (evaluate_limits_with_match,
+	// matchmaker.cpp:5074-5077): evaluate the job's ConcurrencyLimits against THIS
+	// match (MY=job, TARGET=slot) so a per-CPU-style increment can depend on the
+	// slot, then reject the candidate if any named limit would exceed its max
+	// against the (immutable-during-scan) usage view. matchConc is set only when
+	// ConcurrencyLimits is a match-referencing expression; the literal/job-only
+	// case was gated up front in Match. Read-only, so the sharded scan stays a
+	// pure function of its inputs.
+	if matchConc {
+		if s, err := mc.EvaluateAttrLeft("ConcurrencyLimits").StringValue(); err == nil && s != "" {
+			if rejected, _ := rejectForConcurrencyLimits(s, limits.Concurrency); rejected {
+				rej.concurrency++
+				return false
+			}
+		}
 	}
 
 	// (2) preemption classification + (3) submitter-limit gate.

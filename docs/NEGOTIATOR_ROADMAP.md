@@ -99,8 +99,13 @@ Delivered: matchmaker gate on `ConcurrencyLimits` (comma list, `name:weight`)
 vs `<NAME>_LIMIT` / `CONCURRENCY_LIMIT_DEFAULT[_<PREFIX>]` maxes; cross-cycle
 counts store-backed under a `ConcurrencyLimit.` namespace (rebuilt in
 CheckMatches), in-cycle live consumption via a per-cycle tracker; pure gate so
-compat==fast holds. Not ported: the per-candidate expression form
-(`evaluate_limits_with_match`).
+compat==fast holds. The per-candidate expression form
+(`evaluate_limits_with_match`) is now ALSO ported: when `ConcurrencyLimits` is a
+match-referencing expression (only evaluates to a string with a TARGET),
+`Match` flags it and `evalCandidate` evaluates it per candidate against the
+match, so a per-CPU license `strcat("license:", TARGET.Cpus)` consumes the
+matched slot's Cpus. The check is read-only over the usage view, so the sharded
+scan stays deterministic.
 
 _Original brief:_
 
