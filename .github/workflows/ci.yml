@@ -42,11 +42,101 @@ jobs:
     - name: Run go vet
       run: go vet ./...
 
+    - name: Install gotestsum
+      run: |
+        go install gotest.tools/gotestsum@latest
+        echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
     # -short skips the heavy memory/retrain footprint and multi-process scaling
     # tests (they honor testing.Short()); correctness and the condor_master
-    # integration test still run.
+    # integration test still run. gotestsum gives readable per-package output and a
+    # JUnit report; the privilege-drop integration test needs root, so it runs in
+    # the separate `test-root` job below.
     - name: Run tests
-      run: go test -short -race -timeout=30m ./...
+      run: |
+        gotestsum \
+          --format pkgname-and-test-fails \
+          --hide-summary=output \
+          --junitfile junit.xml \
+          -- \
+          -short -race -timeout=30m ./...
+
+    - name: Publish test summary
+      if: always()
+      uses: test-summary/action@v2
+      with:
+        paths: junit.xml
+
+    - name: Upload JUnit report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-test
+        path: junit.xml
+        if-no-files-found: ignore
+
+  # The privilege-drop integration test (TestCollectorPrivilegeDrop) must run as
+  # root: it starts a real condor_master that launches htc-collector as root and
+  # verifies the collector drops to the `condor` account, creates its log + session
+  # DB owned by condor, and re-elevates to root to read the root-owned pool signing
+  # key. It skips unless euid==0 and the condor account exists, so it can only run
+  # in this dedicated root job (installing HTCondor creates the condor user).
+  test-root:
+    name: Test (root privilege drop)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+        cache: true
+
+    - name: Install HTCondor
+      run: |
+        wget -qO - https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-25.x-Key | sudo gpg --dearmor -o /usr/share/keyrings/htcondor-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/htcondor-archive-keyring.gpg] http://research.cs.wisc.edu/htcondor/repo/ubuntu/25.x $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/htcondor.list
+        sudo apt-get update
+        sudo apt-get install -y condor
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Install gotestsum
+      run: |
+        go install gotest.tools/gotestsum@latest
+        echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+    # Run only the root-gated privilege-drop test, as root. `sudo -E` preserves the
+    # environment (HOME, GOPATH, GOCACHE, GOMODCACHE) so gotestsum and the module
+    # cache are reused; `env "PATH=$PATH"` re-injects PATH (sudo resets it via
+    # secure_path) so condor_master, go, and gotestsum are found. The condor daemon
+    # binaries install to /usr/sbin.
+    - name: Run privilege-drop test as root
+      run: |
+        sudo -E env "PATH=$PATH:/usr/sbin" \
+          gotestsum \
+            --format pkgname-and-test-fails \
+            --hide-summary=output \
+            --junitfile junit-root.xml \
+            -- \
+            -run TestCollectorPrivilegeDrop -count=1 -timeout=10m ./integration/
+
+    - name: Publish test summary
+      if: always()
+      uses: test-summary/action@v2
+      with:
+        paths: junit-root.xml
+
+    - name: Upload JUnit report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-test-root
+        path: junit-root.xml
+        if-no-files-found: ignore
 
   lint:
     name: Lint
