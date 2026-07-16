@@ -47,9 +47,17 @@ func TestCollectorPrivilegeDrop(t *testing.T) {
 		t.Skipf("condor_master not found in PATH: %v", err)
 	}
 
-	tmp := t.TempDir()
-	// The temp root is 0700 root-owned; the condor account must traverse it to
-	// reach its (chowned) log/spool dirs.
+	// HTCondor opens its logs and runs its daemons as the unprivileged `condor`
+	// account, which must be able to traverse the ENTIRE working-directory path.
+	// t.TempDir() nests the work dir under a 0700 root-owned parent that condor
+	// cannot enter (condor_master then fails with "Cannot open log file"), so use a
+	// bespoke shallow dir directly under /tmp (mode 1777, world-traversable) at mode
+	// 0755, and remove it ourselves since t.Cleanup no longer owns it.
+	tmp, err := os.MkdirTemp("/tmp", "htc-privdrop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -94,11 +102,13 @@ func TestCollectorPrivilegeDrop(t *testing.T) {
 	addrFile := filepath.Join(logDir, ".collector_address")
 	dbPath := filepath.Join(spoolDir, "collector_sessions.db")
 	sbin := filepath.Dir(mustLookPath(t, "condor_master"))
+	libexec := libexecDir(t, sbin)
 
 	cfg := fmt.Sprintf(`
 CONDOR_HOST = 127.0.0.1
 COLLECTOR_HOST = %s
 RELEASE_DIR = %s
+LIBEXEC = %s
 LOCAL_DIR = %s
 LOG = %s
 SPOOL = %s
@@ -112,7 +122,12 @@ COLLECTOR = %s
 COLLECTOR_LOG = %s/CollectorLog
 COLLECTOR_DEBUG = D_FULLDEBUG
 COLLECTOR_ADDRESS_FILE = %s
-USE_SHARED_PORT = False
+# Shared port, as the collector is actually deployed under condor_master: the Go
+# collector inherits the shared-port endpoint. With USE_SHARED_PORT=False the
+# master pre-binds the command port and the Go daemon (which only inherits a
+# shared-port token, not the classic inherited command socket) collides with it
+# on bind -- see bbockelm/golang-htcondor#119.
+USE_SHARED_PORT = True
 # Encrypted-at-rest session persistence: the collector reads the root-owned pool
 # signing key (as root) to key-encrypt this DB. This is what forces the root
 # re-elevation the test asserts.
@@ -126,7 +141,7 @@ ALLOW_READ = *
 ALLOW_WRITE = *
 ALLOW_DAEMON = *
 ALLOW_ADMINISTRATOR = *
-`, collAddr, releaseDir(t), tmp, logDir, spoolDir, lockDir, lockDir, execDir, sbin,
+`, collAddr, releaseDir(t), libexec, tmp, logDir, spoolDir, lockDir, lockDir, execDir, sbin,
 		logDir, goBin, logDir, addrFile, passwdDir, dbPath)
 
 	cfgPath := filepath.Join(tmp, "condor_config")
@@ -139,6 +154,9 @@ ALLOW_ADMINISTRATOR = *
 	master := exec.Command(mustLookPath(t, "condor_master"), "-f")
 	master.Env = append(os.Environ(), "CONDOR_CONFIG="+cfgPath, "_CONDOR_LOCAL_DIR="+tmp)
 	master.Dir = tmp
+	// Own process group so cleanup can reap the whole daemon tree (the master
+	// forks condor_shared_port, condor_procd, and the collector).
+	master.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	mout, err := os.Create(filepath.Join(tmp, "master-stdio.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -148,13 +166,18 @@ ALLOW_ADMINISTRATOR = *
 		t.Fatalf("starting condor_master: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = master.Process.Signal(os.Interrupt)
+		// SIGTERM is condor_master's graceful shutdown (it tears down its children);
+		// then SIGKILL the whole process group as a backstop so no shared_port/procd/
+		// collector processes are orphaned.
+		_ = master.Process.Signal(syscall.SIGTERM)
 		done := make(chan struct{})
 		go func() { _, _ = master.Process.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			_ = master.Process.Kill()
+		}
+		if pgid, err := syscall.Getpgid(master.Process.Pid); err == nil {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		}
 		_ = mout.Close()
 	})
@@ -165,8 +188,9 @@ ALLOW_ADMINISTRATOR = *
 	// is itself part of assertion (c).
 	collectorLog := filepath.Join(logDir, "CollectorLog")
 	if !waitForFile(addrFile, 60*time.Second) {
-		dumpLog(t, collectorLog)
+		dumpLog(t, filepath.Join(tmp, "master-stdio.log"))
 		dumpLog(t, filepath.Join(logDir, "MasterLog"))
+		dumpLog(t, collectorLog)
 		t.Fatalf("collector never wrote its address file %s; see logs", addrFile)
 	}
 
@@ -189,7 +213,7 @@ ALLOW_ADMINISTRATOR = *
 	// re-elevating to root.
 	assertRootOwned0600(t, keyFile) // unchanged by the run
 	assertLogContains(t, collectorLog, "session persistence enabled",
-		"collector did not enable encrypted session persistence (signing key not read as root?)")
+		"encrypted session persistence active (pool signing key read as root while running as condor)")
 }
 
 // assertDroppedToCondor checks the collector logged a privilege drop to condor's
@@ -243,15 +267,16 @@ func assertRootOwned0600(t *testing.T, path string) {
 	}
 }
 
-// assertLogContains fails with msg unless the log at path contains want.
-func assertLogContains(t *testing.T, path, want, msg string) {
+// assertLogContains verifies the log at path contains want, describing the
+// checked behavior with desc in both the success log and the failure message.
+func assertLogContains(t *testing.T, path, want, desc string) {
 	t.Helper()
 	data := readFileEventually(t, path, want, 30*time.Second)
 	if !strings.Contains(data, want) {
 		dumpLog(t, path)
-		t.Fatalf("%s (missing %q in %s)", msg, want, filepath.Base(path))
+		t.Fatalf("%s: not confirmed (missing %q in %s)", desc, want, filepath.Base(path))
 	}
-	t.Logf("(c) %s", msg)
+	t.Logf("(c) %s", desc)
 }
 
 // readFileEventually polls path until it contains want or the timeout elapses,
@@ -289,4 +314,21 @@ func mustLookPath(t *testing.T, tool string) string {
 		t.Skipf("%s not found in PATH: %v", tool, err)
 	}
 	return p
+}
+
+// libexecDir returns the directory holding condor_shared_port (needed when
+// USE_SHARED_PORT=True), preferring PATH, then the standard package location, then
+// a sibling of sbin. It skips the test if it cannot be found.
+func libexecDir(t *testing.T, sbin string) string {
+	t.Helper()
+	if p, err := exec.LookPath("condor_shared_port"); err == nil {
+		return filepath.Dir(p)
+	}
+	for _, cand := range []string{"/usr/libexec/condor", filepath.Join(filepath.Dir(sbin), "libexec", "condor"), filepath.Join(filepath.Dir(sbin), "libexec")} {
+		if _, err := os.Stat(filepath.Join(cand, "condor_shared_port")); err == nil {
+			return cand
+		}
+	}
+	t.Skip("condor_shared_port (LIBEXEC) not found; skipping privilege-drop test")
+	return ""
 }
