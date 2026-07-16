@@ -56,6 +56,10 @@ const (
 	reasonNoMatch          = "no match found"
 	reasonSubmitterLimit   = "submitter limit exceeded"
 	reasonPreemptionPolicy = "PREEMPTION_REQUIREMENTS == False"
+	// reasonConcurrencyLimitMatch is the per-match concurrency reject reason. It
+	// is generic (no limit name) because per-candidate expressions may hit
+	// different limits; a name from one candidate would not be deterministic.
+	reasonConcurrencyLimitMatch = "concurrency limit reached for all candidate matches"
 )
 
 // reasonConcurrencyLimit builds the verbatim C++ concurrency-limit reject
@@ -225,11 +229,17 @@ func (m *Matchmaker) Match(ctx context.Context, req *negotiator.Request, view ne
 		return nil, nil, fmt.Errorf("matchmaker: nil match limits")
 	}
 
-	// Concurrency-limit gate (roadmap #3): reject the whole request up front if
-	// it would push a named limit over its max (the C++ literal-string path,
-	// matchmaker.cpp:4730-4737). Done before the scan so the sharded scan stays
-	// a pure function of its inputs. Only the literal ConcurrencyLimits string is
-	// honored (see concurrency.go).
+	// Concurrency-limit gate. Two paths, mirroring the C++ evaluate_limits_with_match
+	// selection (matchmaker.cpp:4730-4737):
+	//   - Literal / job-only ConcurrencyLimits (evaluates to a string against the
+	//     job alone): reject the whole request UP FRONT if it would push a named
+	//     limit over its max -- one cheap check, keeping the sharded scan a pure
+	//     function of its inputs.
+	//   - A match-referencing expression (does not evaluate to a string without a
+	//     TARGET, e.g. a per-CPU license "license:<TARGET.Cpus>"): defer to a
+	//     PER-CANDIDATE check that evaluates ConcurrencyLimits against each match
+	//     (evalCandidate), so the increment can depend on the matched slot.
+	matchConc := false
 	if limits.Concurrency != nil {
 		if cl, ok := req.Ad.EvaluateAttrString("ConcurrencyLimits"); ok && cl != "" {
 			if rejected, names := rejectForConcurrencyLimits(cl, limits.Concurrency); rejected {
@@ -238,31 +248,42 @@ func (m *Matchmaker) Match(ctx context.Context, req *negotiator.Request, view ne
 					Reason:            reasonConcurrencyLimit(names),
 				}, nil
 			}
+		} else if !ok {
+			if _, present := req.Ad.Lookup("ConcurrencyLimits"); present {
+				matchConc = true
+			}
 		}
 	}
 
 	cands := gather(view)
 
-	best, rej := m.parallelScan(req.Ad, cands, limits)
+	best, rej := m.parallelScan(req.Ad, cands, limits, matchConc)
 	if best != nil {
 		return best, nil, nil
 	}
 
 	// No candidate. Reproduce the C++ dominant-reason ladder
 	// (matchmaker.cpp:4336-4361), in priority order. Only the counters this
-	// matchmaker tracks are represented: network/bandwidth (never set here) and
-	// concurrency (deferred, roadmap #3) are omitted, so the reachable ladder is
-	//   PREEMPTION_REQUIREMENTS == False  (rejPreemptForPolicy)
-	//   submitter limit exceeded          (rejForSubmitterLimit)
-	//   no match found                    (fallthrough)
+	// matchmaker tracks are represented: network/bandwidth (never set here) is
+	// omitted, so the reachable ladder is
+	//   concurrency limit reached (per-match)  (rejForConcurrencyLimit)
+	//   PREEMPTION_REQUIREMENTS == False        (rejPreemptForPolicy)
+	//   submitter limit exceeded                (rejForSubmitterLimit)
+	//   no match found                          (fallthrough)
 	// Note rejPreemptForRank is tracked for diagnostics but, as in C++, is NOT a
-	// distinct reason: on its own the scan falls through to "no match found".
+	// distinct reason: on its own the scan falls through to "no match found". The
+	// per-match concurrency reason is generic (no single limit name): different
+	// candidates may hit different limits, and a name chosen from one would not be
+	// deterministic across the sharded scan.
 	ri := &negotiator.RejectInfo{
 		ForSubmitterLimit:   rej.submitterLimit,
 		ForPreemptionPolicy: rej.preemptPolicy,
 		ForPreemptionRank:   rej.preemptRank,
+		ForConcurrencyLim:   rej.concurrency,
 	}
 	switch {
+	case rej.concurrency > 0:
+		ri.Reason = reasonConcurrencyLimitMatch
 	case rej.preemptPolicy > 0:
 		ri.Reason = reasonPreemptionPolicy
 	case rej.submitterLimit > 0:

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,11 @@ type Config struct {
 	// UpdateInterval is NEGOTIATOR_UPDATE_INTERVAL (default 300s): how often
 	// the NegotiatorAd is published.
 	UpdateInterval time.Duration
+	// CycleStatsLength is NEGOTIATOR_CYCLE_STATS_LENGTH (default 3, cap 100):
+	// how many recent cycles' stats to keep and publish on the NegotiatorAd
+	// (suffixes 0..N-1, 0 = newest). Mirrors the C++ ring
+	// (matchmaker.h MAX_NEGOTIATION_CYCLE_STATS = 100).
+	CycleStatsLength int
 
 	// Authorizer, if set, enforces per-command HTCondor ALLOW_/DENY_
 	// authorization (perm is a DCpermission name, e.g. "READ"); the same
@@ -91,6 +97,24 @@ type Negotiator struct {
 
 	mu        sync.Mutex
 	lastStats *CycleStats
+	// cycleRing holds the most recent cycles' stats, newest first, capped at
+	// cfg.CycleStatsLength — the C++ negotiation_cycle_stats ring.
+	cycleRing []*CycleStats
+}
+
+const (
+	defaultCycleStatsLength = 3   // C++ NEGOTIATOR_CYCLE_STATS_LENGTH default
+	maxCycleStatsLength     = 100 // C++ MAX_NEGOTIATION_CYCLE_STATS
+)
+
+// recordCycle pushes a completed cycle onto the stats ring (newest first),
+// trimming to CycleStatsLength. Caller holds n.mu.
+func (n *Negotiator) recordCycleLocked(s *CycleStats) {
+	n.lastStats = s
+	n.cycleRing = append([]*CycleStats{s}, n.cycleRing...)
+	if len(n.cycleRing) > n.cfg.CycleStatsLength {
+		n.cycleRing = n.cycleRing[:n.cfg.CycleStatsLength]
+	}
 }
 
 // New validates cfg, fills the HTCondor defaults, and returns the Negotiator.
@@ -109,6 +133,12 @@ func New(cfg Config) (*Negotiator, error) {
 	}
 	if cfg.UpdateInterval <= 0 {
 		cfg.UpdateInterval = 300 * time.Second
+	}
+	if cfg.CycleStatsLength <= 0 {
+		cfg.CycleStatsLength = defaultCycleStatsLength
+	}
+	if cfg.CycleStatsLength > maxCycleStatsLength {
+		cfg.CycleStatsLength = maxCycleStatsLength
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -155,6 +185,10 @@ func (n *Negotiator) LastCycleStats() *CycleStats {
 func (n *Negotiator) RegisterOn(cs *cedarserver.Server) {
 	n.handle(cs, commands.GET_PRIORITY, n.handleGetState(false), "READ")
 	n.handle(cs, commands.GET_PRIORITY_ROLLUP, n.handleGetState(true), "READ")
+	// GET_RESLIST (condor_userprio -getreslist): the per-submitter resource list
+	// (matchmaker.cpp:603-605, READ). Referenced by SCHED_VERS offset because
+	// cedar/commands does not yet name it.
+	n.handle(cs, commandGetResList, n.handleGetResList(), "READ")
 
 	// The collector-style direct queries a modern condor_userprio -modular /
 	// condor_status -direct sends to the negotiator instead of GET_PRIORITY
@@ -257,6 +291,32 @@ func (n *Negotiator) handleGetState(rollup bool) cedarserver.HandlerFunc {
 			Options: message.PutClassAdNoTypes,
 		}); err != nil {
 			return fmt.Errorf("negotiator: sending priority state: %w", err)
+		}
+		return out.FinishMessage(ctx)
+	}
+}
+
+// commandGetResList is GET_RESLIST (condor_userprio -getreslist): SCHED_VERS+63
+// (463). cedar/commands does not name it yet, so it is referenced by offset —
+// the same base the named userprio commands use (commands.GET_PRIORITY = +51).
+const commandGetResList = commands.SCHED_VERS + 63
+
+// handleGetResList serves GET_RESLIST: wire "string submitter + EOM", reply the
+// per-submitter resource-list ad (Name<i>/StartTime<i>) WITHOUT the
+// MyType/TargetType trailer, which condor_userprio reads with getClassAdNoTypes
+// (user_prio.cpp:1122; matchmaker.cpp GET_RESLIST_commandHandler).
+func (n *Negotiator) handleGetResList() cedarserver.HandlerFunc {
+	return func(ctx context.Context, c *cedarserver.Conn) error {
+		submitter, err := payload(c).GetString(ctx)
+		if err != nil {
+			return fmt.Errorf("negotiator: GET_RESLIST: reading submitter: %w", err)
+		}
+		ad := n.cfg.Accountant.ResList(submitter)
+		out := message.NewMessageForStream(c.Stream)
+		if err := out.PutClassAdWithOptions(ctx, ad, &message.PutClassAdConfig{
+			Options: message.PutClassAdNoTypes,
+		}); err != nil {
+			return fmt.Errorf("negotiator: GET_RESLIST: sending reply: %w", err)
 		}
 		return out.FinishMessage(ctx)
 	}
@@ -549,7 +609,7 @@ func (n *Negotiator) cycleLoop(ctx context.Context) {
 		}
 		if stats != nil {
 			n.mu.Lock()
-			n.lastStats = stats
+			n.recordCycleLocked(stats)
 			n.mu.Unlock()
 		}
 		if stats != nil && err == nil {
@@ -622,41 +682,75 @@ func (n *Negotiator) buildNegotiatorAd() *classad.ClassAd {
 		_ = ad.Set("MyAddress", sinful)
 	}
 	n.mu.Lock()
-	stats := n.lastStats
+	ring := append([]*CycleStats(nil), n.cycleRing...)
 	n.mu.Unlock()
-	if stats != nil {
-		publishCycleStats(ad, stats)
-	}
+	publishCycleRing(ad, ring)
 	return ad
 }
 
-// publishCycleStats stamps the "0"-suffixed last-cycle attributes. The C++
-// keeps a ring of the last N cycles (suffixes 0..N-1) and adds CPU-time,
-// match-rate, and failure counters; this Go port publishes only the most
-// recent cycle (suffix 0) and the subset of counters CycleStats tracks:
-// times/durations (whole seconds, like the C++ time_t math), slot counts,
-// submitter/job counts, matches, rejections, and pie spins. The remaining C++
-// attrs (Period, SlotShareIter, NumSchedulers, Pies, CpuTime*, MatchRate*,
-// ScheddsOutOfTime, SubmittersFailed/OutOfTime/ShareLimit) are Phase 7.
-func publishCycleStats(ad *classad.ClassAd, s *CycleStats) {
+// publishCycleRing stamps the last-N-cycles attributes on the NegotiatorAd,
+// suffix 0..N-1 (0 = newest), mirroring the C++ ring
+// (publishNegotiationCycleStats, matchmaker.cpp:6455-6544). Period[i] is the
+// end-to-end gap to the next-older cycle; MatchRate/MatchRateSustained are the
+// matches over duration / period, as in C++.
+func publishCycleRing(ad *classad.ClassAd, ring []*CycleStats) {
+	for i, s := range ring {
+		var period time.Duration
+		if i+1 < len(ring) {
+			period = s.End.Sub(ring[i+1].End)
+		}
+		publishCycleStats(ad, s, i, period)
+	}
+}
+
+// publishCycleStats stamps one cycle's attributes with the given "<i>" suffix.
+// Durations are whole seconds (the C++ time_t math). CPU time is whole-process
+// (getrusage) rather than the C++ single-threaded per-phase rusage, so only the
+// aggregate CpuTime is published; per-phase CPU attrs are left to the wall-clock
+// phase durations' companions. SubmittersShareLimit is not yet classified and is
+// published as 0 (see NEGOTIATOR_CPP_DIFFERENCES.md).
+func publishCycleStats(ad *classad.ClassAd, s *CycleStats, i int, period time.Duration) {
 	secs := func(d time.Duration) int64 { return int64(d / time.Second) }
-	_ = ad.Set("LastNegotiationCycleTime0", s.Start.Unix())
-	_ = ad.Set("LastNegotiationCycleEnd0", s.End.Unix())
-	_ = ad.Set("LastNegotiationCycleDuration0", secs(s.End.Sub(s.Start)))
-	_ = ad.Set("LastNegotiationCyclePhase1Duration0", secs(s.Phase1Duration))
-	_ = ad.Set("LastNegotiationCyclePhase2Duration0", secs(s.Phase2Duration))
-	_ = ad.Set("LastNegotiationCyclePhase3Duration0", secs(s.Phase3Duration))
-	_ = ad.Set("LastNegotiationCyclePhase4Duration0", secs(s.Phase4Duration))
-	_ = ad.Set("LastNegotiationCyclePrefetchDuration0", secs(s.PrefetchDuration))
-	_ = ad.Set("LastNegotiationCycleTotalSlots0", int64(s.TotalSlots))
-	_ = ad.Set("LastNegotiationCycleTrimmedSlots0", int64(s.TrimmedSlots))
-	_ = ad.Set("LastNegotiationCycleCandidateSlots0", int64(s.CandidateSlots))
-	_ = ad.Set("LastNegotiationCycleActiveSubmitterCount0", int64(s.Submitters))
-	_ = ad.Set("LastNegotiationCycleNumIdleJobs0", int64(s.IdleJobs))
-	_ = ad.Set("LastNegotiationCycleNumJobsConsidered0", int64(s.JobsConsidered))
-	_ = ad.Set("LastNegotiationCycleMatches0", int64(s.Matches))
-	_ = ad.Set("LastNegotiationCycleRejections0", int64(s.Rejections))
-	_ = ad.Set("LastNegotiationCyclePieSpins0", int64(s.PieSpins))
+	suf := strconv.Itoa(i)
+	set := func(name string, v any) { _ = ad.Set("LastNegotiationCycle"+name+suf, v) }
+
+	dur := s.End.Sub(s.Start)
+	set("Time", s.Start.Unix())
+	set("End", s.End.Unix())
+	set("Period", secs(period))
+	set("Duration", secs(dur))
+	set("Phase1Duration", secs(s.Phase1Duration))
+	set("Phase2Duration", secs(s.Phase2Duration))
+	set("Phase3Duration", secs(s.Phase3Duration))
+	set("Phase4Duration", secs(s.Phase4Duration))
+	set("PrefetchDuration", secs(s.PrefetchDuration))
+	set("CpuTime", s.CpuTime.Seconds())
+	set("TotalSlots", int64(s.TotalSlots))
+	set("TrimmedSlots", int64(s.TrimmedSlots))
+	set("CandidateSlots", int64(s.CandidateSlots))
+	set("SlotShareIter", int64(s.SlotShareIter))
+	set("NumSchedulers", int64(s.NumSchedulers))
+	set("ActiveSubmitterCount", int64(s.ActiveSubmitters))
+	set("NumIdleJobs", int64(s.IdleJobs))
+	set("NumJobsConsidered", int64(s.JobsConsidered))
+	set("Matches", int64(s.Matches))
+	set("Rejections", int64(s.Rejections))
+	set("Pies", int64(s.Pies))
+	set("PieSpins", int64(s.PieSpins))
+	set("ScheddsOutOfTime", int64(s.ScheddsOutOfTime))
+	set("SubmittersFailed", int64(s.SubmittersFailed))
+	set("SubmittersOutOfTime", int64(s.SubmittersOutOfTime))
+	set("SubmittersShareLimit", int64(s.SubmittersShareLimit))
+	matchRate := 0.0
+	if dur > 0 {
+		matchRate = float64(s.Matches) / dur.Seconds()
+	}
+	set("MatchRate", matchRate)
+	sustained := 0.0
+	if period > 0 {
+		sustained = float64(s.Matches) / period.Seconds()
+	}
+	set("MatchRateSustained", sustained)
 }
 
 // bracketAddr renders an address as a sinful string ("<host:port>") unless it

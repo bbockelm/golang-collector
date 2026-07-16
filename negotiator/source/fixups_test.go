@@ -21,7 +21,7 @@ Name = "slot1@a"
 Cpus = 4
 _condor_PrivRemoteAdminCapability = "topsecret"
 RemoteAdminCapability = "alsosecret"`)
-	FixupSlot(ad)
+	FixupSlot(ad, ParseSlotWeight(""))
 	if _, ok := ad.Lookup("_condor_PrivRemoteAdminCapability"); ok {
 		t.Error("admin capability (_condor_ spelling) not dropped")
 	}
@@ -40,7 +40,7 @@ Cpus = 8
 Memory = 500
 Requirements = Cpus > 2
 NegotiatorRequirements = Memory > 1000`)
-	FixupSlot(ad)
+	FixupSlot(ad, ParseSlotWeight(""))
 
 	if _, ok := ad.Lookup("SavedRequirements"); !ok {
 		t.Fatal("SavedRequirements not set")
@@ -58,7 +58,7 @@ func TestFixupSlot_NoNegotiatorRequirements_LeavesRequirements(t *testing.T) {
 Name = "slot1@a"
 Cpus = 8
 Requirements = Cpus > 2`)
-	FixupSlot(ad)
+	FixupSlot(ad, ParseSlotWeight(""))
 	if _, ok := ad.Lookup("SavedRequirements"); ok {
 		t.Error("SavedRequirements should not be set without NegotiatorRequirements")
 	}
@@ -73,7 +73,7 @@ Name = "slot1@a"
 Cpus = 4
 MachineMatchCount = 5
 OfflineMatches = "x"`)
-	FixupSlot(ad)
+	FixupSlot(ad, ParseSlotWeight(""))
 	if v, ok := ad.EvaluateAttrInt("MachineMatchCount"); !ok || v != 0 {
 		t.Errorf("MachineMatchCount = %d (ok=%v), want 0", v, ok)
 	}
@@ -87,7 +87,7 @@ func TestFixupSlot_SlotWeightDefaulting(t *testing.T) {
 		ad := mustOld(t, `MyType = "Machine"
 Name = "slot1@a"
 Cpus = 8`)
-		FixupSlot(ad)
+		FixupSlot(ad, ParseSlotWeight(""))
 		if v, ok := ad.EvaluateAttrNumber("SlotWeight"); !ok || v != 8 {
 			t.Errorf("defaulted SlotWeight = %v (ok=%v), want 8 (Cpus)", v, ok)
 		}
@@ -97,7 +97,7 @@ Cpus = 8`)
 Name = "slot1@a"
 Cpus = 8
 SlotWeight = 2.5`)
-		FixupSlot(ad)
+		FixupSlot(ad, ParseSlotWeight(""))
 		if v, ok := ad.EvaluateAttrNumber("SlotWeight"); !ok || v != 2.5 {
 			t.Errorf("SlotWeight = %v (ok=%v), want 2.5 preserved", v, ok)
 		}
@@ -107,7 +107,7 @@ SlotWeight = 2.5`)
 Name = "slot1@a"
 Cpus = 3
 SlotWeight = Cpus`)
-		FixupSlot(ad)
+		FixupSlot(ad, ParseSlotWeight(""))
 		if v, ok := ad.EvaluateAttrNumber("SlotWeight"); !ok || v != 3 {
 			t.Errorf("SlotWeight = %v (ok=%v), want 3 (Cpus expr preserved)", v, ok)
 		}
@@ -226,5 +226,39 @@ ClaimId="new"`),
 	got := BuildClaimIDs(pvt)
 	if got["slot1@ep1<10.0.0.11:9618>"] != "new" {
 		t.Errorf("duplicate key kept %q, want last (new)", got["slot1@ep1<10.0.0.11:9618>"])
+	}
+}
+
+// TestFixupSlot_ConfigurableDefaultWeight verifies the SLOT_WEIGHT knob: a slot
+// with no SlotWeight of its own receives the CONFIGURED default cost expression
+// (not the hardcoded "Cpus"), while a slot that already advertises its own
+// SlotWeight is left untouched.
+func TestFixupSlot_ConfigurableDefaultWeight(t *testing.T) {
+	weight := ParseSlotWeight("Cpus + Memory / 1024")
+
+	// No SlotWeight -> gets the configured expression, evaluating over this ad.
+	noWeight := mustOld(t, `MyType = "Machine"
+Name = "slot1@a"
+Cpus = 4
+Memory = 2048`)
+	FixupSlot(noWeight, weight)
+	if got, ok := noWeight.EvaluateAttrNumber("SlotWeight"); !ok || got != 6 { // 4 + 2048/1024
+		t.Errorf("default SlotWeight = %v (ok=%v), want 6 (Cpus + Memory/1024)", got, ok)
+	}
+
+	// A slot with its own SlotWeight keeps it.
+	ownWeight := mustOld(t, `MyType = "Machine"
+Name = "slot2@a"
+Cpus = 4
+Memory = 2048
+SlotWeight = 3`)
+	FixupSlot(ownWeight, weight)
+	if got, ok := ownWeight.EvaluateAttrNumber("SlotWeight"); !ok || got != 3 {
+		t.Errorf("existing SlotWeight = %v (ok=%v), want 3 (untouched)", got, ok)
+	}
+
+	// Empty/invalid config falls back to the C++ "Cpus" default.
+	if fallback := ParseSlotWeight(""); fallback == nil {
+		t.Error("ParseSlotWeight(\"\") returned nil, want the Cpus default")
 	}
 }

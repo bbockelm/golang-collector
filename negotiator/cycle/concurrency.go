@@ -275,6 +275,57 @@ func (c *Cycle) sendMatch(ctx context.Context, sub *subState, mr *negotiator.Mat
 	return true
 }
 
+// startdInformer is the SessionFactory capability the NEGOTIATOR_INFORM_STARTD
+// path needs: send a MATCH_INFO to a startd. The concrete protocol.Factory
+// implements it; type-asserting here keeps the notify optional without widening
+// the negotiator.SessionFactory interface.
+type startdInformer interface {
+	InformStartd(ctx context.Context, startdAddr, claimID string) error
+}
+
+// informStartd best-effort notifies the matched slot's startd of the match
+// (NEGOTIATOR_INFORM_STARTD, matchmaker.cpp:5412-5426). It is a side channel to
+// the startd, not part of the schedd match list, so a failure never fails the
+// match; the error is dropped (the C++ send is likewise best-effort). Runs on
+// the submitter's ordered worker in fast mode (lifecycle-managed by stopWorker),
+// synchronously in compat mode. No-op if the factory cannot inform startds, the
+// claim is absent, or the offer carries no startd address.
+func (c *Cycle) informStartd(ctx context.Context, sub *subState, offer *classad.ClassAd, claimID string) {
+	if claimID == "" || claimID == "null" {
+		return
+	}
+	informer, ok := c.sf.(startdInformer)
+	if !ok {
+		return
+	}
+	addr := startdAddrOf(offer)
+	if addr == "" {
+		return
+	}
+	notify := func() { _ = informer.InformStartd(ctx, addr, claimID) }
+	if sub.w == nil {
+		notify()
+		return
+	}
+	sub.w.enqueue(notify)
+}
+
+// startdAddrOf returns the startd command address from a match ad, preferring
+// StartdIpAddr (what matchmakingProtocol reads, matchmaker.cpp:5470) and falling
+// back to MyAddress.
+func startdAddrOf(offer *classad.ClassAd) string {
+	if offer == nil {
+		return ""
+	}
+	if v, ok := offer.EvaluateAttrString("StartdIpAddr"); ok && v != "" {
+		return v
+	}
+	if v, ok := offer.EvaluateAttrString("MyAddress"); ok && v != "" {
+		return v
+	}
+	return ""
+}
+
 // sendReject delivers REJECTED_WITH_REASON with the same sync/async split as
 // sendMatch, preserving on-wire ordering with prior matches.
 func (c *Cycle) sendReject(ctx context.Context, sub *subState, req *negotiator.Request, reason string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/commands"
@@ -36,9 +37,22 @@ func advertiseAndQuery(t *testing.T, addr string) {
 	if err := col.Advertise(ctx, ad, &htcondor.AdvertiseOptions{Command: commands.UPDATE_STARTD_AD}); err != nil {
 		t.Fatalf("advertise: %v", err)
 	}
-	ads, err := col.QueryAds(ctx, "Machine", `Name == "slot1@embed"`)
-	if err != nil {
-		t.Fatalf("query: %v", err)
+	// UPDATE_STARTD_AD is fire-and-forget: Advertise returns once the update is
+	// sent, with no happens-before against the server storing it, so poll the query
+	// until the ad lands rather than racing a single immediate query (which is flaky
+	// under load).
+	var ads []*classad.ClassAd
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		ads, err = col.QueryAds(ctx, "Machine", `Name == "slot1@embed"`)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if len(ads) == 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if len(ads) != 1 {
 		t.Fatalf("query returned %d ads, want 1", len(ads))

@@ -38,6 +38,15 @@ const (
 // the accountant package). It is the C++ hgq_root_group->name.
 const rootGroupName = "<none>"
 
+// MatchExpr is one NEGOTIATOR_MATCH_EXPRS entry: an attribute Name (already
+// carrying the NegotiatorMatchExpr prefix) and its unevaluated expression Expr.
+// The negotiator stamps it onto every match ad; the schedd propagates it into
+// the job ad it hands the startd (matchmaker.cpp:5268-5274).
+type MatchExpr struct {
+	Name string
+	Expr string
+}
+
 // MatchContext carries the per-request group context the negotiator folds into
 // the offer ad before delivering PERMISSION_AND_AD (design doc section 5).
 type MatchContext struct {
@@ -51,6 +60,9 @@ type MatchContext struct {
 	// HasAutoregroup gates emission of RemoteAutoregroup (so a flat pool need
 	// not stamp a spurious false).
 	HasAutoregroup bool
+	// MatchExprs are the NEGOTIATOR_MATCH_EXPRS to inject as NegotiatorMatchExpr<name>
+	// attributes on the outgoing match ad (matchmaker.cpp:2044 insertNegotiatorMatchExprs).
+	MatchExprs []MatchExpr
 }
 
 // EnrichMatchAd produces the PERMISSION_AND_AD payload ad from an offer/slot ad
@@ -84,7 +96,22 @@ func EnrichMatchAd(slot *classad.ClassAd, req *negotiator.Request, mc MatchConte
 	if mc.HasAutoregroup {
 		_ = out.Set(attrRemoteAutoregroup, mc.RemoteAutoregroup)
 	}
+	insertMatchExprs(out, mc.MatchExprs)
 	return out
+}
+
+// insertMatchExprs stamps each NEGOTIATOR_MATCH_EXPRS entry onto ad as an
+// unevaluated expression (C++ AssignExpr, matchmaker.cpp:5272). An entry whose
+// expression fails to parse falls back to a string literal so a misconfigured
+// expr never drops the whole match ad.
+func insertMatchExprs(ad *classad.ClassAd, exprs []MatchExpr) {
+	for _, e := range exprs {
+		if parsed, err := classad.ParseExpr(e.Expr); err == nil {
+			ad.InsertExpr(e.Name, parsed)
+		} else {
+			ad.InsertAttrString(e.Name, e.Expr)
+		}
+	}
 }
 
 // stampResourceRequest writes the representative job id (and the slot Name, if

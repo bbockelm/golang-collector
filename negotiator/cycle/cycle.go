@@ -23,10 +23,12 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
 	"github.com/bbockelm/golang-collector/negotiator/matchmaker"
+	"github.com/bbockelm/golang-collector/negotiator/protocol"
 )
 
 // Cycle runs negotiation cycles. It implements negotiator.Cycle.
@@ -36,6 +38,19 @@ type Cycle struct {
 	sf   negotiator.SessionFactory
 	mm   negotiator.Matchmaker
 	cfg  Config
+
+	// jobConstraint is the compiled NEGOTIATOR_JOB_CONSTRAINT (nil = no
+	// constraint). The C++ negotiator forwards the constraint to the schedd in
+	// the NEGOTIATE header (ATTR_NEGOTIATOR_JOB_CONSTRAINT, matchmaker.cpp:4088)
+	// and relies on the schedd to filter; the Go negotiator ALSO enforces it
+	// locally against each returned request so an older/looser schedd cannot
+	// slip through jobs the operator meant to exclude (nextRequest).
+	jobConstraint *vm.Query
+
+	// matchExprs are the NEGOTIATOR_MATCH_EXPRS injected into every match ad as
+	// NegotiatorMatchExpr<name> (matchmaker.cpp:5268-5274). Ordered for
+	// deterministic emission.
+	matchExprs []protocol.MatchExpr
 
 	now func() time.Time // injectable clock (tests)
 }
@@ -62,13 +77,22 @@ func New(src negotiator.AdSource, acct negotiator.Accountant, sf negotiator.Sess
 	if err != nil {
 		return nil, fmt.Errorf("cycle: %w", err)
 	}
+	var jobConstraint *vm.Query
+	if cfg.JobConstraint != "" {
+		jobConstraint, err = vm.Parse(cfg.JobConstraint)
+		if err != nil {
+			return nil, fmt.Errorf("cycle: NEGOTIATOR_JOB_CONSTRAINT %q: %w", cfg.JobConstraint, err)
+		}
+	}
 	return &Cycle{
-		src:  src,
-		acct: acct,
-		sf:   sf,
-		mm:   mm,
-		cfg:  cfg,
-		now:  time.Now,
+		src:           src,
+		acct:          acct,
+		sf:            sf,
+		mm:            mm,
+		cfg:           cfg,
+		jobConstraint: jobConstraint,
+		matchExprs:    cfg.MatchExprs,
+		now:           time.Now,
 	}, nil
 }
 
@@ -100,6 +124,7 @@ type runState struct {
 // Run executes one negotiation cycle (design doc 4.1).
 func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 	start := c.now()
+	cpuStart := processCPUTime()
 	stats := newStats(start)
 
 	// Enforce the whole-cycle time budget through the context so even a
@@ -246,7 +271,21 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		}
 	}
 
+	// Distinct-entity counts over the submitters actually wrapped for
+	// negotiation (C++ active_submitters / active_schedds .size()).
+	names := make(map[string]struct{}, len(st.subs))
+	schedds := make(map[string]struct{}, len(st.subs))
+	for _, sub := range st.subs {
+		names[sub.name] = struct{}{}
+		if sub.scheddName != "" {
+			schedds[sub.scheddName] = struct{}{}
+		}
+	}
+	stats.ActiveSubmitters = len(names)
+	stats.NumSchedulers = len(schedds)
+
 	stats.End = c.now()
+	stats.CpuTime = processCPUTime() - cpuStart
 	return stats, nil
 }
 

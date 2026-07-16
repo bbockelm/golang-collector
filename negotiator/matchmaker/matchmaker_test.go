@@ -10,6 +10,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 
 	"github.com/bbockelm/golang-collector/negotiator"
+	"github.com/bbockelm/golang-collector/negotiator/negtest"
 )
 
 // ---- helpers ---------------------------------------------------------------
@@ -268,7 +269,10 @@ func TestSlotWeight(t *testing.T) {
 		{"[ Cpus = 4 ]", 4},                     // fallback to Cpus
 		{"[ SlotWeight = -1; Cpus = 6 ]", 6},    // negative weight -> Cpus
 		{"[ Foo = 1 ]", 1.0},                    // neither -> 1.0
-		{"[ SlotWeight = 2 * 3; Cpus = 1 ]", 6}, // expression
+		{"[ SlotWeight = 2 * 3; Cpus = 1 ]", 6},                       // constant expression
+		{"[ SlotWeight = Cpus * 2; Cpus = 8 ]", 16},                   // references a machine attr
+		{"[ SlotWeight = Cpus + Memory / 1024; Cpus = 4; Memory = 2048 ]", 6}, // multi-attr cost expression
+		{"[ SlotWeight = ifThenElse(Gpus > 0, Gpus * 10, Cpus); Gpus = 2; Cpus = 4 ]", 20}, // conditional cost
 	}
 	for _, tc := range cases {
 		if got := m.slotWeight(mustAd(t, tc.ad)); got != tc.want {
@@ -423,6 +427,134 @@ func BenchmarkMatch(b *testing.B) {
 		c, _, err := m.Match(ctx, job, view, lim)
 		if err != nil || c == nil {
 			b.Fatalf("match failed: c=%v err=%v", c, err)
+		}
+	}
+}
+
+// ---- synthetic-pool sanity + scale benchmarks (roadmap #5) -----------------
+
+// TestGeneratedPoolSanity guards the negtest.Generate synthetic-pool generator
+// the scale benchmarks lean on: it must be deterministic and produce a
+// realistic mix -- every request finds a match, but only a fraction of
+// candidates pass bilateral Requirements (so the scan does a genuine mix of
+// short-circuit-at-Symmetry and full rank-tuple evaluation, not one or the
+// other). If this drifts, the benchmarks stop measuring the intended hot path.
+func TestGeneratedPoolSanity(t *testing.T) {
+	params := negtest.GenParams{
+		Slots: 2000, PartitionableFrac: 0.2,
+		Submitters: 10, Schedds: 3, RRLDepth: 30, AutoClusters: 8, Seed: 1,
+	}
+	pool := negtest.Generate(params)
+
+	// Determinism: a second Generate with the same params yields identical ads.
+	pool2 := negtest.Generate(params)
+	if got, want := len(pool2.Snapshot.Slots), len(pool.Snapshot.Slots); got != want {
+		t.Fatalf("nondeterministic slot count: %d != %d", got, want)
+	}
+	s1, _ := pool.Snapshot.Slots[0].EvaluateAttrString("Name")
+	s2, _ := pool2.Snapshot.Slots[0].EvaluateAttrString("Name")
+	if s1 != s2 {
+		t.Fatalf("nondeterministic slot naming: %q != %q", s1, s2)
+	}
+
+	// Per-candidate selectivity: count how many slots satisfy the first request's
+	// bilateral Requirements. Expect a middle band, not 0% or 100%.
+	req := pool.AllRequests()[0]
+	mc := classad.NewMatchClassAd(cloneAd(req.Ad), nil)
+	pass := 0
+	for _, s := range pool.Snapshot.Slots {
+		mc.ReplaceRightAd(s)
+		if mc.Symmetry("Requirements", "Requirements") {
+			pass++
+		}
+	}
+	frac := float64(pass) / float64(len(pool.Snapshot.Slots))
+	if frac <= 0.05 || frac >= 0.95 {
+		t.Fatalf("candidate pass fraction %.2f outside realistic band (0.05,0.95)", frac)
+	}
+
+	// Request-level: the representative request should still find a best match.
+	m := mustNew(t, Config{PreJobRank: "Cpus", PostJobRank: "Memory"})
+	c, _, err := m.Match(context.Background(), req, NewSlotView(pool.Snapshot), openLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == nil {
+		t.Fatal("representative request found no match")
+	}
+}
+
+// BenchmarkMatchScale measures the matchmaker's per-request hot path
+// (Matchmaker.Match) on synthetic pools at 10k and 100k candidate slots, in both
+// serial (compat) and sharded modes. The rank config exercises PreJobRank
+// (machine Cpus) and PostJobRank (machine Memory), and the generated job ads
+// carry a Rank (TARGET.Cpus), so all three rank evals plus bilateral Symmetry
+// run per candidate -- the alloc-dominated path roadmap #5 targets. The serial
+// vs sharded split quantifies the concurrency thesis (NEGOTIATOR_CPP_DIFFERENCES
+// §1) on a single request's scan. ReportAllocs surfaces allocs/op.
+func BenchmarkMatchScale(b *testing.B) {
+	ctx := context.Background()
+	for _, nSlots := range []int{10000, 100000} {
+		pool := negtest.Generate(negtest.GenParams{
+			Slots: nSlots, PartitionableFrac: 0.2,
+			Submitters: 50, Schedds: 10, RRLDepth: 40, AutoClusters: 8, Seed: 1,
+		})
+		view := NewSlotView(pool.Snapshot)
+		reqs := pool.AllRequests()
+		lim := openLimits()
+
+		for _, mode := range []struct {
+			name string
+			cfg  Config
+		}{
+			{"serial", Config{PreJobRank: "Cpus", PostJobRank: "Memory", Serial: true}},
+			{"sharded", Config{PreJobRank: "Cpus", PostJobRank: "Memory"}},
+		} {
+			m := mustNew(b, mode.cfg)
+			b.Run(fmt.Sprintf("slots=%d/%s", nSlots, mode.name), func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					// Rotate through the whole request set so the scan sees the
+					// full autocluster mix, not one hot request.
+					if _, _, err := m.Match(ctx, reqs[i%len(reqs)], view, lim); err != nil {
+						b.Fatalf("match error: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkPieSpin measures matchmaking throughput for a full pie spin: one
+// submitter's entire resource-request list matched against a 10k-slot pool with
+// consumption between requests (static winners drop out; p-slots persist). It is
+// the closest microbenchmark to a cycle's matchmaking phase without the NEGOTIATE
+// protocol. The per-iteration SlotView rebuild is excluded from the timer.
+func BenchmarkPieSpin(b *testing.B) {
+	ctx := context.Background()
+	pool := negtest.Generate(negtest.GenParams{
+		Slots: 10000, PartitionableFrac: 0.2,
+		Submitters: 20, Schedds: 5, RRLDepth: 50, AutoClusters: 8, Seed: 7,
+	})
+	reqs := pool.Requests[pool.SubmitterNames[0]]
+	m := mustNew(b, Config{PreJobRank: "Cpus", PostJobRank: "Memory"})
+	lim := openLimits()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		view := NewSlotView(pool.Snapshot) // fresh view: Consume mutates it
+		b.StartTimer()
+		for _, req := range reqs {
+			c, _, err := m.Match(ctx, req, view, lim)
+			if err != nil {
+				b.Fatalf("match error: %v", err)
+			}
+			if c != nil {
+				view.Consume(c.ScanIndex)
+			}
 		}
 	}
 }

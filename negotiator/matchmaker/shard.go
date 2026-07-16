@@ -9,19 +9,21 @@ import (
 )
 
 // rejCounters tallies the per-scan rejection reasons the reject-info selection
-// needs, mirroring the C++ rej* counters (matchmaker.cpp). Concurrency/network
-// counters are deferred (roadmap #3), so only submitter-limit and the two
-// preemption counters are live.
+// needs, mirroring the C++ rej* counters (matchmaker.cpp). concurrency counts the
+// per-match ConcurrencyLimits rejections (the up-front literal path rejects the
+// whole request before the scan and never reaches here).
 type rejCounters struct {
 	submitterLimit int // rejForSubmitterLimit
 	preemptPolicy  int // rejPreemptForPolicy (PREEMPTION_REQUIREMENTS == False)
 	preemptRank    int // rejPreemptForRank   (rankCondPrioPreempt false)
+	concurrency    int // rejForConcurrencyLimit, per-match path (evaluate_limits_with_match)
 }
 
 func (r *rejCounters) add(o rejCounters) {
 	r.submitterLimit += o.submitterLimit
 	r.preemptPolicy += o.preemptPolicy
 	r.preemptRank += o.preemptRank
+	r.concurrency += o.concurrency
 }
 
 // parallelScan evaluates every candidate against reqAd, sharding the candidate
@@ -37,7 +39,7 @@ func (r *rejCounters) add(o rejCounters) {
 // shared request ad would be a data race under -race. Candidate (right) ads are
 // disjoint across workers (each owns a contiguous index range), so mutating
 // their TARGET pointers is safe.
-func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits) (*negotiator.Candidate, rejCounters) {
+func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits, matchConc bool) (*negotiator.Candidate, rejCounters) {
 	n := len(cands)
 	if n == 0 {
 		return nil, rejCounters{}
@@ -48,7 +50,7 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 		nw = n
 	}
 	if nw <= 1 {
-		best, rej := m.scanRange(reqAd, cands, limits)
+		best, rej := m.scanRange(reqAd, cands, limits, matchConc)
 		return best, rej
 	}
 
@@ -73,7 +75,7 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 		wg.Add(1)
 		go func(w, lo, hi int) {
 			defer wg.Done()
-			results[w].best, results[w].rej = m.scanRange(reqAd, cands[lo:hi], limits)
+			results[w].best, results[w].rej = m.scanRange(reqAd, cands[lo:hi], limits, matchConc)
 		}(w, lo, hi)
 	}
 	wg.Wait()
@@ -94,7 +96,16 @@ func (m *Matchmaker) parallelScan(reqAd *classad.ClassAd, cands []candRef, limit
 
 // scanRange evaluates a contiguous slice of candidates with a single reused
 // MatchClassAd, returning the local best and reject counters.
-func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits) (*negotiator.Candidate, rejCounters) {
+//
+// Allocation note: the per-candidate rank tuple is evaluated into a single
+// reused scratch Candidate (cand), and only the running winner is retained in
+// best; neither is heap-allocated per candidate. best escapes once (the returned
+// pointer), so the whole range costs O(1) Candidate allocations instead of one
+// per matching candidate. cand and best are worker-local -- scanRange runs on a
+// disjoint index sub-range per goroutine -- so this reuse is race-free and does
+// not touch the deterministic reduce (Candidate.Better still tie-breaks on
+// ScanIndex, so the sharded winner is byte-identical to the serial one).
+func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *negotiator.MatchLimits, matchConc bool) (*negotiator.Candidate, rejCounters) {
 	if len(cands) == 0 {
 		return nil, rejCounters{}
 	}
@@ -105,19 +116,24 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 	job := cloneAd(reqAd)
 	mc := classad.NewMatchClassAd(job, nil)
 
-	var best *negotiator.Candidate
+	var best negotiator.Candidate
+	var cand negotiator.Candidate
+	haveBest := false
 	var rej rejCounters
 
 	for _, c := range cands {
-		cand := m.evalCandidate(mc, c, limits, &rej)
-		if cand == nil {
+		if !m.evalCandidate(mc, c, limits, matchConc, &rej, &cand) {
 			continue
 		}
-		if best == nil || cand.Better(best) {
+		if !haveBest || cand.Better(&best) {
 			best = cand
+			haveBest = true
 		}
 	}
-	return best, rej
+	if !haveBest {
+		return nil, rej
+	}
+	return &best, rej
 }
 
 // evalCandidate runs the full per-candidate pipeline for one offer, porting the
@@ -130,17 +146,38 @@ func (m *Matchmaker) scanRange(reqAd *classad.ClassAd, cands []candRef, limits *
 //  3. the tier-specific submitter-limit gate (SubmitterLimitPermits);
 //  4. the rank tuple (calculateRanks), including PREEMPTION_RANK when preempting.
 //
-// Returns nil (and bumps the appropriate reject counter) when the candidate is
-// filtered out. Requirements failures bump NO counter, matching the C++ `continue`
-// (matchmaker.cpp:4951-4954).
-func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, rej *rejCounters) *negotiator.Candidate {
+// On a match it fills *out with the candidate's rank tuple and returns true; on
+// a filtered-out candidate it returns false (bumping the appropriate reject
+// counter) and leaves *out untouched. Writing into a caller-owned scratch
+// Candidate -- rather than returning a fresh *Candidate -- keeps the per-
+// candidate path allocation-free (the caller reuses one scratch across the whole
+// scan range). Requirements failures bump NO counter, matching the C++
+// `continue` (matchmaker.cpp:4951-4954).
+func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *negotiator.MatchLimits, matchConc bool, rej *rejCounters, out *negotiator.Candidate) bool {
 	mc.ReplaceRightAd(c.slot)
 
 	// (1) bilateral Requirements. (The C++ pslotMultiMatch retry for
 	// WantPslotPreemption jobs is deferred, roadmap #6; a Requirements failure
 	// is simply "not a match".)
 	if !mc.Symmetry("Requirements", "Requirements") {
-		return nil
+		return false
+	}
+
+	// (1b) per-match concurrency limits (evaluate_limits_with_match,
+	// matchmaker.cpp:5074-5077): evaluate the job's ConcurrencyLimits against THIS
+	// match (MY=job, TARGET=slot) so a per-CPU-style increment can depend on the
+	// slot, then reject the candidate if any named limit would exceed its max
+	// against the (immutable-during-scan) usage view. matchConc is set only when
+	// ConcurrencyLimits is a match-referencing expression; the literal/job-only
+	// case was gated up front in Match. Read-only, so the sharded scan stays a
+	// pure function of its inputs.
+	if matchConc {
+		if s, err := mc.EvaluateAttrLeft("ConcurrencyLimits").StringValue(); err == nil && s != "" {
+			if rejected, _ := rejectForConcurrencyLimits(s, limits.Concurrency); rejected {
+				rej.concurrency++
+				return false
+			}
+		}
 	}
 
 	// (2) preemption classification + (3) submitter-limit gate.
@@ -148,14 +185,14 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 	if m.considerPreemption {
 		var ok bool
 		if tier, ok = m.classifyPreemption(mc, c.slot, limits, rej); !ok {
-			return nil
+			return false
 		}
 	}
 
 	cost := m.slotWeight(c.slot)
 	if !m.submitterLimitGate(tier, limits, cost) {
 		rej.submitterLimit++
-		return nil
+		return false
 	}
 
 	// (4) rank tuple (calculateRanks). PreemptRank is the NO_PREEMPTION sentinel
@@ -164,7 +201,7 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 	if tier != noPreemption {
 		preemptRank = rankRight(mc, m.preemptionRank)
 	}
-	return &negotiator.Candidate{
+	*out = negotiator.Candidate{
 		Slot:        c.slot,
 		PreJobRank:  rankRight(mc, m.preJobRank),
 		Rank:        jobRank(mc),
@@ -173,6 +210,7 @@ func (m *Matchmaker) evalCandidate(mc *classad.MatchClassAd, c candRef, limits *
 		PreemptRank: preemptRank,
 		ScanIndex:   c.idx,
 	}
+	return true
 }
 
 // classifyPreemption ports the remoteUser lookup + preemption-tier decision

@@ -147,6 +147,45 @@ func TestConcurrencyGateNoLimitsAttrIgnored(t *testing.T) {
 	}
 }
 
+// TestConcurrencyGateExpression verifies that ConcurrencyLimits may be an
+// EXPRESSION over the job's own attributes (not just a literal string): the
+// negotiator evaluates it to a string once per request (EvaluateAttrString) and
+// gates on the resulting limit name. This is the per-request expression path
+// (evaluate_limits_with_match == false); the TARGET-referencing per-candidate
+// path is covered by TestPerMatchConcurrencyPerCPU.
+func TestConcurrencyGateExpression(t *testing.T) {
+	m := mustNew(t, Config{})
+	view := viewOf(mustAd(t, "[ Requirements = true ]"))
+	// ConcurrencyLimits is strcat("cms_", AcctGroup) -> "cms_prod".
+	req := func() *negotiator.Request {
+		return reqOf(mustAd(t, `[ Requirements = true; AcctGroup = "prod"; ConcurrencyLimits = strcat("cms_", AcctGroup) ]`))
+	}
+
+	// usage 3 + 1 <= 4 -> admit against the evaluated limit "cms_prod".
+	admit := stubLimits{usage: map[string]float64{"cms_prod": 3}, max: map[string]float64{"cms_prod": 4}}
+	if cand, rej, err := m.Match(context.Background(), req(), view, limitsWith(admit)); err != nil {
+		t.Fatalf("Match: %v", err)
+	} else if cand == nil {
+		t.Fatalf("expected match (cms_prod 3+1<=4), got reject %+v", rej)
+	}
+
+	// usage 4 + 1 > 4 -> reject; proves the expression resolved to the gated name.
+	full := stubLimits{usage: map[string]float64{"cms_prod": 4}, max: map[string]float64{"cms_prod": 4}}
+	cand, rej, err := m.Match(context.Background(), req(), view, limitsWith(full))
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if cand != nil {
+		t.Fatalf("expected rejection (cms_prod at max), got match %v", cand.Slot)
+	}
+	if rej == nil || rej.ForConcurrencyLim != 1 {
+		t.Fatalf("expected ForConcurrencyLim=1, got %+v", rej)
+	}
+	if want := "concurrency limit cms_prod reached"; rej.Reason != want {
+		t.Fatalf("reason: got %q want %q", rej.Reason, want)
+	}
+}
+
 func TestParseLimitToken(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -172,5 +211,61 @@ func TestParseLimitToken(t *testing.T) {
 			t.Errorf("parseLimitToken(%q) = (%q,%v,%v), want (%q,%v,%v)",
 				c.in, name, inc, ok, c.name, c.inc, c.ok)
 		}
+	}
+}
+
+// TestPerMatchConcurrencyPerCPU is the per-CPU-license case: ConcurrencyLimits is
+// a MATCH-referencing expression, strcat("license:", TARGET.Cpus), so the limit
+// increment is the matched slot's Cpus (name "license", weight = Cpus), not a
+// fixed 1. The negotiator must evaluate it against each candidate and reject the
+// candidates whose Cpus would push "license" over its max -- picking a smaller
+// slot that fits.
+func TestPerMatchConcurrencyPerCPU(t *testing.T) {
+	m := mustNew(t, Config{})
+	// license usage 3, max 8. A 16-CPU slot would need 3+16=19 (reject); a 4-CPU
+	// slot needs 3+4=7 (fits). The 16-CPU slot is index 0 (would win ties), so a
+	// win by the 4-CPU slot proves the 16-CPU one was rejected per-match.
+	view := viewOf(
+		mustAd(t, `[ Requirements = true; Cpus = 16 ]`),
+		mustAd(t, `[ Requirements = true; Cpus = 4 ]`),
+	)
+	lim := stubLimits{usage: map[string]float64{"license": 3}, max: map[string]float64{"license": 8}}
+	req := reqOf(mustAd(t, `[ Requirements = true; ConcurrencyLimits = strcat("license:", TARGET.Cpus) ]`))
+
+	cand, rej, err := m.Match(context.Background(), req, view, limitsWith(lim))
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if cand == nil {
+		t.Fatalf("expected a match (the 4-CPU slot fits), got reject %+v", rej)
+	}
+	if cpus, _ := cand.Slot.EvaluateAttrInt("Cpus"); cpus != 4 {
+		t.Errorf("matched slot Cpus = %d, want 4 (the 16-CPU slot must be rejected per-match)", cpus)
+	}
+}
+
+// TestPerMatchConcurrencyAllRejected: when EVERY candidate's per-match increment
+// exceeds the limit, the request is rejected with the generic per-match reason.
+func TestPerMatchConcurrencyAllRejected(t *testing.T) {
+	m := mustNew(t, Config{})
+	view := viewOf(
+		mustAd(t, `[ Requirements = true; Cpus = 16 ]`),
+		mustAd(t, `[ Requirements = true; Cpus = 10 ]`),
+	)
+	lim := stubLimits{usage: map[string]float64{"license": 3}, max: map[string]float64{"license": 8}}
+	req := reqOf(mustAd(t, `[ Requirements = true; ConcurrencyLimits = strcat("license:", TARGET.Cpus) ]`))
+
+	cand, rej, err := m.Match(context.Background(), req, view, limitsWith(lim))
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if cand != nil {
+		t.Fatalf("expected rejection (both slots over the license limit), got match %v", cand.Slot)
+	}
+	if rej == nil || rej.ForConcurrencyLim == 0 {
+		t.Fatalf("expected ForConcurrencyLim > 0, got %+v", rej)
+	}
+	if rej.Reason != "concurrency limit reached for all candidate matches" {
+		t.Errorf("reason = %q, want the generic per-match reason", rej.Reason)
 	}
 }

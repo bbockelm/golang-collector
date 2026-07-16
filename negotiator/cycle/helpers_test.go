@@ -181,7 +181,7 @@ type fixedSource struct {
 func newFixedSource(t *testing.T, slots []*classad.ClassAd, submitters []*classad.ClassAd, pvts []*classad.ClassAd) *fixedSource {
 	t.Helper()
 	for _, s := range slots {
-		source.FixupSlot(s)
+		source.FixupSlot(s, source.ParseSlotWeight(""))
 	}
 	kept := make([]*classad.ClassAd, 0, len(submitters))
 	for _, s := range submitters {

@@ -36,6 +36,10 @@ import (
 	"github.com/bbockelm/golang-collector/negotiator/source"
 )
 
+// version is stamped at build time via `-ldflags "-X main.version=..."` (see the
+// Makefile); it is "dev" for a plain `go build`.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "golang-negotiator:", err)
@@ -45,6 +49,7 @@ func main() {
 
 func run() error {
 	listen := flag.String("listen", ":0", "fallback TCP listen address when not inheriting a shared-port endpoint (the negotiator has no well-known port; peers find it via the collector)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	// condor_master appends these standard DaemonCore flags when it launches a
 	// daemon not in its built-in list; accept them so flag.Parse does not reject
 	// our launch. -local-name additionally scopes config lookups.
@@ -52,6 +57,11 @@ func run() error {
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
 	importLog := flag.String("import", "", "path to a C++ negotiator Accountantnew.log to import ONCE into the native accountant store (overrides ACCOUNTANT_IMPORT_LOG); imported only when the native store has no existing Customer records")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("htc-negotiator", version)
+		return nil
+	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "NEGOTIATOR", LocalName: *localName})
 	if err != nil {
@@ -120,6 +130,7 @@ func run() error {
 	src, err := source.NewRemote(source.Config{
 		SlotConstraint:      configString(cfg, "NEGOTIATOR_SLOT_CONSTRAINT"),
 		SubmitterConstraint: configString(cfg, "NEGOTIATOR_SUBMITTER_CONSTRAINT"),
+		SlotWeightExpr:      configString(cfg, "SLOT_WEIGHT"),
 		CollectorAddr:       collectorHost,
 		Security:            querySec,
 		Logger:              d.Slog(),
@@ -172,17 +183,18 @@ func run() error {
 	}
 
 	neg, err := negotiator.New(negotiator.Config{
-		Source:         src,
-		Accountant:     acct,
-		Cycle:          cyc,
-		NegotiatorName: cycleCfg.NegotiatorName,
-		AdvertisedAddr: negotiatorAddr(d, ln),
-		Interval:       configSeconds(cfg, "NEGOTIATOR_INTERVAL", 60*time.Second),
-		CycleDelay:     configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
-		MinInterval:    configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
-		UpdateInterval: configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
-		Authorizer:     policy.Authorize,
-		Logger:         d.Slog(),
+		Source:           src,
+		Accountant:       acct,
+		Cycle:            cyc,
+		NegotiatorName:   cycleCfg.NegotiatorName,
+		AdvertisedAddr:   negotiatorAddr(d, ln),
+		Interval:         configSeconds(cfg, "NEGOTIATOR_INTERVAL", 60*time.Second),
+		CycleDelay:       configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
+		MinInterval:      configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
+		UpdateInterval:   configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
+		CycleStatsLength: configInt(cfg, "NEGOTIATOR_CYCLE_STATS_LENGTH", 3),
+		Authorizer:       policy.Authorize,
+		Logger:           d.Slog(),
 	})
 	if err != nil {
 		return err
@@ -295,6 +307,16 @@ func configSeconds(cfg *config.Config, key string, def time.Duration) time.Durat
 	if v, ok := cfg.Get(key); ok {
 		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
+		}
+	}
+	return def
+}
+
+// configInt reads a positive integer knob, falling back to def.
+func configInt(cfg *config.Config, key string, def int) int {
+	if v, ok := cfg.Get(key); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
 		}
 	}
 	return def

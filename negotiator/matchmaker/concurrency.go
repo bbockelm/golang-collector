@@ -16,10 +16,14 @@ import (
 // (not per candidate) keeps the sharded scan a pure function of its inputs, so
 // compat==fast determinism is untouched.
 //
-// The rarer path -- ConcurrencyLimits as an expression evaluated per candidate
-// (evaluate_limits_with_match==true) -- is not ported: the negotiator's own
-// enrichment always stamps a literal string, and every candidate would evaluate
-// the same literal identically anyway.
+// The match-referencing path -- ConcurrencyLimits an EXPRESSION that only
+// evaluates to a string with a TARGET (evaluate_limits_with_match==true,
+// matchmaker.cpp:5074-5077) -- IS ported: Match flags it (matchConc) and
+// evalCandidate evaluates ConcurrencyLimits against each match (MY=job,
+// TARGET=slot) via the same rejectForConcurrencyLimits check, so a per-CPU
+// license like strcat("license:", TARGET.Cpus) consumes the matched slot's Cpus.
+// The check reads the usage view only (consumption happens on commit), so the
+// sharded scan stays deterministic.
 //
 // The token parser is a compact re-implementation of the accountant's
 // ParseConcurrencyLimit (kept local so this package need not import accountant).

@@ -7,6 +7,8 @@
 package source
 
 import (
+	"strings"
+
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
@@ -53,7 +55,10 @@ const defaultSlotWeightExpr = "Cpus"
 // The ad must be a freshly-owned copy (embedded mode gets fresh decodes from
 // the store; remote mode gets fresh ads off the wire) -- these mutations must
 // never touch a live store entry.
-func FixupSlot(ad *classad.ClassAd) {
+//
+// defaultWeight is the pre-parsed SLOT_WEIGHT cost expression (from
+// ParseSlotWeight) inserted as the slot's SlotWeight when it has no usable one.
+func FixupSlot(ad *classad.ClassAd, defaultWeight *classad.Expr) {
 	// Drop the admin capability (matchmaker.cpp:3255). Delete the exact ATTR_
 	// name and the short spelling defensively.
 	ad.Delete(attrRemoteAdmin)
@@ -81,12 +86,26 @@ func FixupSlot(ad *classad.ClassAd) {
 	// LookupFloat (literal-only); we treat a SlotWeight that fails to evaluate
 	// to a number as "missing", which additionally keeps a valid expression
 	// weight (e.g. SlotWeight = Cpus) intact rather than overwriting it. When
-	// truly absent, insert the "Cpus" default expression.
-	if _, ok := ad.EvaluateAttrNumber(attrSlotWeight); !ok {
-		if e, err := classad.ParseExpr(defaultSlotWeightExpr); err == nil {
-			ad.InsertExpr(attrSlotWeight, e)
+	// truly absent, insert the configured SLOT_WEIGHT default expression.
+	if _, ok := ad.EvaluateAttrNumber(attrSlotWeight); !ok && defaultWeight != nil {
+		ad.InsertExpr(attrSlotWeight, defaultWeight)
+	}
+}
+
+// ParseSlotWeight compiles the negotiator's default cost expression (the
+// SLOT_WEIGHT knob): the expression a slot's weight defaults to when the ad has
+// none. An empty or unparseable value falls back to the C++ default, "Cpus".
+// The returned *Expr is shared read-only across every slot the source fixes up
+// (ClassAd expressions are immutable), like the C++ negotiator's single parsed
+// slotWeightStr.
+func ParseSlotWeight(expr string) *classad.Expr {
+	if s := strings.TrimSpace(expr); s != "" {
+		if e, err := classad.ParseExpr(s); err == nil {
+			return e
 		}
 	}
+	e, _ := classad.ParseExpr(defaultSlotWeightExpr)
+	return e
 }
 
 // KeepSubmitter reports whether a submitter ad survives the design-doc-4.1

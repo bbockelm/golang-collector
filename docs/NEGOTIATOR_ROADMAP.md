@@ -99,8 +99,13 @@ Delivered: matchmaker gate on `ConcurrencyLimits` (comma list, `name:weight`)
 vs `<NAME>_LIMIT` / `CONCURRENCY_LIMIT_DEFAULT[_<PREFIX>]` maxes; cross-cycle
 counts store-backed under a `ConcurrencyLimit.` namespace (rebuilt in
 CheckMatches), in-cycle live consumption via a per-cycle tracker; pure gate so
-compat==fast holds. Not ported: the per-candidate expression form
-(`evaluate_limits_with_match`).
+compat==fast holds. The per-candidate expression form
+(`evaluate_limits_with_match`) is now ALSO ported: when `ConcurrencyLimits` is a
+match-referencing expression (only evaluates to a string with a TARGET),
+`Match` flags it and `evalCandidate` evaluates it per candidate against the
+match, so a per-CPU license `strcat("license:", TARGET.Cpus)` consumes the
+matched slot's Cpus. The check is read-only over the usage view, so the sharded
+scan stays deterministic.
 
 _Original brief:_
 
@@ -144,7 +149,20 @@ transaction records into the existing record model. Add a one-shot import path
 
 **Scope:** medium; isolated to the store.
 
-## 5. Performance benchmarks + matchmaker allocation reduction  (P1)
+## 5. Performance benchmarks + matchmaker allocation reduction  ✅ DONE
+
+Delivered: a deterministic synthetic-pool generator (`negtest.Generate`) and
+scale benchmarks (`BenchmarkMatchScale` 10k/100k × serial/sharded,
+`BenchmarkPieSpin`). The sharded scan measures 1.5× (10k) to **5.5× (100k)**
+faster than serial, confirming the concurrency thesis (§1). The matchmaker hot
+path (`shard.go`) now writes the rank tuple into a caller-owned scratch
+`Candidate` and keeps the winner in one `best` value — O(1) `Candidate` allocs
+per scan range instead of one per matching candidate (~19% fewer bytes/op, ~10%
+fewer allocs/op), worker-local so the sharded winner stays byte-identical to
+serial. Remaining ~9 allocs/candidate live inside the `PelicanPlatform/classad`
+evaluator (a library-boundary follow-up, as is `NEGOTIATOR_MATCHLIST_CACHING`).
+
+_Original brief:_
 
 **What:** quantify the concurrency thesis — Go vs C++ negotiation-cycle wall-clock
 on large synthetic pools (10k-100k slots, many schedds, deep RRLs) — and cut the
@@ -178,7 +196,18 @@ is unchanged.
 
 **Scope:** medium; opt-in, low risk to the default path.
 
-## 7. Full NegotiatorAd stats + userprio-locate polish  (P2)
+## 7. Full NegotiatorAd stats + userprio-locate polish  ✅ DONE
+
+Delivered: the NegotiatorAd now carries a **ring of the last N cycles**
+(`NEGOTIATOR_CYCLE_STATS_LENGTH`, default 3, cap 100), newest-first suffix
+`0..N-1`, with the full C++ attribute set — Period, MatchRate/MatchRateSustained,
+Pies, SlotShareIter, NumSchedulers, ActiveSubmitterCount, ScheddsOutOfTime,
+SubmittersFailed/OutOfTime, and aggregate CpuTime (getrusage). The
+userprio-locate issue was fixed separately (CondorVersion on the ad; see
+NEGOTIATOR_CPP_DIFFERENCES.md). Remaining deviations: CpuTime is whole-process
+not per-phase; SubmittersShareLimit stays 0 (not classified).
+
+_Original brief:_
 
 **What:** the C++ NegotiatorAd keeps a ring of the last N cycles (suffixes
 `0..N-1`) and publishes CpuTime/MatchRate/Pies/ScheddsOutOfTime/
@@ -196,34 +225,61 @@ is advertised promptly/queryably so `condor_userprio`'s locate succeeds.
 
 **Scope:** small-medium.
 
-## 8. Userprio completeness: GET_RESLIST, leases, PRIORITY_FACTOR_AUTHORIZATION  (P2)
+## 8. Userprio completeness: GET_RESLIST, leases, PRIORITY_FACTOR_AUTHORIZATION  (partial)
 
-**What:** the userprio surface still missing:
-- `GET_RESLIST` (463) — `condor_userprio -getreslist`. **Its command int isn't in
-  `cedar/commands` yet** — add the constant there first (a cedar PR), then the
-  handler (returns per-submitter `Name<i>`/`StartTime<i>`).
-- The ceiling/floor/priority-factor **lease** commands (a local HTCondor
-  extension; `MANAGE_*`).
-- `PRIORITY_FACTOR_AUTHORIZATION` user-map for `SET_PRIORITYFACTOR` at WRITE (Go
-  currently requires ADMINISTRATOR; the user-map path is stubbed with the
-  versioned `{ErrorCode}` reply).
+- **`GET_RESLIST` (463) — ✅ DONE.** `condor_userprio -getreslist`: the handler
+  (`handleGetResList`) reads the submitter and replies with the per-submitter
+  resource list (`Name<i>`/`StartTime<i>`) via a new `Accountant.ResList`
+  (mirrors `Accountant::ReportState(customer)`, Accountant.cpp:1344). Registered
+  at READ by `SCHED_VERS+63` — cedar/commands does not name it yet, so it is
+  referenced by offset rather than blocking on a cedar tag. Covered by
+  `TestResList` + `TestGetResListWire`.
+- **Ceiling/floor/priority-factor lease commands (`MANAGE_*`) — DEFERRED.** They
+  need new cedar command ints (`MANAGE_CEILING`/`MANAGE_FLOOR`/
+  `MANAGE_PRIORITY_FACTOR`) *and* lease storage on the accountant record; a niche
+  local HTCondor extension. Do the cedar command-int PR first, then the
+  accountant `SetCeilingLease` / expiry.
+- **`PRIORITY_FACTOR_AUTHORIZATION` user-map — DEFERRED (needs infra).** The C++
+  path (matchmaker.cpp:1107-1140) maps the authenticated identity through the
+  `CLASSAD_USER_MAP` mechanism (`NEGOTIATOR_CLASSAD_USER_MAP_NAMES`, regex map
+  files) and authorizes at WRITE when the mapped output prefixes the submitter.
+  The Go stack has **no user-map facility yet** — that is a general HTCondor
+  feature that belongs in `golang-htcondor/authz`, not the negotiator. Until it
+  exists, `SET_PRIORITYFACTOR` stays ADMINISTRATOR-only (the versioned
+  `{ErrorCode}` reply already in place).
 
-**Where:** `negotiator/negotiator.go` handlers; `cedar/commands` for GET_RESLIST.
+**Where:** `negotiator/negotiator.go` handlers; `negotiator/accountant` (ResList,
+future leases); a future `golang-htcondor/authz` user-map for the WRITE path.
 
-**Scope:** small each.
+**Scope:** GET_RESLIST small (done); leases + user-map each need cross-cutting
+infra first.
 
-## 9. Multi-pool / job-prio / match-expr knobs  (P2)
+## 9. Multi-pool / job-prio / match-expr knobs  (mostly DONE)
 
-Smaller cycle-side C++ features not yet ported, each independent:
-- `USE_GLOBAL_JOB_PRIOS` — submitter-ad fan-out per `JobPrioArray`, the
-  `want_globaljobprio` key in `submitterLessThan`, and `JOBPRIO_MIN/MAX` in the
-  NEGOTIATE header (matchmaker.cpp :817, :3455-3477).
-- `NEGOTIATOR_MATCH_EXPRS` (`MatchExprX` injected into match ads),
-  `NEGOTIATOR_JOB_CONSTRAINT`, `STARTD_AD_REEVAL_EXPR`.
-- `NEGOTIATOR_INFORM_STARTD` (`MATCH_INFO` to the startd; default off).
-- Multi-collector query with failover for `RemoteSource` (`CollectorList`),
-  and flocking `SubmitterTag` handling across pools.
+Smaller cycle-side C++ features, each independent:
+- **`NEGOTIATOR_MATCH_EXPRS` — ✅ DONE.** Config list of bare macro names
+  (resolved via the knob getter, like C++ `param`) or inline `name=expr`,
+  injected into every match ad as `NegotiatorMatchExpr<name>` (unevaluated
+  expression, string-literal fallback). Ordered → deterministic
+  (matchmaker.cpp:728-746, :5268-5274).
+- **`NEGOTIATOR_JOB_CONSTRAINT` — ✅ DONE (now enforced).** Previously only
+  forwarded in the NEGOTIATE header + folded into significant attrs; now compiled
+  in `cycle.New` and evaluated against each returned request in `nextRequest`
+  (non-matching requests silently skipped), so an older/looser schedd cannot slip
+  through excluded jobs. Deterministic; runs in both compat and fast modes.
+- **`NEGOTIATOR_INFORM_STARTD` (default false) — ✅ DONE.** Full `MATCH_INFO`
+  wire send (`put_secret(claimID)+EOM`, dc_startd.h:301-402) via a
+  `startdInformer` type-assertion on the SessionFactory (no `interfaces.go`
+  change); best-effort, ordered after schedd delivery, never fails the match.
+  Default-off keeps behavior byte-identical.
+- **Multi-collector failover — ✅ DONE.** The direct-CEDAR private-ad query now
+  iterates a bracket-aware `COLLECTOR_HOST` list and fails over on error (context
+  cancellation is terminal); the htcondor client already races the list for
+  public queries.
+- **`USE_GLOBAL_JOB_PRIOS` — DEFERRED.** The meatiest item (submitter-ad fan-out
+  per `JobPrioArray`, `want_globaljobprio` in the submitter sort, `JOBPRIO_MIN/MAX`
+  in the NEGOTIATE header, matchmaker.cpp:817, :3455-3477). Touches the submitter
+  loop + header; left rather than risk half-breaking the spin.
+- `STARTD_AD_REEVAL_EXPR` and flocking `SubmitterTag` handling remain unported.
 
 **Where:** `negotiator/cycle`, `negotiator/source`, `negotiator/protocol`.
-
-**Scope:** small each; pick as needed by target deployments.

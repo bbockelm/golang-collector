@@ -1,0 +1,88 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g. `git tag v0.3.0 && git push origin v0.3.0`.
+# This builds htc-collector and htc-negotiator for linux/amd64 and linux/arm64 and
+# uploads them (raw binaries + per-arch tarballs, with a checksums file) to the
+# GitHub release for that tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # create/update the release and upload assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # `git describe` (Makefile VERSION) needs tags + history
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'   # pure-Go build; cross-compiles without a C toolchain
+        run: |
+          # The tag (e.g. refs/tags/v0.3.0) is the release version.
+          VERSION="${GITHUB_REF_NAME}"
+          make build VERSION="${VERSION}" BINDIR=build
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PLATFORM="${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p dist
+          # Per-arch tarball with both daemons + a raw copy of each binary, so a
+          # consumer can grab whichever form they want.
+          tar -C build -czf "dist/htcondor-go-${VERSION}-${PLATFORM}.tar.gz" htc-collector htc-negotiator
+          cp build/htc-collector "dist/htc-collector-${VERSION}-${PLATFORM}"
+          cp build/htc-negotiator "dist/htc-negotiator-${VERSION}-${PLATFORM}"
+          ( cd dist && sha256sum * > "SHA256SUMS-${PLATFORM}.txt" )
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create/update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # A tag with a pre-release suffix (e.g. v0.3.0-rc1, v0.3.0-test) is
+          # published as a prerelease rather than a "latest" release.
+          prerelease: ${{ contains(github.ref_name, '-') }}

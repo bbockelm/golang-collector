@@ -23,6 +23,9 @@ type EmbeddedSource struct {
 	log   *slog.Logger
 	slotQ *vm.Query // compiled NEGOTIATOR_SLOT_CONSTRAINT (nil = all)
 	subQ  *vm.Query // compiled NEGOTIATOR_SUBMITTER_CONSTRAINT (nil = all)
+	// defaultWeight is the parsed SLOT_WEIGHT cost expression, applied by
+	// FixupSlot to slots lacking their own SlotWeight (shared read-only).
+	defaultWeight *classad.Expr
 }
 
 var _ negotiator.AdSource = (*EmbeddedSource)(nil)
@@ -52,7 +55,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 			if ctx.Err() != nil {
 				return
 			}
-			FixupSlot(ad)
+			FixupSlot(ad, s.defaultWeight)
 			slots = append(slots, ad)
 		}
 	}()
