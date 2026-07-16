@@ -36,6 +36,10 @@ import (
 	"github.com/bbockelm/golang-collector/negotiator/source"
 )
 
+// version is stamped at build time via `-ldflags "-X main.version=..."` (see the
+// Makefile); it is "dev" for a plain `go build`.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "golang-negotiator:", err)
@@ -45,6 +49,7 @@ func main() {
 
 func run() error {
 	listen := flag.String("listen", ":0", "fallback TCP listen address when not inheriting a shared-port endpoint (the negotiator has no well-known port; peers find it via the collector)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	// condor_master appends these standard DaemonCore flags when it launches a
 	// daemon not in its built-in list; accept them so flag.Parse does not reject
 	// our launch. -local-name additionally scopes config lookups.
@@ -52,6 +57,11 @@ func run() error {
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
 	importLog := flag.String("import", "", "path to a C++ negotiator Accountantnew.log to import ONCE into the native accountant store (overrides ACCOUNTANT_IMPORT_LOG); imported only when the native store has no existing Customer records")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("htc-negotiator", version)
+		return nil
+	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "NEGOTIATOR", LocalName: *localName})
 	if err != nil {
