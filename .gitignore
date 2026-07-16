@@ -1,7 +1,11 @@
 # Built binaries
 /golang-collector
 /cmd/golang-collector/golang-collector
+/htc-collector
+/htc-negotiator
 # Test / build artifacts
 *.test
 *.out
+junit*.xml
 /build/
+/dist/
