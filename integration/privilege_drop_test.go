@@ -123,10 +123,9 @@ COLLECTOR_LOG = %s/CollectorLog
 COLLECTOR_DEBUG = D_FULLDEBUG
 COLLECTOR_ADDRESS_FILE = %s
 # Shared port, as the collector is actually deployed under condor_master: the Go
-# collector inherits the shared-port endpoint. With USE_SHARED_PORT=False the
-# master pre-binds the command port and the Go daemon (which only inherits a
-# shared-port token, not the classic inherited command socket) collides with it
-# on bind -- see bbockelm/golang-htcondor#119.
+# collector inherits the shared-port endpoint. (Non-shared-port launch also works
+# now that the daemon adopts the master's inherited command socket --
+# bbockelm/golang-htcondor#119 -- but shared port is the deployed default.)
 USE_SHARED_PORT = True
 # Encrypted-at-rest session persistence: the collector reads the root-owned pool
 # signing key (as root) to key-encrypt this DB. This is what forces the root

@@ -15,18 +15,7 @@ engine](https://github.com/bbockelm/golang-classads) for compact ad storage.
 
 > **Status: experimental.** The intended first production use is as a **CONDOR_VIEW
 > host** observing an existing pool (see [Deploying alongside an existing
-> condor_collector](#deploying-htc-collector-alongside-an-existing-condor_collector)),
-> not as a drop-in replacement for a central manager.
-
-## Compatibility
-
-- **TCP only, AES-GCM only.** CEDAR here does not implement UDP or the legacy
-  Blowfish/3DES ciphers. This has direct configuration consequences — see the view
-  host setup below.
-- Authentication methods supported: `FS` (same host) and `IDTOKENS`/`TOKEN`
-  (tokens signed by the pool signing key). Peers should be HTCondor 25.x.
-- Pure Go (`CGO_ENABLED=0`): cross-compiles to `linux/amd64` and `linux/arm64`
-  with no C toolchain.
+> condor_collector](#deploying-htc-collector-alongside-an-existing-condor_collector)).
 
 ## Building
 
@@ -50,9 +39,8 @@ Cross-compile for a Linux deployment target from any host:
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build
 ```
 
-Tagged releases (`git tag v0.3.0 && git push origin v0.3.0`) publish prebuilt
-`linux/amd64` + `linux/arm64` binaries, tarballs, and checksums to the GitHub
-release via `.github/workflows/release.yml`.
+Tagged releases publish prebuilt `linux/amd64` + `linux/arm64` binaries, tarballs,
+and checksums to the GitHub release.
 
 ## Running
 
@@ -68,8 +56,11 @@ COLLECTOR = /usr/local/sbin/htc-collector
 Started as root under the master, `htc-collector` drops its effective uid/gid to
 the `condor` account, inherits the shared-port endpoint, writes its address file,
 and answers `condor_status` / `condor_who` / `condor_ping` like the C++ collector.
-Keep `USE_SHARED_PORT = True` (the default); non-shared-port launch is not yet
-supported (bbockelm/golang-htcondor#119).
+Keep `USE_SHARED_PORT = True` (the default and the recommended mode).
+
+To instead run it *next to* the stock collector as a view host — the recommended
+first rollout — see [Deploying htc-collector alongside an existing
+condor_collector](#deploying-htc-collector-alongside-an-existing-condor_collector).
 
 ### Standalone (testing)
 
@@ -78,7 +69,7 @@ htc-collector -listen 127.0.0.1:9618
 ```
 
 Reads `CONDOR_CONFIG` for its security and forwarding policy but does not need a
-`condor_master`. Useful as a view sink (below) and for local experimentation.
+`condor_master`. Useful for local experimentation.
 
 Flags: `-listen` (fallback bind when not under shared port), `-metrics`
 (`:9720`-style address for a Prometheus `/metrics` endpoint), `-version`, and the
@@ -88,94 +79,96 @@ Flags: `-listen` (fallback bind when not under shared port), `-metrics`
 
 The lowest-risk way to run `htc-collector` against a live pool is as a **CONDOR_VIEW
 host**: a second collector that receives a *copy* of every ad your existing
-(C++) collector receives. Your production `condor_collector` remains the source of
+(C++) collector receives. Your production `condor_collector` stays the source of
 truth; `htc-collector` just mirrors it, so you can validate it against real pool
-traffic with zero impact on matchmaking. This is exactly the arrangement the
-integration tests exercise (`integration/condor_view_test.go`).
+traffic with zero impact on matchmaking.
+
+Run it as a **second, differently-named DaemonCore daemon under the same
+`condor_master`** as the stock collector — not as a hand-started process. The
+master supervises it, drops it to `condor`, and hands it a shared-port endpoint,
+exactly like every other daemon.
 
 ```
-   daemons ──update──▶  condor_collector (C++, unchanged)
-                              │  CONDOR_VIEW_HOST (a copy of every ad, over TCP)
-                              ▼
-                        htc-collector  (view sink — observe, query, scrape metrics)
+                       condor_master
+                        ├── condor_collector   (C++, unchanged) ──┐
+                        └── htc-collector       (HTC_COLLECTOR)  ◀─┘ CONDOR_VIEW_HOST
+                                                                     (a copy of every ad)
 ```
 
-### 1. Run htc-collector as a standalone view sink
+### Minimal example
 
-Give it its own config and port (here `127.0.0.1:9620`; use a routable address for
-a separate host). A view sink only receives updates and answers queries — it needs
-no `condor_master`:
-
-```
-# htc-view.config
-COLLECTOR_HOST = 0.0.0.0:9620
-LOG            = /var/log/htc-view
-COLLECTOR_LOG  = $(LOG)/CollectorLog
-COLLECTOR_ADDRESS_FILE = $(LOG)/.htc_view_address
-USE_SHARED_PORT = False
-DAEMON_LIST    = COLLECTOR
-
-# htc-collector is TCP + AES-GCM only. Same host as the source? FS auth works.
-# Different host? Use IDTOKENS with a token signed by the pool signing key.
-SEC_DEFAULT_AUTHENTICATION         = REQUIRED
-SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
-SEC_DEFAULT_CRYPTO_METHODS         = AES
-SEC_PASSWORD_DIRECTORY             = /etc/condor/passwords.d   # for IDTOKENS
-```
-
-```sh
-CONDOR_CONFIG=/etc/condor/htc-view.config htc-collector -listen 0.0.0.0:9620
-```
-
-### 2. Point the existing collector at it
-
-On the host running your **existing `condor_collector`**, add the view host. Two
-settings are load-bearing:
+Drop this into a new config file on the central manager — e.g.
+`/etc/condor/config.d/50-htc-view.conf` — and `condor_reconfig` (or restart the
+master). It adds the view host without changing anything about the existing
+collector.
 
 ```
-CONDOR_VIEW_HOST = <view-sink-host>:9620
+# --- htc-collector as a CONDOR_VIEW host, under the existing condor_master ---
 
-# REQUIRED: htc-collector is TCP-only, but view forwarding defaults to UDP
-# (UPDATE_VIEW_COLLECTOR_WITH_TCP defaults false). Without this the forwarded ads
-# are silently dropped.
+# Define a second daemon. Do NOT call it COLLECTOR (that is the stock collector);
+# a distinct name + a -local-name is what keeps the two from colliding.
+HTC_COLLECTOR       = /usr/local/sbin/htc-collector
+HTC_COLLECTOR_ARGS  = -local-name HTCVIEW
+DAEMON_LIST         = $(DAEMON_LIST), HTC_COLLECTOR
+DC_DAEMON_LIST      = $(DC_DAEMON_LIST), HTC_COLLECTOR   # it is a DaemonCore daemon
+
+# Its own log and address file. Do NOT reset LOG or reuse COLLECTOR_ADDRESS_FILE
+# (those belong to the stock collector). The "HTCVIEW." prefix scopes these knobs
+# to this daemon only.
+HTCVIEW.COLLECTOR_LOG          = $(LOG)/HTCViewCollectorLog
+HTCVIEW.COLLECTOR_ADDRESS_FILE = $(LOG)/.htcview_collector_address
+# It is a view *sink*; make sure it never forwards onward (avoids a loop).
+HTCVIEW.CONDOR_VIEW_HOST       =
+
+# Point the stock collector at the view host. Under shared port the daemon shares
+# the collector's port and is addressed by its socket name, which is derived from
+# the local name ("HTCVIEW" -> "htcview"). Use your collector's actual port.
+CONDOR_VIEW_HOST              = <$(CONDOR_HOST):9618?sock=htcview>
+# REQUIRED: htc-collector speaks TCP only, but view forwarding defaults to UDP
+# (UPDATE_VIEW_COLLECTOR_WITH_TCP is false), which would be silently dropped.
 UPDATE_VIEW_COLLECTOR_WITH_TCP = True
-
-# By default a collector forwards only Machine (startd) ads to a view host (the
-# classic CondorView utilization use). To mirror every daemon, opt each type in:
-CONDOR_VIEW_CLASSAD_TYPES = Machine, Scheduler, Negotiator, DaemonMaster
+# A collector forwards only Machine (startd) ads to a view host by default (the
+# classic CondorView utilization use); opt every daemon type in to mirror the pool.
+CONDOR_VIEW_CLASSAD_TYPES      = Machine, Scheduler, Negotiator, DaemonMaster
 ```
 
-Reconfigure the C++ collector (`condor_reconfig -collector`). It now authenticates
-to the view sink and forwards a copy of each ad.
+Notes:
 
-> **Gotchas, from experience:**
-> - Omitting `UPDATE_VIEW_COLLECTOR_WITH_TCP = True` → the C++ collector forwards
->   over UDP, which `htc-collector` never receives. Nothing arrives, no error.
-> - Omitting `CONDOR_VIEW_CLASSAD_TYPES` → only startd (`Machine`) ads are
->   forwarded; schedd/negotiator/master ads never appear on the view host.
-> - Cross-host: the C++ collector must authenticate to `htc-collector`, so provision
->   an IDTOKEN (`condor_token_create`) signed by the pool signing key rather than
->   relying on same-host `FS`.
+- **Shared port stays on** (`USE_SHARED_PORT = True`, the default). The view host
+  needs no port of its own — the master gives it the socket name `htcview` on the
+  collector's shared port, so its address is `<host:9618?sock=htcview>`.
+- **Leave security alone.** `htc-collector` inherits the pool's `SEC_*` policy; it
+  interoperates on a normal pool (AES with `IDTOKENS`/`FS`). Do not hand-craft a
+  separate security config for it.
+- **Nothing about the stock collector changes** except the three
+  `CONDOR_VIEW_HOST` / `UPDATE_VIEW_COLLECTOR_WITH_TCP` / `CONDOR_VIEW_CLASSAD_TYPES`
+  lines, which are read only by the `COLLECTOR` subsystem; the `HTCVIEW.`-scoped
+  overrides above keep the view daemon from acting on them.
+- The `HTCVIEW.`-prefixed knobs rely on HTCondor subsystem/local-name config
+  scoping. Build `htc-collector` against a `golang-htcondor` new enough to
+  implement it; an older build ignores the prefix and the two daemons collide on
+  `COLLECTOR_LOG` / `COLLECTOR_ADDRESS_FILE`.
 
-### 3. Verify
+### Verify
 
-Query the view sink directly and confirm the usual daemon ads mirror across:
+The view daemon logs to `HTCViewCollectorLog` and writes its address to
+`.htcview_collector_address`. Query it directly — it mirrors the pool's daemon ads:
 
 ```sh
-condor_status -pool <view-sink-host>:9620            # machine ads
-condor_status -pool <view-sink-host>:9620 -schedd    # scheduler ads
-condor_status -pool <view-sink-host>:9620 -negotiator
-condor_status -pool <view-sink-host>:9620 -master
+condor_status -pool '<CM-HOST:9618?sock=htcview>'                # machine ads
+condor_status -pool '<CM-HOST:9618?sock=htcview>' -schedd
+condor_status -pool '<CM-HOST:9618?sock=htcview>' -negotiator
+condor_status -pool '<CM-HOST:9618?sock=htcview>' -master
 ```
 
-All four daemon ad types (Startd, Schedd, Negotiator, Master) should be present.
+All four daemon ad types (Startd, Schedd, Negotiator, Master) should appear.
 
 ### The reverse direction
 
 `htc-collector` can also be the **source** and forward to a C++ view host — set
-`CONDOR_VIEW_HOST` in the Go collector's config. It forwards every ad type over TCP
-(no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C++ *sink* then
-needs `ALLOW_NEGOTIATOR` to accept forwarded negotiator/accounting ads.
+`CONDOR_VIEW_HOST` in the Go collector's own (scoped) config. It forwards every ad
+type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C++
+*sink* then needs `ALLOW_NEGOTIATOR` to accept forwarded negotiator/accounting ads.
 
 ## Configuration
 
