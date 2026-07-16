@@ -110,7 +110,7 @@ collector.
 HTC_COLLECTOR       = /usr/local/sbin/htc-collector
 HTC_COLLECTOR_ARGS  = -local-name HTCVIEW
 DAEMON_LIST         = $(DAEMON_LIST), HTC_COLLECTOR
-DC_DAEMON_LIST      = $(DC_DAEMON_LIST), HTC_COLLECTOR   # it is a DaemonCore daemon
+DC_DAEMON_LIST      = +HTC_COLLECTOR     # append to the built-in DaemonCore list
 
 # Its own log and address file. Do NOT reset LOG or reuse COLLECTOR_ADDRESS_FILE
 # (those belong to the stock collector). The "HTCVIEW." prefix scopes these knobs
