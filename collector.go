@@ -41,8 +41,18 @@ type Config struct {
 	// Security is the CEDAR server-side security policy applied to the Collector's
 	// own command server (used by Serve and by New's internal server). It may be a
 	// plaintext/no-auth config. Required. When embedding via RegisterOn, the host
-	// server's own security policy governs the shared socket instead.
+	// server's own security policy governs the shared socket instead. When
+	// SecurityForLevel is set, Security is only the fallback for commands whose
+	// level is not in the map.
 	Security *security.SecurityConfig
+
+	// SecurityForLevel, if set, gives a distinct CEDAR security policy per HTCondor
+	// authorization level ("READ", "ADVERTISE", "NEGOTIATOR"; see server.CommandLevel),
+	// so the collector negotiates each command at its own level -- monitoring
+	// (READ) can be permissive enough for an unauthenticated condor_status while
+	// publishing (ADVERTISE) still requires authentication. A level absent from the
+	// map falls back to Security. Optional.
+	SecurityForLevel map[string]*security.SecurityConfig
 
 	// ViewHosts are CONDOR_VIEW_HOST collector addresses to relay every update and
 	// invalidation to (never private startd ads). Optional; nil forwards nothing.
@@ -106,6 +116,15 @@ func New(cfg Config) (*Collector, error) {
 	c.srv = cedarserver.New(cfg.Security)
 	if cfg.Authorizer != nil {
 		c.srv.Authorizer = cfg.Authorizer
+	}
+	if cfg.SecurityForLevel != nil {
+		// Negotiate each command at its HTCondor authorization level: map the
+		// command to its level (server.CommandLevel) and hand cedar that level's
+		// policy. A level absent from the map returns nil, so cedar falls back to
+		// the default Security config.
+		c.srv.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
+			return cfg.SecurityForLevel[server.CommandLevel(command)]
+		}
 	}
 	c.RegisterOn(c.srv)
 	return c, nil

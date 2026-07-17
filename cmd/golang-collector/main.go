@@ -36,6 +36,7 @@ import (
 	"github.com/bbockelm/golang-collector/negotiator/cycle"
 	"github.com/bbockelm/golang-collector/negotiator/protocol"
 	"github.com/bbockelm/golang-collector/negotiator/source"
+	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
 )
 
@@ -95,11 +96,29 @@ func run() error {
 	slog.SetDefault(d.Slog())
 
 	// Server-side security policy from the HTCondor configuration (SEC_* knobs),
-	// so this collector authenticates and encrypts exactly like the C++ one.
-	sec, err := htcondor.GetServerSecurityConfig(d.Config(), commands.QUERY_STARTD_ADS, "DAEMON")
-	if err != nil {
-		return fmt.Errorf("building security config: %w", err)
+	// per authorization level -- exactly like the C++ collector, which serves
+	// QUERY_*_ADS at READ (monitoring is public, so condor_status works without
+	// daemon credentials) but UPDATE_*/INVALIDATE_* at ADVERTISE (only
+	// authenticated daemons may publish). The collector maps each command to its
+	// level (server.CommandLevel) and negotiates using the matching policy.
+	secForLevel := map[string]*security.SecurityConfig{}
+	for _, lvl := range []struct {
+		name string
+		cmd  int
+	}{
+		{server.LevelRead, commands.QUERY_ANY_ADS},
+		{server.LevelAdvertise, commands.UPDATE_STARTD_AD},
+		{server.LevelNegotiator, commands.QUERY_STARTD_PVT_ADS},
+	} {
+		s, err := htcondor.GetServerSecurityConfig(d.Config(), lvl.cmd, lvl.name)
+		if err != nil {
+			return fmt.Errorf("building %s security config: %w", lvl.name, err)
+		}
+		secForLevel[lvl.name] = s
 	}
+	// READ is the permissive baseline; it also backstops any command not mapped to
+	// a level (e.g. the DC_* defaults), so tools like condor_ping/condor_who work.
+	sec := secForLevel[server.LevelRead]
 
 	// The collector core -- store, protocol handlers, CONDOR_VIEW_HOST forwarding,
 	// and background dictionary retraining + ad expiry -- exactly as the embeddable
@@ -108,6 +127,7 @@ func run() error {
 	// metrics, and the embedded CCB.
 	c, err := collector.New(collector.Config{
 		Security:            sec,
+		SecurityForLevel:    secForLevel,
 		ViewHosts:           viewHosts(cfg),
 		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
 		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
