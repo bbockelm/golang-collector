@@ -9,3 +9,7 @@
 junit*.xml
 /build/
 /dist/
+
+# local multi-module dev (not committed)
+go.work
+go.work.sum

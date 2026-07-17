@@ -4,9 +4,46 @@ package server
 
 import (
 	"github.com/bbockelm/cedar/commands"
+	"github.com/bbockelm/cedar/watch"
 
 	"github.com/bbockelm/golang-collector/store"
 )
+
+// HTCondor DCpermission authorization levels the collector serves commands at.
+const (
+	LevelRead       = "READ"       // public monitoring: QUERY_*_ADS
+	LevelAdvertise  = "ADVERTISE"  // publishing ads: UPDATE_*/INVALIDATE_*
+	LevelNegotiator = "NEGOTIATOR" // private/claim ads: the *_PVT_ADS queries
+)
+
+// CommandLevel returns the HTCondor authorization level a collector command is
+// served at, matching the C++ condor_collector: ordinary QUERY_*_ADS at READ
+// (monitoring is public, so condor_status works without daemon credentials),
+// the private-ad queries at NEGOTIATOR (claim ids are secret), and updates and
+// invalidations at ADVERTISE (only authenticated daemons may publish or expire
+// ads). Unknown commands default to READ (the least-privileged, read-only
+// level). Callers use this both to register per-command authorization and to
+// select the per-command security policy to negotiate.
+func CommandLevel(cmd int) string {
+	switch cmd {
+	case commands.QUERY_STARTD_PVT_ADS, commands.QUERY_MULTIPLE_PVT_ADS:
+		return LevelNegotiator
+	case commands.UPDATE_STARTD_AD_WITH_ACK:
+		return LevelAdvertise
+	case commands.QUERY_MULTIPLE_ADS, watch.WatchAds:
+		return LevelRead
+	}
+	if _, ok := updateCommands[cmd]; ok {
+		return LevelAdvertise
+	}
+	if _, ok := invalidateCommands[cmd]; ok {
+		return LevelAdvertise
+	}
+	if _, ok := queryCommands[cmd]; ok {
+		return LevelRead
+	}
+	return LevelRead
+}
 
 // updateCommands maps each UPDATE_*_AD command to the table it feeds.
 var updateCommands = map[int]store.AdType{
