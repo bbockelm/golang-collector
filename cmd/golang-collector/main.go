@@ -53,6 +53,7 @@ func main() {
 func run() error {
 	listen := flag.String("listen", ":9618", "fallback TCP listen address when not inheriting a shared-port endpoint")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	debug := flag.Bool("debug", false, "enable verbose debug logging on every destination (including the cedar security handshake); overrides COLLECTOR_DEBUG")
 	// condor_master appends these standard DaemonCore flags when it launches a
 	// daemon not in its built-in list; accept them so flag.Parse does not reject
 	// our launch. -local-name additionally scopes config lookups.
@@ -69,6 +70,18 @@ func run() error {
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "COLLECTOR", LocalName: *localName})
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
+	}
+
+	if *debug {
+		// Turn every log destination up to debug -- including the cedar destination,
+		// which otherwise defaults to Warn and hides the security handshake. Set both
+		// the bare and (if scoped) local-name-prefixed knob so it wins regardless of
+		// how the daemon resolves COLLECTOR_DEBUG.
+		const allDebug = "general:debug collector:debug security:debug cedar:debug metrics:debug http:debug schedd:debug mcp:debug"
+		cfg.Set("COLLECTOR_DEBUG", allDebug)
+		if *localName != "" {
+			cfg.Set(strings.ToUpper(*localName)+".COLLECTOR_DEBUG", allDebug)
+		}
 	}
 
 	// Bootstrap logging and condor_master integration (drops privileges to the
