@@ -57,7 +57,7 @@ func TestEmbeddedCCB(t *testing.T) {
 		Name:              "embed-target",
 		HeartbeatInterval: 30 * time.Second,
 		ReconnectInterval: 100 * time.Millisecond,
-		Handler:           func(c net.Conn) { _ = c.Close() },
+		Handler:           func(c net.Conn, _ ccb.InboundMeta) { _ = c.Close() },
 	})
 	lctx, lcancel := context.WithCancel(context.Background())
 	defer lcancel()

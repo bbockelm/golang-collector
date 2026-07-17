@@ -5,9 +5,9 @@ go 1.25.7
 require (
 	github.com/PelicanPlatform/classad v0.5.1
 	github.com/PelicanPlatform/classad/collections v0.4.0
-	github.com/bbockelm/cedar v0.4.0
+	github.com/bbockelm/cedar v0.5.2
 	github.com/bbockelm/golang-ccb v0.1.0
-	github.com/bbockelm/golang-htcondor v0.5.0
+	github.com/bbockelm/golang-htcondor v0.6.2
 	github.com/prometheus/client_golang v1.13.0
 )
 
