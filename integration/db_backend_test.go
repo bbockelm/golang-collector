@@ -5,6 +5,7 @@
 package integration
 
 import (
+	"crypto/rand"
 	"fmt"
 	"net"
 	"os"
@@ -35,6 +36,22 @@ func TestGoCollectorDBBackendRestartResume(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(collDir, "log"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+
+	// A POOL signing key: encryption at rest is on by default for the embedded
+	// store, so the database is sealed under this key -- proving restart-resume
+	// works through the encrypted path, not just plaintext.
+	passwdDir := filepath.Join(tmp, "passwords.d")
+	if err := os.MkdirAll(passwdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	poolKey := make([]byte, 50)
+	if _, err := rand.Read(poolKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(passwdDir, "POOL"), poolKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	collCfg := filepath.Join(tmp, "coll_config")
 	writeFile(t, collCfg, fmt.Sprintf(`
 RELEASE_DIR = %s
@@ -46,13 +63,14 @@ USE_SHARED_PORT = False
 CONDOR_VIEW_HOST =
 COLLECTOR_STORE = embedded
 COLLECTOR_DB_PATH = %s
+SEC_PASSWORD_DIRECTORY = %s
 SEC_DEFAULT_AUTHENTICATION = OPTIONAL
 SEC_DEFAULT_ENCRYPTION = OPTIONAL
 SEC_DEFAULT_CRYPTO_METHODS = AES
 ALLOW_READ = *
 ALLOW_ADVERTISE = *
 ALLOW_DAEMON = *
-`, releaseDir(t), collDir, collDir, collDir, collDir, dbPath))
+`, releaseDir(t), collDir, collDir, collDir, collDir, dbPath, passwdDir))
 
 	clientCfg := filepath.Join(tmp, "client_config")
 	writeFile(t, clientCfg, fmt.Sprintf(`

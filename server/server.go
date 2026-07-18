@@ -117,6 +117,9 @@ func adMessage(c *cedarserver.Conn) *message.Message {
 
 // ackUpdateHandler stores one ad and returns a one-int acknowledgment, for the
 // UPDATE_*_WITH_ACK commands whose sender blocks until the collector confirms.
+// Because the sender treats the ack as "committed", the store must be durable
+// before we reply -- store.DurableUpdate bypasses any Nagle buffering (which would
+// otherwise ack a merely-buffered write).
 func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		msg := message.NewMessageFromStream(c.Stream)
@@ -124,7 +127,7 @@ func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarser
 		if err != nil {
 			return err
 		}
-		if err := st.UpdateOldText(t, text); err != nil {
+		if err := store.DurableUpdate(st, t, text); err != nil {
 			return err
 		}
 		fwd.forwardText(commands.UPDATE_STARTD_AD, text)

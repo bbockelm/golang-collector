@@ -178,15 +178,52 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | --- | --- |
 | `COLLECTOR_HOST` | Well-known bind address/port (default `:9618`). |
 | `CONDOR_VIEW_HOST` | Comma/space-separated view collectors to forward every ad to (TCP). |
+| `COLLECTOR_STORE` | Ad store backend: `memory` (default), `embedded`, or `db` (see [Ad store backends](#ad-store-backends)). |
+| `COLLECTOR_DB_PATH` | `embedded` store location (default `$(LOCAL_DIR)/collector-db`). |
+| `COLLECTOR_DB_ENCRYPTION` | Encrypt the `embedded` store at rest under the pool signing key. Default `True`. |
+| `COLLECTOR_DB_HOST` | `db` store: address of the external database daemon (CEDAR). |
+| `COLLECTOR_BATCH_WINDOW_MS` | Ad-update batching window for the persistent backends. Default `100`; `0` disables. |
+| `COLLECTOR_BATCH_MAX_ADS` | Flush the batch early once this many ads buffer. Default `2048`. |
 | `COLLECTOR_PERSIST_SESSIONS` | Persist the CEDAR session cache across restarts (see below). Default off. |
 | `COLLECTOR_SESSION_CACHE_FILE` | Path to the encrypted session DB (default `$(SPOOL)/collector_sessions.db`). |
-| `SEC_PASSWORD_DIRECTORY` | Pool signing keys — required for session persistence and IDTOKENS. |
+| `SEC_PASSWORD_DIRECTORY` | Pool signing keys — required for session persistence, embedded-store encryption, and IDTOKENS. |
 | `ENABLE_CCB_SERVER` | Run an embedded CCB server on the collector's command socket. |
 | `NEGOTIATOR_EMBEDDED` | Run the negotiator inside `htc-collector` (reads the store directly). |
 | `COLLECTOR_METRICS_ADDRESS` / `-metrics` | Serve Prometheus metrics at `/metrics`. |
 | `COLLECTOR_UPDATE_INTERVAL` | Ad expiry sweep interval. |
 | `COLLECTOR_DICT_RETRAIN_INTERVAL`, `COLLECTOR_DICT_SAMPLE_SIZE` | Compression-dictionary retraining cadence and sample size. |
 | `SEC_*` | Authentication/encryption policy, exactly as for the C++ collector. |
+
+### Ad store backends
+
+`COLLECTOR_STORE` selects where advertised ads live:
+
+- **`memory`** (default) — ads are held in the in-memory collections engine
+  (compressed, footprint-tuned). Fastest, but the pool is lost on restart.
+- **`embedded`** — ads are persisted to a local database under `COLLECTOR_DB_PATH`,
+  so a restart resumes with the pool intact (stale ads are pruned by the startup
+  expiry sweep, not lost). Encrypted at rest by default (see below).
+- **`db`** — ads are stored in an external database daemon reached over CEDAR at
+  `COLLECTOR_DB_HOST`, so several collectors can share one durable store.
+
+**Encryption at rest (`embedded`).** With `COLLECTOR_DB_ENCRYPTION = True` (the
+default), the embedded database is sealed under the pool signing key(s) in
+`SEC_PASSWORD_DIRECTORY` — the same key source and root-read mechanism as the
+[session cache](#encrypted-session-persistence-and-the-privilege-model), so the
+on-disk ads (including private ads such as claim capabilities) are unreadable
+without a key. As with session persistence, enabling encryption with no signing
+key available is a fatal misconfiguration rather than a silent fall back to
+plaintext; set `COLLECTOR_DB_ENCRYPTION = False` to store ads unencrypted (e.g. for
+testing).
+
+**Update batching.** For the persistent backends, ad updates are buffered for
+`COLLECTOR_BATCH_WINDOW_MS` (default `100`), deduplicated per ad, and committed in
+one transaction — collapsing a daemon's rapid re-advertises and coalescing startup
+storms into far fewer commits/round-trips. Reads flush the buffer first, so the
+window bounds only write-visibility latency (well under the C++ collector's update
+cadence, and imperceptible to `condor_status`); `UPDATE_*_AD_WITH_ACK` updates
+bypass the buffer entirely, so an acknowledgment always follows durability. Set the
+window to `0` to disable batching. Batching does not apply to the `memory` store.
 
 ### Encrypted session persistence and the privilege model
 

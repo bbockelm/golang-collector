@@ -18,11 +18,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PelicanPlatform/classad/dbrpc"
 	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/PelicanPlatform/classad/dbrpc"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
@@ -501,21 +501,25 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 }
 
 // buildBackend selects the collector's ad-store backend from COLLECTOR_STORE:
-// "memory" (default) keeps ads in memory (fastest, lost on restart); "db"
-// persists them in an embedded database under COLLECTOR_DB_PATH (default
-// $(LOCAL_DIR)/collector-db), so the collector resumes with its pool after a
-// restart. Returns nil for the in-memory default, which collector.New maps to
-// store.New(). (A remote-database backend is selected the same way once wired.)
+// "memory" (default) keeps ads in memory (fastest, lost on restart); "embedded"
+// persists them in a local database under COLLECTOR_DB_PATH (encrypted at rest by
+// default), so the collector resumes with its pool after a restart; "db" stores
+// them in an external database daemon over CEDAR (COLLECTOR_DB_HOST). Returns nil
+// for the in-memory default, which collector.New maps to store.New(). The
+// persistent backends are wrapped with COLLECTOR_BATCH_WINDOW_MS update batching.
 func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
 	base, err := buildBaseBackend(cfg, log)
 	if err != nil || base == nil {
 		return base, err // nil = in-memory default (no batching)
 	}
-	// Optional ad-update batching: COLLECTOR_BATCH_WINDOW_MS>0 buffers non-ack
-	// updates for that many milliseconds (dedup by ad) and commits them in one
-	// transaction -- fewer round trips to a remote database, and rapid
-	// re-advertises collapsed. Off by default.
-	wms := configInt(cfg, "COLLECTOR_BATCH_WINDOW_MS", 0)
+	// Ad-update batching: COLLECTOR_BATCH_WINDOW_MS buffers non-ack updates for
+	// that many milliseconds (deduplicated by ad) and commits them in one
+	// transaction -- fewer round trips to a remote database, rapid re-advertises
+	// collapsed, and startup storms coalesced. On by default (100ms) for the
+	// persistent backends; set to 0 to disable. Reads flush the buffer first, so
+	// the window bounds only write-visibility latency (well under the C++
+	// collector's update cadence), and ACK updates bypass it (store.DurableUpdate).
+	wms := configInt(cfg, "COLLECTOR_BATCH_WINDOW_MS", 100)
 	if wms <= 0 {
 		return base, nil
 	}
@@ -530,6 +534,31 @@ func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error
 	return buffered, nil
 }
 
+// embeddedDBKeys returns the pool signing keys that encrypt the embedded ad
+// database at rest. Encryption is on by default (COLLECTOR_DB_ENCRYPTION); the keys
+// come from SEC_PASSWORD_DIRECTORY, read as root -- the same source and mechanism
+// the session cache uses. When encryption is required but no keys are available it
+// is a fatal misconfiguration (rather than a silent fall back to plaintext); set
+// COLLECTOR_DB_ENCRYPTION=false to store ads unencrypted (e.g. for testing). It
+// returns nil keys when encryption is disabled, opening the database in plaintext.
+func embeddedDBKeys(cfg *config.Config) ([]store.KEK, error) {
+	if !configBool(cfg, "COLLECTOR_DB_ENCRYPTION", true) {
+		return nil, nil
+	}
+	raw, err := htcondor.LoadSigningKeys(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("collector: embedded ad store encryption: loading pool signing keys: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("collector: embedded ad store encryption is enabled but no pool signing keys are available (set SEC_PASSWORD_DIRECTORY, or COLLECTOR_DB_ENCRYPTION=false to store ads unencrypted)")
+	}
+	keys := make([]store.KEK, 0, len(raw))
+	for id, material := range raw {
+		keys = append(keys, store.KEK{ID: id, Material: material})
+	}
+	return keys, nil
+}
+
 // buildBaseBackend selects the underlying ad-store backend from COLLECTOR_STORE:
 // "memory" (in-memory, the default), "embedded" (a local database file), or "db"
 // (an external database daemon reached over CEDAR).
@@ -540,8 +569,12 @@ func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, e
 		return nil, nil
 	case "embedded", "local":
 		path := collectorDBPath(cfg)
-		log.Info(logging.DestinationGeneral, "collector ad store: embedded database", "path", path)
-		b, err := store.NewDBBackend(path)
+		keys, err := embeddedDBKeys(cfg)
+		if err != nil {
+			return nil, err
+		}
+		log.Info(logging.DestinationGeneral, "collector ad store: embedded database", "path", path, "encrypted", len(keys) > 0)
+		b, err := store.NewDBBackendEncrypted(path, keys)
 		if err != nil {
 			return nil, fmt.Errorf("collector: embedded ad store: %w", err)
 		}
