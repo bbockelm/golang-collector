@@ -18,9 +18,11 @@ import (
 	"strings"
 	"time"
 
+	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
@@ -125,9 +127,14 @@ func run() error {
 	// collector library provides it. This daemon wraps it with the condor_master
 	// glue: config, logging, the command socket, the address file, DC_* commands,
 	// metrics, and the embedded CCB.
+	backend, err := buildBackend(cfg, log)
+	if err != nil {
+		return err
+	}
 	c, err := collector.New(collector.Config{
 		Security:            sec,
 		SecurityForLevel:    secForLevel,
+		Backend:             backend, // nil selects the default in-memory store
 		ViewHosts:           viewHosts(cfg),
 		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
 		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
@@ -137,6 +144,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Final expiry sweep + backend flush/close at shutdown (runs after the
+	// background loops stop, since it is deferred first).
+	defer func() { _ = c.Close() }()
 	st, srv := c.Store(), c.Server()
 	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
 	d.RegisterDefaultCommands(srv)
@@ -347,7 +357,7 @@ func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Co
 // $(SPOOL)/GoAccountant.log — the Go-native transaction-log format, NOT the
 // C++ Accountantnew.log ClassAdLog (whose importer is deferred; design doc
 // 3.4). Point the knob at a fresh path when migrating from a C++ negotiator.
-func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st *store.Store, pubAddr string) error {
+func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st store.Backend, pubAddr string) error {
 	if !configBool(cfg, "NEGOTIATOR_EMBEDDED", false) {
 		return nil
 	}
@@ -467,9 +477,16 @@ func metricsListenAddr(cfg *config.Config, flagAddr string) string {
 // startMetrics serves the collector's Prometheus metrics at /metrics on addr
 // until ctx is cancelled. Bind failures are logged, not fatal -- metrics are
 // observability, not core function.
-func startMetrics(ctx context.Context, addr string, st *store.Store, log *logging.Logger) {
+func startMetrics(ctx context.Context, addr string, st store.Backend, log *logging.Logger) {
+	// Per-table metrics come from store.Statser; a backend that doesn't expose
+	// them (e.g. a remote database) simply has no metrics endpoint.
+	statser, ok := st.(store.Statser)
+	if !ok {
+		log.Info(logging.DestinationGeneral, "metrics endpoint disabled: backend has no stats")
+		return
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler(st))
+	mux.Handle("/metrics", metrics.Handler(statser))
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")
@@ -481,6 +498,121 @@ func startMetrics(ctx context.Context, addr string, st *store.Store, log *loggin
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
+}
+
+// buildBackend selects the collector's ad-store backend from COLLECTOR_STORE:
+// "memory" (default) keeps ads in memory (fastest, lost on restart); "db"
+// persists them in an embedded database under COLLECTOR_DB_PATH (default
+// $(LOCAL_DIR)/collector-db), so the collector resumes with its pool after a
+// restart. Returns nil for the in-memory default, which collector.New maps to
+// store.New(). (A remote-database backend is selected the same way once wired.)
+func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
+	base, err := buildBaseBackend(cfg, log)
+	if err != nil || base == nil {
+		return base, err // nil = in-memory default (no batching)
+	}
+	// Optional ad-update batching: COLLECTOR_BATCH_WINDOW_MS>0 buffers non-ack
+	// updates for that many milliseconds (dedup by ad) and commits them in one
+	// transaction -- fewer round trips to a remote database, and rapid
+	// re-advertises collapsed. Off by default.
+	wms := configInt(cfg, "COLLECTOR_BATCH_WINDOW_MS", 0)
+	if wms <= 0 {
+		return base, nil
+	}
+	maxBuf := configInt(cfg, "COLLECTOR_BATCH_MAX_ADS", 2048)
+	buffered, err := store.NewBufferedBackend(base, time.Duration(wms)*time.Millisecond, maxBuf,
+		func(e error) { log.Warn(logging.DestinationGeneral, "ad-update batch flush failed", "err", e.Error()) })
+	if err != nil {
+		log.Info(logging.DestinationGeneral, "ad-update batching unavailable for this backend; continuing unbuffered", "err", err.Error())
+		return base, nil
+	}
+	log.Info(logging.DestinationGeneral, "ad-update batching enabled", "window_ms", wms, "max_ads", maxBuf)
+	return buffered, nil
+}
+
+// buildBaseBackend selects the underlying ad-store backend from COLLECTOR_STORE:
+// "memory" (in-memory, the default), "embedded" (a local database file), or "db"
+// (an external database daemon reached over CEDAR).
+func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
+	kind, _ := cfg.Get("COLLECTOR_STORE")
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "memory", "mem":
+		return nil, nil
+	case "embedded", "local":
+		path := collectorDBPath(cfg)
+		log.Info(logging.DestinationGeneral, "collector ad store: embedded database", "path", path)
+		b, err := store.NewDBBackend(path)
+		if err != nil {
+			return nil, fmt.Errorf("collector: embedded ad store: %w", err)
+		}
+		return b, nil
+	case "db", "database", "remote":
+		addr, ok := cfg.Get("COLLECTOR_DB_HOST")
+		if !ok || strings.TrimSpace(addr) == "" {
+			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the external database daemon's address)", kind)
+		}
+		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR", "host", addr)
+		return store.NewRPCBackend(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr))), nil
+	default:
+		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"embedded\", or \"db\")", kind)
+	}
+}
+
+// dbSessionCommand is htcondordb's DBSession CEDAR command (command.DBSession =
+// TRANSFERD_BASE 74000): the multiplexed dbrpc session. Defined locally to avoid
+// a dependency on the htcondordb daemon module for one protocol constant.
+const dbSessionCommand = 74000
+
+// dbrpcDial returns a dial that opens a fresh authenticated CEDAR DBSession to the
+// remote database at addr and wraps its stream as a dbrpc MsgConn. The collector
+// authenticates (PREFERRED) so it maps to a privileged identity that can write
+// and read private ads -- it applies per-client redaction itself. The returned
+// MsgConn's Close also closes the CEDAR connection.
+func dbrpcDial(cfg *config.Config, addr string) func(context.Context) (dbrpc.MsgConn, error) {
+	return func(ctx context.Context) (dbrpc.MsgConn, error) {
+		sec, err := htcondor.GetSecurityConfig(cfg, dbSessionCommand, "CLIENT")
+		if err != nil {
+			return nil, fmt.Errorf("building db-session security config: %w", err)
+		}
+		sec.Command = dbSessionCommand
+		if sec.Authentication == security.SecurityOptional {
+			sec.Authentication = security.SecurityPreferred
+		}
+		connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to remote database %s: %w", addr, err)
+		}
+		return &closingMsgConn{MsgConn: dbrpc.NewCedarConn(ctx, cl.GetStream()), also: cl.Close}, nil
+	}
+}
+
+// closingMsgConn augments a dbrpc MsgConn's Close to also tear down the CEDAR
+// connection the stream rides on.
+type closingMsgConn struct {
+	dbrpc.MsgConn
+	also func() error
+}
+
+func (c *closingMsgConn) Close() error {
+	err := c.MsgConn.Close()
+	if c.also != nil {
+		_ = c.also()
+	}
+	return err
+}
+
+// collectorDBPath is the on-disk directory for the embedded database store:
+// COLLECTOR_DB_PATH if set, else $(LOCAL_DIR)/collector-db.
+func collectorDBPath(cfg *config.Config) string {
+	if p, ok := cfg.Get("COLLECTOR_DB_PATH"); ok && strings.TrimSpace(p) != "" {
+		return p
+	}
+	if p, ok := cfg.Get("LOCAL_DIR"); ok && strings.TrimSpace(p) != "" {
+		return filepath.Join(p, "collector-db")
+	}
+	return "collector-db"
 }
 
 // collectorListenAddr picks the fallback TCP bind address when not inheriting a

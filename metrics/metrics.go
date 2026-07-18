@@ -16,11 +16,11 @@ import (
 
 const namespace = "condor_collector"
 
-// storeCollector implements prometheus.Collector over a *store.Store, emitting
+// storeCollector implements prometheus.Collector over a store.Statser, emitting
 // per-ad-type storage gauges. Reading on Collect (rather than caching gauges)
 // keeps the numbers exact and lock-scoped to the scrape.
 type storeCollector struct {
-	st *store.Store
+	st store.Statser
 
 	ads      *prometheus.Desc
 	arena    *prometheus.Desc
@@ -29,7 +29,7 @@ type storeCollector struct {
 	segments *prometheus.Desc
 }
 
-func newStoreCollector(st *store.Store) *storeCollector {
+func newStoreCollector(st store.Statser) *storeCollector {
 	label := []string{"ad_type"}
 	return &storeCollector{
 		st: st,
@@ -72,7 +72,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 // the per-ad-type storage gauges above, plus standard Go runtime and process
 // (RSS, open FDs, ...) collectors. It uses a private registry so it can be
 // mounted alongside any other metrics without global-registry collisions.
-func Handler(st *store.Store) http.Handler {
+func Handler(st store.Statser) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		newStoreCollector(st),

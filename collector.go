@@ -54,6 +54,14 @@ type Config struct {
 	// map falls back to Security. Optional.
 	SecurityForLevel map[string]*security.SecurityConfig
 
+	// Backend is the ad store. Optional; nil selects the default in-memory store
+	// (store.New()). Set it to a persistent/remote backend (store.NewDBBackend for
+	// an embedded database, or an external-database store over CEDAR) to give
+	// the collector restart-survivable or externally-shared storage. StartBackground
+	// runs an expiry sweep at startup (pruning ads a persistent backend reloaded
+	// that went stale while down) and Close runs one at shutdown.
+	Backend store.Backend
+
 	// ViewHosts are CONDOR_VIEW_HOST collector addresses to relay every update and
 	// invalidation to (never private startd ads). Optional; nil forwards nothing.
 	ViewHosts []string
@@ -89,7 +97,7 @@ type Config struct {
 type Collector struct {
 	cfg   Config
 	log   *slog.Logger
-	store *store.Store
+	store store.Backend
 	fwd   *server.Forwarder
 	srv   *cedarserver.Server
 }
@@ -107,10 +115,14 @@ func New(cfg Config) (*Collector, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	st := cfg.Backend
+	if st == nil {
+		st = store.New()
+	}
 	c := &Collector{
 		cfg:   cfg,
 		log:   cfg.Logger,
-		store: store.New(),
+		store: st,
 		fwd:   server.NewForwarder(cfg.ViewHosts, cfg.Security),
 	}
 	c.srv = cedarserver.New(cfg.Security)
@@ -145,11 +157,23 @@ func (c *Collector) RegisterOn(cs *cedarserver.Server) {
 // stops it (and waits for the loops to exit). It is a no-op with both intervals
 // unset. Safe to call once.
 func (c *Collector) StartBackground(ctx context.Context) func() {
+	// Startup expiry sweep: a persistent backend reloads the ads a prior run left
+	// behind, some of which went stale while the collector was down. Prune them
+	// before serving so a long outage does not resurrect dead ads (a short one
+	// keeps the pool warm). A no-op for the empty in-memory backend.
+	if n, err := c.store.Expire(); err != nil {
+		c.log.Warn("collector: startup expiry sweep failed", "error", err)
+	} else if n > 0 {
+		c.log.Info("collector: pruned stale ads at startup", "count", n)
+	}
+
 	var stops []func()
-	if c.cfg.DictRetrainInterval > 0 {
+	// Dictionary retraining is an in-memory-backend optimization (store.Retrainer);
+	// a backend that manages its own storage (a database) does not implement it.
+	if r, ok := c.store.(store.Retrainer); ok && c.cfg.DictRetrainInterval > 0 {
 		c.log.Info("collector: dictionary auto-retraining enabled",
 			"interval", c.cfg.DictRetrainInterval.String(), "sample_size", c.cfg.DictSampleSize)
-		stops = append(stops, c.store.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
+		stops = append(stops, r.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
 	}
 	if c.cfg.ExpireInterval > 0 {
 		loopCtx, cancel := context.WithCancel(ctx)
@@ -173,7 +197,10 @@ func (c *Collector) expireLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n := c.store.Expire(); n > 0 {
+			n, err := c.store.Expire()
+			if err != nil {
+				c.log.Warn("collector: ad expiry sweep failed", "error", err)
+			} else if n > 0 {
 				c.log.Info("collector: reaped expired ads", "count", n)
 			}
 		}
@@ -193,11 +220,26 @@ func (c *Collector) ServeConn(ctx context.Context, conn net.Conn) error {
 	return c.srv.ServeConn(ctx, conn)
 }
 
-// Store returns the underlying ad store, for introspection and metrics
-// (Store().Stats() gives per-table ad counts and compressed byte footprints).
-func (c *Collector) Store() *store.Store { return c.store }
+// Store returns the underlying ad store backend, for introspection, metrics
+// (assert store.Statser for per-table counts/byte footprints), and the embedded
+// negotiator's in-process reads.
+func (c *Collector) Store() store.Backend { return c.store }
 
 // Server returns the Collector's internal cedar command server, for callers that
 // want to register additional commands (e.g. DC_* defaults) or set an Authorizer
 // before Serve.
 func (c *Collector) Server() *cedarserver.Server { return c.srv }
+
+// Close runs a final expiry sweep (keeping a persistent backend's at-rest state
+// pruned) and closes the store backend, flushing and releasing its database. It
+// should be called once, after the serve loop stops. The in-memory backend's
+// Close is a no-op. Callers embedding via RegisterOn that own the backend should
+// close it themselves instead.
+func (c *Collector) Close() error {
+	if n, err := c.store.Expire(); err != nil {
+		c.log.Warn("collector: shutdown expiry sweep failed", "error", err)
+	} else if n > 0 {
+		c.log.Info("collector: pruned stale ads at shutdown", "count", n)
+	}
+	return c.store.Close()
+}

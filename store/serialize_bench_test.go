@@ -120,7 +120,12 @@ func BenchmarkSerializeScaling(b *testing.B) {
 					var local int64
 					for atomic.AddInt64(&claimed, 1) <= int64(b.N) {
 						msg := message.NewMessageForStream(st2)
-						for ra := range st.QueryRaw(StartdAd, nil) {
+						seq, err := st.QueryRaw(StartdAd, "", 0)
+						if err != nil {
+							b.Error(err)
+							return
+						}
+						for ra := range seq {
 							if err := msg.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
 								b.Error(err)
 								return
@@ -204,7 +209,11 @@ func benchSerialize(b *testing.B, st *Store) {
 		var ads int64
 		for i := 0; i < b.N; i++ {
 			msg := message.NewMessageForStream(st2)
-			for ad := range st.Query(StartdAd, nil) { // nil == match all
+			seq, err := st.Query(StartdAd, "", 0) // "" == match all
+			if err != nil {
+				b.Fatal(err)
+			}
+			for ad := range seq {
 				if err := msg.PutClassAd(ctx, ad); err != nil {
 					b.Fatal(err)
 				}
@@ -224,7 +233,11 @@ func benchSerialize(b *testing.B, st *Store) {
 		var ads int64
 		for i := 0; i < b.N; i++ {
 			msg := message.NewMessageForStream(st2)
-			for ra := range st.QueryRaw(StartdAd, nil) {
+			seq, err := st.QueryRaw(StartdAd, "", 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for ra := range seq {
 				if err := msg.PutClassAdRawBytes(ctx, ra.Exprs, ra.MyType, ra.TargetType); err != nil {
 					b.Fatal(err)
 				}

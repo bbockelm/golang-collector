@@ -22,7 +22,7 @@ import (
 //
 // The handler owns the connection for the subscription's lifetime: it returns
 // (letting the server close the socket) only when the stream ends.
-func watchHandler(st *store.Store) cedarserver.HandlerFunc {
+func watchHandler(st store.Backend) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		req, err := message.NewMessageFromStream(c.Stream).GetClassAd(ctx)
 		if err != nil {

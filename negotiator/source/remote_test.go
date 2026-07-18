@@ -213,7 +213,7 @@ MyAddress="<10.0.0.1:9618>"`)
 		t.Fatalf("publish negotiator ad: %v", err)
 	}
 	if !waitForLen(st, store.NegotiatorAd, 1) {
-		t.Errorf("negotiator table = %d, want 1", st.Len(store.NegotiatorAd))
+		t.Errorf("negotiator table = %d, want 1", mustLen(t, st, store.NegotiatorAd))
 	}
 
 	acct := []*classad.ClassAd{
@@ -230,17 +230,18 @@ Priority=2.0`),
 		t.Fatalf("publish accounting ads: %v", err)
 	}
 	if !waitForLen(st, store.AccountingAd, 2) {
-		t.Errorf("accounting table = %d, want 2", st.Len(store.AccountingAd))
+		t.Errorf("accounting table = %d, want 2", mustLen(t, st, store.AccountingAd))
 	}
 }
 
 func waitForLen(st *store.Store, t store.AdType, want int) bool {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if st.Len(t) == want {
+		if n, err := st.Len(t); err == nil && n == want {
 			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return st.Len(t) == want
+	n, err := st.Len(t)
+	return err == nil && n == want
 }

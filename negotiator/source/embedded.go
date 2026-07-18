@@ -7,22 +7,26 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/PelicanPlatform/classad/collections/vm"
 
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/store"
 )
 
-// EmbeddedSource is a negotiator.AdSource that reads a collector store.Store
+// EmbeddedSource is a negotiator.AdSource that reads a collector store.Backend
 // directly (in-process), for the negotiator embedded in the collector binary.
 // It applies the same per-ad fixups and constraint filters as the remote
-// source and publishes the negotiator's own ads straight into the store.
+// source and publishes the negotiator's own ads straight into the store. Reading
+// through the Backend (rather than the concrete in-memory store) keeps the
+// embedded negotiator working over any backend, including a persistent database.
 type EmbeddedSource struct {
-	store *store.Store
+	store store.Backend
 	cfg   Config
 	log   *slog.Logger
-	slotQ *vm.Query // compiled NEGOTIATOR_SLOT_CONSTRAINT (nil = all)
-	subQ  *vm.Query // compiled NEGOTIATOR_SUBMITTER_CONSTRAINT (nil = all)
+	// Constraint expression strings (validated at construction; "" = all), handed
+	// to the backend's Query, which compiles them. Kept as strings so a remote
+	// backend can push them down unchanged.
+	slotConstraint string
+	subConstraint  string
 	// defaultWeight is the parsed SLOT_WEIGHT cost expression, applied by
 	// FixupSlot to slots lacking their own SlotWeight (shared read-only).
 	defaultWeight *classad.Expr
@@ -44,6 +48,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 		slots    []*classad.ClassAd
 		subs     []*classad.ClassAd
 		claimIDs map[string]string
+		errs     [3]error
 	)
 
 	wg.Add(3)
@@ -51,7 +56,12 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Slots: query (with slot constraint pushed to the store) + per-slot fixup.
 	go func() {
 		defer wg.Done()
-		for ad := range s.store.Query(store.StartdAd, s.slotQ) {
+		ads, err := s.store.Query(store.StartdAd, s.slotConstraint, 0)
+		if err != nil {
+			errs[0] = err
+			return
+		}
+		for ad := range ads {
 			if ctx.Err() != nil {
 				return
 			}
@@ -63,7 +73,12 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Submitters: query (with submitter constraint) + filter.
 	go func() {
 		defer wg.Done()
-		for ad := range s.store.Query(store.SubmitterAd, s.subQ) {
+		ads, err := s.store.Query(store.SubmitterAd, s.subConstraint, 0)
+		if err != nil {
+			errs[1] = err
+			return
+		}
+		for ad := range ads {
 			if ctx.Err() != nil {
 				return
 			}
@@ -76,8 +91,13 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Private ads: build the claim-id map (never republished).
 	go func() {
 		defer wg.Done()
+		ads, err := s.store.Query(store.StartdPvtAd, "", 0)
+		if err != nil {
+			errs[2] = err
+			return
+		}
 		var pvt []*classad.ClassAd
-		for ad := range s.store.Query(store.StartdPvtAd, nil) {
+		for ad := range ads {
 			if ctx.Err() != nil {
 				return
 			}
@@ -89,6 +109,11 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &negotiator.PoolSnapshot{

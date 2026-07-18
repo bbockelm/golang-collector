@@ -80,7 +80,11 @@ func TestEmbeddableStandalone(t *testing.T) {
 
 	advertiseAndQuery(t, ln.Addr().String())
 
-	if n := c.Store().Len(store.StartdAd); n != 1 {
+	n, err := c.Store().Len(store.StartdAd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
 		t.Errorf("Store().Len(StartdAd) = %d, want 1", n)
 	}
 }
@@ -108,7 +112,11 @@ func TestEmbeddableRegisterOn(t *testing.T) {
 	advertiseAndQuery(t, ln.Addr().String())
 
 	// The ads landed in the embedded collector's store.
-	if n := c.Store().Len(store.StartdAd); n != 1 {
+	n, err := c.Store().Len(store.StartdAd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
 		t.Errorf("embedded Store().Len(StartdAd) = %d, want 1", n)
 	}
 }

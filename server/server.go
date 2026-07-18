@@ -21,7 +21,7 @@ import (
 // plaintext/no-auth config for testing). fwd, if non-nil, relays every update and
 // invalidation on to the configured CONDOR_VIEW_HOST collectors (a nil fwd
 // forwards nothing). The returned server is ready to Serve.
-func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarserver.Server {
+func New(st store.Backend, sec *security.SecurityConfig, fwd *Forwarder) *cedarserver.Server {
 	cs := cedarserver.New(sec)
 	Register(cs, st, fwd)
 	return cs
@@ -35,7 +35,7 @@ func New(st *store.Store, sec *security.SecurityConfig, fwd *Forwarder) *cedarse
 // standalone case. fwd, if non-nil, relays updates/invalidations to CONDOR_VIEW_HOST
 // collectors. It registers only the collector protocol; DC_* default commands (NOP,
 // CONFIG_VAL, ...) are the host's responsibility.
-func Register(cs *cedarserver.Server, st *store.Store, fwd *Forwarder) {
+func Register(cs *cedarserver.Server, st store.Backend, fwd *Forwarder) {
 	// Every command is registered at its HTCondor authorization level (CommandLevel):
 	// QUERY_*_ADS at READ, UPDATE_*/INVALIDATE_* at ADVERTISE, private-ad queries at
 	// NEGOTIATOR. The cedar server uses these both to authorize a session per command
@@ -71,7 +71,7 @@ func Register(cs *cedarserver.Server, st *store.Store, fwd *Forwarder) {
 // connection (claim ids etc. that only the negotiator may query); it is stored
 // in the StartdPvtAd table keyed the same as the public ad. Its absence (the
 // common case -- most clients send only the public ad and close) is fine.
-func updateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
+func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		// Keep the connection open for follow-on updates on the same session:
 		// HTCondor daemons stream several updates down one persistent command
@@ -117,7 +117,7 @@ func adMessage(c *cedarserver.Conn) *message.Message {
 
 // ackUpdateHandler stores one ad and returns a one-int acknowledgment, for the
 // UPDATE_*_WITH_ACK commands whose sender blocks until the collector confirms.
-func ackUpdateHandler(st *store.Store, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
+func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		msg := message.NewMessageFromStream(c.Stream)
 		text, err := msg.GetClassAdRaw(ctx)
@@ -139,17 +139,14 @@ func ackUpdateHandler(st *store.Store, t store.AdType, fwd *Forwarder) cedarserv
 // queryHandler reads a query ad, evaluates its constraint against table t, and
 // streams matching ads back as PutInt32(1)+PutClassAd per ad, terminated by
 // PutInt32(0) -- the framing the collector query protocol expects.
-func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
+func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		req := message.NewMessageFromStream(c.Stream)
 		queryAd, err := req.GetClassAd(ctx)
 		if err != nil {
 			return err
 		}
-		q, projection, limit, err := parseQuery(queryAd)
-		if err != nil {
-			return err
-		}
+		constraint, projection, limit := parseQuery(queryAd)
 
 		// Redact private (secret) attributes from every public table's response.
 		// The StartdPvt table is the authorized private channel (served only via
@@ -157,15 +154,20 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 		// through unredacted -- serving them is the whole point of that table.
 		redact := t != store.StartdPvtAd
 
+		// Whole-ad (unprojected) queries take the wire-form fast path when the
+		// backend offers one (the in-memory store; see store.RawQueryer): stream
+		// stored bytes straight out without materializing each ad. Backends
+		// without it fall through to the materialized Query path below.
+		rq, rawOK := st.(store.RawQueryer)
+
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
-		if len(projection) == 0 {
-			// Fast path: no projection means whole ads, so stream them straight
-			// from the stored wire form (PutClassAdRaw) without decoding each into
-			// a *classad.ClassAd -- ~2x faster on realistic ads. Private attributes
-			// are dropped by filtering the rendered [][]byte expressions (a cheap
-			// filter-and-recount, no re-encoding), so redaction keeps the fast path.
-			for ra := range st.QueryRaw(t, q) {
+		if len(projection) == 0 && rawOK {
+			raw, err := rq.QueryRaw(t, constraint, limit)
+			if err != nil {
+				return err
+			}
+			for ra := range raw {
 				if limit > 0 && n >= limit {
 					break
 				}
@@ -182,7 +184,11 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 				n++
 			}
 		} else {
-			for ad := range st.Query(t, q) {
+			ads, err := st.Query(t, constraint, limit)
+			if err != nil {
+				return err
+			}
+			for ad := range ads {
 				if limit > 0 && n >= limit {
 					break
 				}
@@ -211,7 +217,7 @@ func queryHandler(st *store.Store, t store.AdType) cedarserver.HandlerFunc {
 // The private-attr variant is served identically: the negotiator obtains startd
 // claim capabilities through the dedicated QUERY_STARTD_PVT_ADS command, so the
 // multi-query only needs the public ads of each target table.
-func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
+func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		queryAd, err := message.NewMessageFromStream(c.Stream).GetClassAd(ctx)
 		if err != nil {
@@ -225,16 +231,17 @@ func multiQueryHandler(st *store.Store) cedarserver.HandlerFunc {
 			if !ok {
 				continue // unknown target type: skip it, like the C++ collector
 			}
-			q, projection, limit, err := parseSubQuery(queryAd, target)
-			if err != nil {
-				return err
-			}
+			constraint, projection, limit := parseSubQuery(queryAd, target)
 			// Multi-queries only name public target types (the negotiator gets startd
 			// claim caps through the dedicated QUERY_STARTD_PVT_ADS command), so every
 			// response here is redacted.
 			redact := adType != store.StartdPvtAd
+			ads, err := st.Query(adType, constraint, limit)
+			if err != nil {
+				return err
+			}
 			n := 0
-			for ad := range st.Query(adType, q) {
+			for ad := range ads {
 				if limit > 0 && n >= limit {
 					break
 				}
@@ -311,21 +318,22 @@ func redactRawExprs(exprs [][]byte) [][]byte {
 
 // invalidateHandler reads an invalidation ad and removes matching ads: by its
 // Requirements constraint if present, otherwise the single ad it identifies.
-func invalidateHandler(st *store.Store, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
+func invalidateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		msg := message.NewMessageFromStream(c.Stream)
 		ad, err := msg.GetClassAd(ctx)
 		if err != nil {
 			return err
 		}
-		q, _, _, err := parseQuery(ad)
-		if err != nil {
-			return err
-		}
-		if q == nil {
-			st.Invalidate(t, nil, ad)
+		constraint, _, _ := parseQuery(ad)
+		if constraint == "" {
+			if _, err := st.Invalidate(t, "", ad); err != nil {
+				return err
+			}
 		} else {
-			st.Invalidate(t, q, nil)
+			if _, err := st.Invalidate(t, constraint, nil); err != nil {
+				return err
+			}
 		}
 		// Relay the invalidation so view collectors drop the same ads.
 		fwd.forward(cmd, ad)
