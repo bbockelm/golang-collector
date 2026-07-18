@@ -64,14 +64,31 @@ func (b *DBBackend) UpdateBatch(batch []PendingUpdate) error {
 	return nil
 }
 
-// NewDBBackend opens (or creates) a persistent ad database under dir with one
-// table per storage AdType, reloading any ads a prior run persisted -- so a
-// collector restart resumes with its pool intact (stale ads are pruned by the
+// KEK is a key-encryption key (a pool signing key) that wraps the ad database's
+// at-rest master key. Re-exported from the db layer so callers configure
+// encryption without importing db directly.
+type KEK = db.KEK
+
+// NewDBBackend opens (or creates) a persistent, unencrypted ad database under dir
+// with one table per storage AdType, reloading any ads a prior run persisted -- so
+// a collector restart resumes with its pool intact (stale ads are pruned by the
 // startup expiry sweep, not lost on restart).
 func NewDBBackend(dir string) (*DBBackend, error) {
-	cat, err := db.OpenCatalog(dir)
+	return newDBBackend(db.CatalogConfig{Dir: dir})
+}
+
+// NewDBBackendEncrypted is NewDBBackend with encryption at rest: every table's
+// master key is wrapped under keys (the pool signing keys), so the on-disk ad data
+// -- including private ads -- is unreadable without one. Passing no keys is
+// equivalent to NewDBBackend (plaintext).
+func NewDBBackendEncrypted(dir string, keys []KEK) (*DBBackend, error) {
+	return newDBBackend(db.CatalogConfig{Dir: dir, PoolKeys: keys})
+}
+
+func newDBBackend(cfg db.CatalogConfig) (*DBBackend, error) {
+	cat, err := db.OpenCatalogConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("collector: open ad database at %q: %w", dir, err)
+		return nil, fmt.Errorf("collector: open ad database at %q: %w", cfg.Dir, err)
 	}
 	b := &DBBackend{
 		cat:             cat,

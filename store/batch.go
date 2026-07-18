@@ -70,9 +70,28 @@ type BufferedBackend struct {
 }
 
 var (
-	_ Backend    = (*BufferedBackend)(nil)
-	_ RawQueryer = (*BufferedBackend)(nil)
+	_ Backend        = (*BufferedBackend)(nil)
+	_ RawQueryer     = (*BufferedBackend)(nil)
+	_ DurableUpdater = (*BufferedBackend)(nil)
 )
+
+// DurableUpdater is an optional Backend capability: apply one ad update and return
+// only once it is durably stored. The ACK-update path (UPDATE_*_WITH_ACK) uses it
+// so a BufferedBackend -- which normally defers writes into its Nagle buffer --
+// still acknowledges only after the write is committed, never merely buffered.
+type DurableUpdater interface {
+	UpdateOldTextDurable(t AdType, text string) error
+}
+
+// DurableUpdate applies text to st and returns only once it is durable: through
+// DurableUpdater when the backend provides it, else a plain UpdateOldText (already
+// synchronous for unbuffered backends).
+func DurableUpdate(st Backend, t AdType, text string) error {
+	if du, ok := st.(DurableUpdater); ok {
+		return du.UpdateOldTextDurable(t, text)
+	}
+	return st.UpdateOldText(t, text)
+}
 
 // NewBufferedBackend wraps under (which must implement BatchWriter) with a buffer
 // that flushes every window or once maxBuf ads accumulate. logErr, if non-nil,
@@ -160,6 +179,17 @@ func (b *BufferedBackend) UpdateOldText(t AdType, text string) error {
 
 func (b *BufferedBackend) UpdatePvt(publicText, pvtText string) error {
 	return b.enqueue(PendingUpdate{Type: StartdAd, Text: publicText, PvtText: pvtText, Pvt: true})
+}
+
+// UpdateOldTextDurable flushes any buffered writes (so an earlier buffered update
+// of the same ad cannot overwrite this one) and applies text synchronously through
+// the underlying backend, returning only once it is committed. The ACK-update path
+// uses it so the acknowledgment follows durability, not mere buffering.
+func (b *BufferedBackend) UpdateOldTextDurable(t AdType, text string) error {
+	if err := b.flush(); err != nil {
+		return err
+	}
+	return b.Backend.UpdateOldText(t, text)
 }
 
 // --- flush-then-passthrough paths (consistency) ---
