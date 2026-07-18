@@ -29,9 +29,40 @@ type DBBackend struct {
 }
 
 var (
-	_ Backend    = (*DBBackend)(nil)
-	_ RawQueryer = (*DBBackend)(nil)
+	_ Backend     = (*DBBackend)(nil)
+	_ RawQueryer  = (*DBBackend)(nil)
+	_ BatchWriter = (*DBBackend)(nil)
 )
+
+// UpdateBatch applies a buffer of upserts, grouping ordinary ads by table into
+// one wire-native shard-commit each (db.UpdateOldBatch); private ads go through
+// UpdatePvt individually (they share the public ad's key).
+func (b *DBBackend) UpdateBatch(batch []PendingUpdate) error {
+	byTable := make(map[AdType][]db.OldAdText)
+	for _, p := range batch {
+		if p.Pvt {
+			if err := b.UpdatePvt(p.Text, p.PvtText); err != nil {
+				return err
+			}
+			continue
+		}
+		key, ok := hashKeyFromText(p.Type, p.Text)
+		if !ok {
+			continue
+		}
+		byTable[p.Type] = append(byTable[p.Type], db.OldAdText{Key: string(key), Text: stampText(p.Text, b.now())})
+	}
+	for t, items := range byTable {
+		tbl := b.tables[t]
+		if tbl == nil {
+			continue
+		}
+		if err := tbl.UpdateOldBatch(items); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // NewDBBackend opens (or creates) a persistent ad database under dir with one
 // table per storage AdType, reloading any ads a prior run persisted -- so a

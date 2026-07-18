@@ -507,6 +507,31 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 // restart. Returns nil for the in-memory default, which collector.New maps to
 // store.New(). (A remote-database backend is selected the same way once wired.)
 func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
+	base, err := buildBaseBackend(cfg, log)
+	if err != nil || base == nil {
+		return base, err // nil = in-memory default (no batching)
+	}
+	// Optional ad-update batching: COLLECTOR_BATCH_WINDOW_MS>0 buffers non-ack
+	// updates for that many milliseconds (dedup by ad) and commits them in one
+	// transaction -- fewer round trips to a remote database, and rapid
+	// re-advertises collapsed. Off by default.
+	wms := configInt(cfg, "COLLECTOR_BATCH_WINDOW_MS", 0)
+	if wms <= 0 {
+		return base, nil
+	}
+	maxBuf := configInt(cfg, "COLLECTOR_BATCH_MAX_ADS", 2048)
+	buffered, err := store.NewBufferedBackend(base, time.Duration(wms)*time.Millisecond, maxBuf,
+		func(e error) { log.Warn(logging.DestinationGeneral, "ad-update batch flush failed", "err", e.Error()) })
+	if err != nil {
+		log.Info(logging.DestinationGeneral, "ad-update batching unavailable for this backend; continuing unbuffered", "err", err.Error())
+		return base, nil
+	}
+	log.Info(logging.DestinationGeneral, "ad-update batching enabled", "window_ms", wms, "max_ads", maxBuf)
+	return buffered, nil
+}
+
+// buildBaseBackend selects the underlying ad-store backend from COLLECTOR_STORE.
+func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
 	kind, _ := cfg.Get("COLLECTOR_STORE")
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "", "memory", "mem":

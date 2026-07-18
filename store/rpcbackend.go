@@ -38,9 +38,78 @@ type RPCBackend struct {
 }
 
 var (
-	_ Backend    = (*RPCBackend)(nil)
-	_ RawQueryer = (*RPCBackend)(nil)
+	_ Backend     = (*RPCBackend)(nil)
+	_ RawQueryer  = (*RPCBackend)(nil)
+	_ BatchWriter = (*RPCBackend)(nil)
 )
+
+type keyedText struct{ key, text string }
+
+// UpdateBatch applies a buffer of upserts as one transaction per table (one
+// round trip per table instead of per ad -- the batching win over a remote
+// database).
+func (b *RPCBackend) UpdateBatch(batch []PendingUpdate) error {
+	cl, err := b.conn()
+	if err != nil {
+		return err
+	}
+	byTable := make(map[string][]keyedText)
+	for _, p := range batch {
+		if p.Pvt {
+			key, ok := hashKeyFromText(StartdAd, p.Text)
+			if !ok {
+				continue
+			}
+			pvt := p.PvtText
+			if !strings.HasSuffix(pvt, "\n") {
+				pvt += "\n"
+			}
+			header := copyAttrLines(p.Text, attrName, attrMyAddress, attrMyType)
+			table := StartdPvtAd.String()
+			byTable[table] = append(byTable[table], keyedText{string(key), stampText(header+pvt, b.now())})
+			continue
+		}
+		key, ok := hashKeyFromText(p.Type, p.Text)
+		if !ok {
+			continue
+		}
+		byTable[p.Type.String()] = append(byTable[p.Type.String()], keyedText{string(key), stampText(p.Text, b.now())})
+	}
+	for table, items := range byTable {
+		if err := b.putBatch(cl, table, items); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// putBatch upserts all items into one table in a single optimistic transaction,
+// retrying the commit on conflict.
+func (b *RPCBackend) putBatch(cl *dbrpc.Client, table string, items []keyedText) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		tx, err := cl.BeginTable(table)
+		if err != nil {
+			b.drop()
+			return err
+		}
+		for _, it := range items {
+			if err := tx.NewClassAd(it.key, it.text); err != nil {
+				_ = tx.Abort()
+				b.drop()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			if isConflict(err) {
+				continue
+			}
+			b.drop()
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("collector: batch write to %s did not commit after repeated conflicts", table)
+}
 
 // NewRPCBackend builds a remote-database backend whose connection is produced by
 // dial (call it repeatedly; each returns a fresh MsgConn -- e.g. a freshly
