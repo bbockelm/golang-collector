@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,6 +142,90 @@ NEGOTIATOR_UPDATE_INTERVAL = 5
 	assertDaemonsVisible(t, viewAddr, viewLog, "C++ view host")
 }
 
+// TestGoViewCollectorUnderMasterSharedPort covers the production topology the standalone view
+// tests miss: the Go collector runs as a view host UNDER condor_master WITH shared port
+// (reachable at "<host:port>?sock=..."), and a normal C++ pool forwards its ads there via
+// CONDOR_VIEW_HOST. The distinguishing variable vs TestGoCollectorAsViewTarget is exactly
+// this: there the Go view sink is standalone (direct TCP bind, USE_SHARED_PORT=False); here
+// it is a real condor_master-managed, shared-port daemon receiving forwards over the
+// shared-port fd-pass. We assert every daemon ad -- Startd especially, the type that fails in
+// the field -- reaches it, with a production-sized (multi-KiB) slot ad.
+//
+// NOTE: this passes today, which is itself the finding -- the core forward-receive path is
+// sound over shared port, so the field failure ("condor_write(): Socket closed ...
+// ?sock=htcview" dropping every Machine ad) is triggered by something narrower still. The
+// leading suspect not yet reproduced here is the *colocated* layout: the C++ main collector
+// and the Go view collector behind ONE shared-port server on :9618 (sock=collector +
+// sock=htcview), rather than the two independent shared-port servers this test uses.
+func TestGoViewCollectorUnderMasterSharedPort(t *testing.T) {
+	requireViewTools(t)
+
+	tmp := t.TempDir()
+	goBin := buildGoCollector(t, tmp)
+
+	// View pool: condor_master running ONLY the Go collector, under shared port. Its
+	// advertised address is a shared-port sinful ("...?sock=collector"), the same shape as
+	// the field's "?sock=htcview". DAEMON_SOCKET_DIR is left at its default ("auto"), which
+	// picks a unique short /tmp path per instance -- so the two pools' shared-port sockets do
+	// not collide, and the deep test tmpdir does not blow the ~104-char Unix socket limit.
+	viewExtra := fmt.Sprintf(`
+DAEMON_LIST = MASTER, COLLECTOR
+COLLECTOR = %s
+COLLECTOR_LOG = $(LOG)/CollectorLog
+COLLECTOR_ADDRESS_FILE = $(LOG)/.collector_address
+COLLECTOR_DEBUG = D_FULLDEBUG
+CONDOR_VIEW_HOST =
+SEC_DEFAULT_AUTHENTICATION = REQUIRED
+SEC_DEFAULT_AUTHENTICATION_METHODS = FS
+SEC_CLIENT_AUTHENTICATION_METHODS = FS
+SEC_DEFAULT_CRYPTO_METHODS = AES
+`, goBin)
+	view := htcondor.SetupCondorHarnessWithConfig(t, viewExtra)
+	defer view.Shutdown()
+	defer saveLogs(t, view.GetLogDir())
+	viewAddr := view.GetCollectorAddr()
+	viewLog := filepath.Join(view.GetLogDir(), "CollectorLog")
+	t.Logf("Go view collector (under master, shared port) at %s", viewAddr)
+
+	// A startd/slot ad carrying OSIssue with a backslash escape, the field trigger. NOTE: this
+	// does NOT by itself reproduce the OSIssue = "\S" drop -- that needs a single backslash on
+	// the old-ClassAd wire, and this HTCondor's old-ClassAd unparse escapes it to "\\S", which
+	// even an unfixed ParseOld accepts. The authoritative guard for the escape fix is the
+	// classad layer (parser unit tests + the old-ClassAd differential fuzzer); this test's job
+	// is the topology that had no coverage: a Go collector as a view host UNDER condor_master
+	// with shared port, receiving C++ forwards.
+	mainExtra := fmt.Sprintf(`
+CONDOR_VIEW_HOST = %s
+COLLECTOR_DEBUG = D_FULLDEBUG
+CONDOR_VIEW_CLASSAD_TYPES = Machine, Scheduler, Negotiator, DaemonMaster
+UPDATE_VIEW_COLLECTOR_WITH_TCP = True
+SEC_DEFAULT_AUTHENTICATION = REQUIRED
+SEC_DEFAULT_AUTHENTICATION_METHODS = FS
+SEC_CLIENT_AUTHENTICATION_METHODS = FS
+SEC_DEFAULT_CRYPTO_METHODS = AES
+START = TRUE
+OSIssue = "\\S"
+STARTD_ATTRS = $(STARTD_ATTRS) OSIssue
+NEGOTIATOR_INTERVAL = 5
+MASTER_UPDATE_INTERVAL = 5
+UPDATE_INTERVAL = 5
+SCHEDD_INTERVAL = 5
+NEGOTIATOR_UPDATE_INTERVAL = 5
+`, viewAddr)
+	h := htcondor.SetupCondorHarnessWithConfig(t, mainExtra)
+	defer h.Shutdown()
+	defer saveLogs(t, h.GetLogDir())
+
+	if err := h.WaitForStartd(90 * time.Second); err != nil {
+		dumpLog(t, filepath.Join(h.GetLogDir(), "CollectorLog"))
+		dumpLog(t, viewLog)
+		t.Fatalf("main pool did not come up: %v", err)
+	}
+
+	// Every daemon ad type -- Startd included -- reaches the shared-port Go view collector.
+	assertDaemonsVisible(t, viewAddr, viewLog, "Go shared-port view host")
+}
+
 // assertDaemonsVisible polls the collector at addr until every viewDaemonTypes ad
 // is locatable, failing (with the view log) if any never appears.
 func assertDaemonsVisible(t *testing.T, addr, viewLog, who string) {
@@ -154,6 +239,68 @@ func assertDaemonsVisible(t *testing.T, addr, viewLog, who string) {
 		}
 		t.Logf("%s: %s ad present via the view link", who, dt)
 	}
+}
+
+// TestGoCollectorIngestsBackslashEscape is the regression guard for the OSIssue = "\S" drop.
+// A C++ startd advertising OSIssue from /etc/issue puts a literal backslash escape on the
+// old-ClassAd wire; a Go collector whose ingest lexed string literals with strict new-ClassAd
+// escape rules rejected it ("invalid escape sequence \S"), dropped the update, and reset the
+// connection ("condor_write(): Socket closed"). condor_advertise reproduces exactly that wire
+// form (a single backslash), which the config->serialize round-trip cannot (it escapes to
+// "\\S"). We advertise such an ad straight to a standalone Go collector and require it to land
+// with OSIssue intact -- it fails against a collector without the ingest fix.
+func TestGoCollectorIngestsBackslashEscape(t *testing.T) {
+	adv, err := exec.LookPath("condor_advertise")
+	if err != nil {
+		t.Skip("condor_advertise not found in PATH")
+	}
+	tmp := t.TempDir()
+	goBin := buildGoCollector(t, tmp)
+	addr, viewLog := startViewCollector(t, "go", goBin, tmp)
+
+	// Client config matching the collector's FS + AES policy so condor_advertise authenticates.
+	clientCfg := filepath.Join(tmp, "client_config")
+	if err := os.WriteFile(clientCfg, []byte(fmt.Sprintf(`
+CONDOR_HOST = 127.0.0.1
+RELEASE_DIR = %s
+SEC_DEFAULT_AUTHENTICATION = REQUIRED
+SEC_CLIENT_AUTHENTICATION_METHODS = FS
+SEC_DEFAULT_CRYPTO_METHODS = AES
+`, releaseDir(t))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A minimal Machine ad whose OSIssue holds a single literal backslash ("\S").
+	adFile := filepath.Join(tmp, "machine.ad")
+	if err := os.WriteFile(adFile, []byte("MyType = \"Machine\"\nName = \"slot1@bktest\"\nOSIssue = \"\\S\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(adv, "-pool", addr, "UPDATE_STARTD_AD", adFile)
+	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+clientCfg)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("condor_advertise: %v\n%s", err, out)
+	}
+
+	// The ad must appear at the collector AND still carry an OSIssue with a backslash; a
+	// dropped-on-ingest ad never appears.
+	ctx := context.Background()
+	col := htcondor.NewCollector(addr)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		ads, qerr := col.QueryAds(ctx, "Startd", `Name == "slot1@bktest"`)
+		if qerr == nil {
+			for _, ad := range ads {
+				if v, ok := ad.EvaluateAttrString("OSIssue"); ok && strings.Contains(v, `\`) {
+					t.Logf("advertised OSIssue=%q ingested and queryable", v)
+					return
+				}
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	dumpLog(t, viewLog) // look for: dropped update ... invalid escape sequence \S
+	t.Fatal(`the OSIssue = "\S" ad never landed at the Go collector -- dropped on ingest`)
 }
 
 // requireViewTools skips unless condor_master (for the pool) and condor_collector
