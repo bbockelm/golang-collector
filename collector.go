@@ -56,7 +56,7 @@ type Config struct {
 
 	// Backend is the ad store. Optional; nil selects the default in-memory store
 	// (store.New()). Set it to a persistent/remote backend (store.NewDBBackend for
-	// an embedded database, or a dbrpc-backed store for an external one) to give
+	// an embedded database, or an external-database store over CEDAR) to give
 	// the collector restart-survivable or externally-shared storage. StartBackground
 	// runs an expiry sweep at startup (pruning ads a persistent backend reloaded
 	// that went stale while down) and Close runs one at shutdown.

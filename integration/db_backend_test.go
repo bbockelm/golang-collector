@@ -1,4 +1,4 @@
-// Integration test for the embedded-database ad store (COLLECTOR_STORE=db): the
+// Integration test for the embedded-database ad store (COLLECTOR_STORE=embedded): the
 // real proof of the persistent backend is that ads advertised with the actual
 // HTCondor client tools survive a collector restart, instead of vanishing as they
 // would with the in-memory store. Skips unless the HTCondor binaries are on PATH.
@@ -29,7 +29,7 @@ func TestGoCollectorDBBackendRestartResume(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	// Permissive security so condor_advertise/condor_status work without tokens;
-	// the point under test is persistence, not auth. COLLECTOR_STORE=db persists
+	// the point under test is persistence, not auth. COLLECTOR_STORE=embedded persists
 	// ads to COLLECTOR_DB_PATH so a restart reloads them.
 	collDir := filepath.Join(tmp, "coll")
 	if err := os.MkdirAll(filepath.Join(collDir, "log"), 0o755); err != nil {
@@ -44,7 +44,7 @@ COLLECTOR_LOG = %s/log/CollectorLog
 COLLECTOR_ADDRESS_FILE = %s/log/.collector_address
 USE_SHARED_PORT = False
 CONDOR_VIEW_HOST =
-COLLECTOR_STORE = db
+COLLECTOR_STORE = embedded
 COLLECTOR_DB_PATH = %s
 SEC_DEFAULT_AUTHENTICATION = OPTIONAL
 SEC_DEFAULT_ENCRYPTION = OPTIONAL

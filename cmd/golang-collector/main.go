@@ -530,29 +530,31 @@ func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error
 	return buffered, nil
 }
 
-// buildBaseBackend selects the underlying ad-store backend from COLLECTOR_STORE.
+// buildBaseBackend selects the underlying ad-store backend from COLLECTOR_STORE:
+// "memory" (in-memory, the default), "embedded" (a local database file), or "db"
+// (an external database daemon reached over CEDAR).
 func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
 	kind, _ := cfg.Get("COLLECTOR_STORE")
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "", "memory", "mem":
 		return nil, nil
-	case "db", "database", "embedded":
+	case "embedded", "local":
 		path := collectorDBPath(cfg)
 		log.Info(logging.DestinationGeneral, "collector ad store: embedded database", "path", path)
 		b, err := store.NewDBBackend(path)
 		if err != nil {
-			return nil, fmt.Errorf("collector: embedded db store: %w", err)
+			return nil, fmt.Errorf("collector: embedded ad store: %w", err)
 		}
 		return b, nil
-	case "dbrpc", "remote":
+	case "db", "database", "remote":
 		addr, ok := cfg.Get("COLLECTOR_DB_HOST")
 		if !ok || strings.TrimSpace(addr) == "" {
-			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the htcondordb daemon's address)", kind)
+			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the external database daemon's address)", kind)
 		}
-		log.Info(logging.DestinationGeneral, "collector ad store: remote database over CEDAR", "host", addr)
+		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR", "host", addr)
 		return store.NewRPCBackend(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr))), nil
 	default:
-		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"db\", or \"dbrpc\")", kind)
+		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"embedded\", or \"db\")", kind)
 	}
 }
 
