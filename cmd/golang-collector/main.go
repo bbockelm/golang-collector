@@ -18,9 +18,11 @@ import (
 	"strings"
 	"time"
 
+	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
@@ -517,9 +519,61 @@ func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error
 			return nil, fmt.Errorf("collector: embedded db store: %w", err)
 		}
 		return b, nil
+	case "dbrpc", "remote":
+		addr, ok := cfg.Get("COLLECTOR_DB_HOST")
+		if !ok || strings.TrimSpace(addr) == "" {
+			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the htcondordb daemon's address)", kind)
+		}
+		log.Info(logging.DestinationGeneral, "collector ad store: remote database over CEDAR", "host", addr)
+		return store.NewRPCBackend(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr))), nil
 	default:
-		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\" or \"db\")", kind)
+		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"db\", or \"dbrpc\")", kind)
 	}
+}
+
+// dbSessionCommand is htcondordb's DBSession CEDAR command (command.DBSession =
+// TRANSFERD_BASE 74000): the multiplexed dbrpc session. Defined locally to avoid
+// a dependency on the htcondordb daemon module for one protocol constant.
+const dbSessionCommand = 74000
+
+// dbrpcDial returns a dial that opens a fresh authenticated CEDAR DBSession to the
+// remote database at addr and wraps its stream as a dbrpc MsgConn. The collector
+// authenticates (PREFERRED) so it maps to a privileged identity that can write
+// and read private ads -- it applies per-client redaction itself. The returned
+// MsgConn's Close also closes the CEDAR connection.
+func dbrpcDial(cfg *config.Config, addr string) func(context.Context) (dbrpc.MsgConn, error) {
+	return func(ctx context.Context) (dbrpc.MsgConn, error) {
+		sec, err := htcondor.GetSecurityConfig(cfg, dbSessionCommand, "CLIENT")
+		if err != nil {
+			return nil, fmt.Errorf("building db-session security config: %w", err)
+		}
+		sec.Command = dbSessionCommand
+		if sec.Authentication == security.SecurityOptional {
+			sec.Authentication = security.SecurityPreferred
+		}
+		connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to remote database %s: %w", addr, err)
+		}
+		return &closingMsgConn{MsgConn: dbrpc.NewCedarConn(ctx, cl.GetStream()), also: cl.Close}, nil
+	}
+}
+
+// closingMsgConn augments a dbrpc MsgConn's Close to also tear down the CEDAR
+// connection the stream rides on.
+type closingMsgConn struct {
+	dbrpc.MsgConn
+	also func() error
+}
+
+func (c *closingMsgConn) Close() error {
+	err := c.MsgConn.Close()
+	if c.also != nil {
+		_ = c.also()
+	}
+	return err
 }
 
 // collectorDBPath is the on-disk directory for the embedded database store:

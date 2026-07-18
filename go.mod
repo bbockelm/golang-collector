@@ -13,6 +13,7 @@ require (
 
 require (
 	github.com/PelicanPlatform/classad/db v0.7.1 // indirect
+	github.com/PelicanPlatform/classad/dbrpc v0.7.1 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

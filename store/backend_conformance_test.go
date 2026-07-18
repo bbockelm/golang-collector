@@ -1,9 +1,13 @@
 package store
 
 import (
+	"context"
+	"net"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
 // backendFactory builds a fresh Backend and a hook to set its clock (so the
@@ -23,6 +27,27 @@ var backends = map[string]backendFactory{
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = b.Close() })
+		return b, func(n int64) { b.now = func() int64 { return n } }
+	},
+	// The remote backend, wired to an in-process dbrpc server over an in-memory
+	// pipe (the CEDAR transport is exercised separately). Proves the Backend <->
+	// dbrpc mapping behaves like the others.
+	"rpc": func(t *testing.T) (Backend, func(int64)) {
+		cat, err := db.OpenCatalog(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := dbrpc.NewServerCatalog(cat)
+		// The collector connects to its database at a privileged level: it needs the
+		// full ad (including private attributes like claim capabilities) and applies
+		// per-client redaction itself. Serve with IncludePrivate to match.
+		dial := func(context.Context) (dbrpc.MsgConn, error) {
+			sc, cc := net.Pipe()
+			go func() { _ = srv.ServeConnOpts(dbrpc.NewStreamConn(sc), dbrpc.ServeOptions{IncludePrivate: true}) }()
+			return dbrpc.NewStreamConn(cc), nil
+		}
+		b := NewRPCBackend(context.Background(), dial)
+		t.Cleanup(func() { _ = b.Close(); srv.Close(); _ = cat.Close() })
 		return b, func(n int64) { b.now = func() int64 { return n } }
 	},
 }
