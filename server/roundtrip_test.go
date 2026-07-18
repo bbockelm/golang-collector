@@ -293,13 +293,16 @@ func TestRoundTripAdvertiseQuery(t *testing.T) {
 		}
 	}
 
-	// Query all.
-	got, err := col.QueryAds(ctx, "Machine", "")
-	if err != nil {
-		t.Fatalf("query all: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("query all returned %d ads, want 2", len(got))
+	// Query all. UPDATE_STARTD_AD is fire-and-forget (no ack), so the server may
+	// still be committing the second ad when the query races in; poll until both
+	// are visible.
+	var got []*classad.ClassAd
+	var err error
+	if !waitFor(5*time.Second, func() bool {
+		got, err = col.QueryAds(ctx, "Machine", "")
+		return err == nil && len(got) == 2
+	}) {
+		t.Fatalf("query all returned %d ads (err=%v), want 2", len(got), err)
 	}
 
 	// Query by constraint.
