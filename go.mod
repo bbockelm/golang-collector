@@ -3,8 +3,8 @@ module github.com/bbockelm/golang-collector
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.5.1
-	github.com/PelicanPlatform/classad/collections v0.4.0
+	github.com/PelicanPlatform/classad v0.7.0
+	github.com/PelicanPlatform/classad/collections v0.7.0
 	github.com/bbockelm/cedar v0.5.5
 	github.com/bbockelm/golang-ccb v0.1.0
 	github.com/bbockelm/golang-htcondor v0.6.2
@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/PelicanPlatform/classad/db v0.7.1 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -34,6 +35,7 @@ require (
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
+	github.com/tidwall/btree v1.8.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect

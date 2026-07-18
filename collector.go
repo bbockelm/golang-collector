@@ -54,6 +54,14 @@ type Config struct {
 	// map falls back to Security. Optional.
 	SecurityForLevel map[string]*security.SecurityConfig
 
+	// Backend is the ad store. Optional; nil selects the default in-memory store
+	// (store.New()). Set it to a persistent/remote backend (store.NewDBBackend for
+	// an embedded database, or a dbrpc-backed store for an external one) to give
+	// the collector restart-survivable or externally-shared storage. StartBackground
+	// runs an expiry sweep at startup (pruning ads a persistent backend reloaded
+	// that went stale while down) and Close runs one at shutdown.
+	Backend store.Backend
+
 	// ViewHosts are CONDOR_VIEW_HOST collector addresses to relay every update and
 	// invalidation to (never private startd ads). Optional; nil forwards nothing.
 	ViewHosts []string
@@ -107,10 +115,14 @@ func New(cfg Config) (*Collector, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	st := cfg.Backend
+	if st == nil {
+		st = store.New()
+	}
 	c := &Collector{
 		cfg:   cfg,
 		log:   cfg.Logger,
-		store: store.New(),
+		store: st,
 		fwd:   server.NewForwarder(cfg.ViewHosts, cfg.Security),
 	}
 	c.srv = cedarserver.New(cfg.Security)
@@ -145,6 +157,16 @@ func (c *Collector) RegisterOn(cs *cedarserver.Server) {
 // stops it (and waits for the loops to exit). It is a no-op with both intervals
 // unset. Safe to call once.
 func (c *Collector) StartBackground(ctx context.Context) func() {
+	// Startup expiry sweep: a persistent backend reloads the ads a prior run left
+	// behind, some of which went stale while the collector was down. Prune them
+	// before serving so a long outage does not resurrect dead ads (a short one
+	// keeps the pool warm). A no-op for the empty in-memory backend.
+	if n, err := c.store.Expire(); err != nil {
+		c.log.Warn("collector: startup expiry sweep failed", "error", err)
+	} else if n > 0 {
+		c.log.Info("collector: pruned stale ads at startup", "count", n)
+	}
+
 	var stops []func()
 	// Dictionary retraining is an in-memory-backend optimization (store.Retrainer);
 	// a backend that manages its own storage (a database) does not implement it.
@@ -207,3 +229,17 @@ func (c *Collector) Store() store.Backend { return c.store }
 // want to register additional commands (e.g. DC_* defaults) or set an Authorizer
 // before Serve.
 func (c *Collector) Server() *cedarserver.Server { return c.srv }
+
+// Close runs a final expiry sweep (keeping a persistent backend's at-rest state
+// pruned) and closes the store backend, flushing and releasing its database. It
+// should be called once, after the serve loop stops. The in-memory backend's
+// Close is a no-op. Callers embedding via RegisterOn that own the backend should
+// close it themselves instead.
+func (c *Collector) Close() error {
+	if n, err := c.store.Expire(); err != nil {
+		c.log.Warn("collector: shutdown expiry sweep failed", "error", err)
+	} else if n > 0 {
+		c.log.Info("collector: pruned stale ads at shutdown", "count", n)
+	}
+	return c.store.Close()
+}

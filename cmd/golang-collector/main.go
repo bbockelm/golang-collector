@@ -125,9 +125,14 @@ func run() error {
 	// collector library provides it. This daemon wraps it with the condor_master
 	// glue: config, logging, the command socket, the address file, DC_* commands,
 	// metrics, and the embedded CCB.
+	backend, err := buildBackend(cfg, log)
+	if err != nil {
+		return err
+	}
 	c, err := collector.New(collector.Config{
 		Security:            sec,
 		SecurityForLevel:    secForLevel,
+		Backend:             backend, // nil selects the default in-memory store
 		ViewHosts:           viewHosts(cfg),
 		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
 		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
@@ -137,6 +142,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Final expiry sweep + backend flush/close at shutdown (runs after the
+	// background loops stop, since it is deferred first).
+	defer func() { _ = c.Close() }()
 	st, srv := c.Store(), c.Server()
 	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
 	d.RegisterDefaultCommands(srv)
@@ -488,6 +496,42 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
+}
+
+// buildBackend selects the collector's ad-store backend from COLLECTOR_STORE:
+// "memory" (default) keeps ads in memory (fastest, lost on restart); "db"
+// persists them in an embedded database under COLLECTOR_DB_PATH (default
+// $(LOCAL_DIR)/collector-db), so the collector resumes with its pool after a
+// restart. Returns nil for the in-memory default, which collector.New maps to
+// store.New(). (A remote-database backend is selected the same way once wired.)
+func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
+	kind, _ := cfg.Get("COLLECTOR_STORE")
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "memory", "mem":
+		return nil, nil
+	case "db", "database", "embedded":
+		path := collectorDBPath(cfg)
+		log.Info(logging.DestinationGeneral, "collector ad store: embedded database", "path", path)
+		b, err := store.NewDBBackend(path)
+		if err != nil {
+			return nil, fmt.Errorf("collector: embedded db store: %w", err)
+		}
+		return b, nil
+	default:
+		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\" or \"db\")", kind)
+	}
+}
+
+// collectorDBPath is the on-disk directory for the embedded database store:
+// COLLECTOR_DB_PATH if set, else $(LOCAL_DIR)/collector-db.
+func collectorDBPath(cfg *config.Config) string {
+	if p, ok := cfg.Get("COLLECTOR_DB_PATH"); ok && strings.TrimSpace(p) != "" {
+		return p
+	}
+	if p, ok := cfg.Get("LOCAL_DIR"); ok && strings.TrimSpace(p) != "" {
+		return filepath.Join(p, "collector-db")
+	}
+	return "collector-db"
 }
 
 // collectorListenAddr picks the fallback TCP bind address when not inheriting a
