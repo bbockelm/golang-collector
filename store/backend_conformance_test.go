@@ -81,6 +81,7 @@ func TestBackendConformance(t *testing.T) {
 			t.Run("Invalidate", func(t *testing.T) { testInvalidate(t, factory) })
 			t.Run("UpdatePvt", func(t *testing.T) { testUpdatePvt(t, factory) })
 			t.Run("Expire", func(t *testing.T) { testExpire(t, factory) })
+			t.Run("RawQuery", func(t *testing.T) { testRawQuery(t, factory) })
 		})
 	}
 }
@@ -195,6 +196,54 @@ func testUpdatePvt(t *testing.T, factory backendFactory) {
 	}
 	if n, _ := b.Len(StartdPvtAd); n != 0 {
 		t.Fatalf("StartdPvtAd len = %d after invalidate, want 0 (shadow removed)", n)
+	}
+}
+
+// testRawQuery exercises the optional RawQueryer fast path: wire-form results
+// must match Query in count, carry the type tag, and honor the constraint.
+func testRawQuery(t *testing.T, factory backendFactory) {
+	b, _ := factory(t)
+	rq, ok := b.(RawQueryer)
+	if !ok {
+		t.Skip("backend does not implement RawQueryer")
+	}
+	for _, ad := range []string{
+		`MyType = "Machine"` + "\n" + `Name = "slot1@a"` + "\n" + `State = "Idle"`,
+		`MyType = "Machine"` + "\n" + `Name = "slot2@a"` + "\n" + `State = "Busy"`,
+	} {
+		if err := b.UpdateOldText(StartdAd, ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seq, err := rq.QueryRaw(StartdAd, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := 0
+	for ra := range seq {
+		all++
+		if len(ra.Exprs) == 0 {
+			t.Fatal("RawAd has no expression lines")
+		}
+		if ra.MyType != "Machine" {
+			t.Fatalf("RawAd MyType = %q, want Machine", ra.MyType)
+		}
+	}
+	if all != 2 {
+		t.Fatalf("QueryRaw all = %d, want 2", all)
+	}
+
+	seq, err = rq.QueryRaw(StartdAd, `State == "Idle"`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle := 0
+	for range seq {
+		idle++
+	}
+	if idle != 1 {
+		t.Fatalf("QueryRaw Idle = %d, want 1", idle)
 	}
 }
 

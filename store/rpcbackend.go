@@ -37,7 +37,10 @@ type RPCBackend struct {
 	defaultLifetime int64
 }
 
-var _ Backend = (*RPCBackend)(nil)
+var (
+	_ Backend    = (*RPCBackend)(nil)
+	_ RawQueryer = (*RPCBackend)(nil)
+)
 
 // NewRPCBackend builds a remote-database backend whose connection is produced by
 // dial (call it repeatedly; each returns a fresh MsgConn -- e.g. a freshly
@@ -209,6 +212,93 @@ func (b *RPCBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*cl
 		}, nil
 	}
 	return b.queryTable(t, constraint, limit), nil
+}
+
+// QueryRaw makes RPCBackend a store.RawQueryer: it fetches matching ads as
+// old-ClassAd wire text (the dbrpc QueryRaw op) and rebuilds a collections.RawAd
+// from each by splitting lines -- no AST parse -- so the collector's unprojected
+// query fast path relays them. The collector connects privileged, so private
+// attributes arrive here and are redacted per-client upstream.
+func (b *RPCBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return nil, err
+		}
+		return func(yield func(collections.RawAd) bool) {
+			for at := AnyAd + 1; at < numAdTypes; at++ {
+				if at == StartdPvtAd {
+					continue
+				}
+				for ra := range b.queryRawTable(at, constraint, limit) {
+					if !yield(ra) {
+						return
+					}
+				}
+			}
+		}, nil
+	}
+	return b.queryRawTable(t, constraint, limit), nil
+}
+
+func (b *RPCBackend) queryRawTable(t AdType, constraint string, limit int) iter.Seq[collections.RawAd] {
+	return func(yield func(collections.RawAd) bool) {
+		cl, err := b.conn()
+		if err != nil {
+			return
+		}
+		rows, err := cl.QueryRawTable(t.String(), rpcConstraint(constraint), limit)
+		if err != nil {
+			b.drop()
+			return
+		}
+		for _, text := range rows {
+			if !yield(rawAdFromOldText(text)) {
+				return
+			}
+		}
+	}
+}
+
+// rawAdFromOldText rebuilds a collections.RawAd from old-ClassAd wire text: the
+// MyType/TargetType tag lines become the RawAd's type fields and every other
+// non-blank line is an expression, all without building an AST.
+func rawAdFromOldText(text string) collections.RawAd {
+	var ra collections.RawAd
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		switch strings.ToLower(rawLineName(line)) {
+		case "mytype":
+			ra.MyType = rawLineValue(line)
+		case "targettype":
+			ra.TargetType = rawLineValue(line)
+		default:
+			ra.Exprs = append(ra.Exprs, []byte(line))
+		}
+	}
+	return ra
+}
+
+// rawLineName returns the attribute name of a "Name = value" line.
+func rawLineName(line string) string {
+	if i := strings.IndexByte(line, '='); i >= 0 {
+		return strings.TrimSpace(line[:i])
+	}
+	return strings.TrimSpace(line)
+}
+
+// rawLineValue returns the value of a "Name = value" line, unquoted.
+func rawLineValue(line string) string {
+	i := strings.IndexByte(line, '=')
+	if i < 0 {
+		return ""
+	}
+	v := strings.TrimSpace(line[i+1:])
+	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+		v = v[1 : len(v)-1]
+	}
+	return v
 }
 
 func (b *RPCBackend) Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {

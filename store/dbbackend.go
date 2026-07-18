@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -27,7 +28,10 @@ type DBBackend struct {
 	defaultLifetime int64
 }
 
-var _ Backend = (*DBBackend)(nil)
+var (
+	_ Backend    = (*DBBackend)(nil)
+	_ RawQueryer = (*DBBackend)(nil)
+)
 
 // NewDBBackend opens (or creates) a persistent ad database under dir with one
 // table per storage AdType, reloading any ads a prior run persisted -- so a
@@ -69,15 +73,19 @@ func (b *DBBackend) Update(t AdType, ad *classad.ClassAd) error {
 	return tbl.Put(string(key), ad)
 }
 
-// UpdateOldText parses an ad from old-ClassAd wire text and stores it. Unlike the
-// in-memory backend it materializes a *classad.ClassAd (db stores ads, not the
-// raw wire form), so this path is a little heavier here.
+// UpdateOldText ingests an ad from old-ClassAd wire text via db.UpdateOld -- the
+// wire-native path, no AST -- stamping ATTR_LAST_HEARD_FROM into the text. (An
+// encrypted store takes the parse+seal path internally; see db.UpdateOld.)
 func (b *DBBackend) UpdateOldText(t AdType, text string) error {
-	ad, err := classad.ParseOld(text)
-	if err != nil {
-		return fmt.Errorf("collector: parse %s ad: %w", t, err)
+	tbl := b.tables[t]
+	if tbl == nil {
+		return fmt.Errorf("collector: %s is not a storage table", t)
 	}
-	return b.Update(t, ad)
+	key, ok := hashKeyFromText(t, text)
+	if !ok {
+		return fmt.Errorf("collector: %s ad has no Name/Machine to key on", t)
+	}
+	return tbl.UpdateOld(string(key), stampText(text, b.now()))
 }
 
 // UpdatePvt stores a startd's PRIVATE ad (keyed by the public ad's HashKey) in
@@ -86,28 +94,17 @@ func (b *DBBackend) UpdateOldText(t AdType, text string) error {
 // attributes (Name/MyAddress/MyType) are copied from the public ad so the private
 // ad is self-describing.
 func (b *DBBackend) UpdatePvt(publicText, pvtText string) error {
-	pubAd, err := classad.ParseOld(publicText)
-	if err != nil {
-		return fmt.Errorf("collector: parse startd ad: %w", err)
-	}
-	key, ok := HashKey(StartdAd, pubAd) // private ad shares the public ad's key
+	key, ok := hashKeyFromText(StartdAd, publicText)
 	if !ok {
 		return fmt.Errorf("collector: startd private ad's public ad has no Name to key on")
 	}
-	pvtAd, err := classad.ParseOld(pvtText)
-	if err != nil {
-		return fmt.Errorf("collector: parse startd private ad: %w", err)
+	// Copy identifying attributes from the public ad's text so the private ad is
+	// self-describing; wire-native, no AST (matches the in-memory backend).
+	header := copyAttrLines(publicText, attrName, attrMyAddress, attrMyType)
+	if !strings.HasSuffix(pvtText, "\n") {
+		pvtText += "\n"
 	}
-	for _, attr := range []string{attrName, attrMyAddress, attrMyType} {
-		if _, present := pvtAd.Lookup(attr); present {
-			continue
-		}
-		if e, ok := pubAd.Lookup(attr); ok {
-			pvtAd.InsertExpr(attr, e)
-		}
-	}
-	pvtAd.InsertAttr(attrLastHeardFrom, b.now())
-	return b.tables[StartdPvtAd].Put(string(key), pvtAd)
+	return b.tables[StartdPvtAd].UpdateOld(string(key), stampText(header+pvtText, b.now()))
 }
 
 // dbConstraint maps the Backend's "" (match everything) to the ClassAd expression
@@ -149,6 +146,39 @@ func (b *DBBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*cla
 		return nil, fmt.Errorf("collector: %s is not a storage table", t)
 	}
 	return tbl.Query(dbConstraint(constraint))
+}
+
+// QueryRaw makes DBBackend a store.RawQueryer: it yields matching ads in
+// wire-form (collections.RawAd, no AST) via db.QueryRaw, which decodes straight
+// from the (inline) stored records, so the collector's unprojected query fast
+// path relays them without materializing each ad.
+func (b *DBBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return nil, err
+		}
+		return func(yield func(collections.RawAd) bool) {
+			for at := AnyAd + 1; at < numAdTypes; at++ {
+				if at == StartdPvtAd {
+					continue
+				}
+				seq, err := b.tables[at].QueryRaw(dbConstraint(constraint))
+				if err != nil {
+					return
+				}
+				for ra := range seq {
+					if !yield(ra) {
+						return
+					}
+				}
+			}
+		}, nil
+	}
+	tbl := b.tables[t]
+	if tbl == nil {
+		return nil, fmt.Errorf("collector: %s is not a storage table", t)
+	}
+	return tbl.QueryRaw(dbConstraint(constraint))
 }
 
 // Get returns the ad stored under keyAd's key.
