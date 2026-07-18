@@ -52,25 +52,25 @@ func (c Config) logger() *slog.Logger {
 // NewEmbedded constructs an EmbeddedSource reading st directly. It validates
 // the constraint expressions up front so a bad constraint fails at
 // construction rather than mid-cycle.
-func NewEmbedded(st *store.Store, cfg Config) (*EmbeddedSource, error) {
+func NewEmbedded(st store.Backend, cfg Config) (*EmbeddedSource, error) {
 	if st == nil {
 		return nil, fmt.Errorf("source: embedded source requires a non-nil store")
 	}
-	slotQ, err := compileConstraint(cfg.SlotConstraint)
-	if err != nil {
+	// Validate the constraints up front so a bad one fails at construction, not
+	// mid-cycle; the backend re-compiles the strings when it queries.
+	if _, err := compileConstraint(cfg.SlotConstraint); err != nil {
 		return nil, fmt.Errorf("source: NEGOTIATOR_SLOT_CONSTRAINT %q: %w", cfg.SlotConstraint, err)
 	}
-	subQ, err := compileConstraint(cfg.SubmitterConstraint)
-	if err != nil {
+	if _, err := compileConstraint(cfg.SubmitterConstraint); err != nil {
 		return nil, fmt.Errorf("source: NEGOTIATOR_SUBMITTER_CONSTRAINT %q: %w", cfg.SubmitterConstraint, err)
 	}
 	return &EmbeddedSource{
-		store: st,
-		cfg:   cfg,
-		log:   cfg.logger(),
-		slotQ: slotQ,
-		subQ:  subQ,
-		defaultWeight: ParseSlotWeight(cfg.SlotWeightExpr),
+		store:          st,
+		cfg:            cfg,
+		log:            cfg.logger(),
+		slotConstraint: cfg.SlotConstraint,
+		subConstraint:  cfg.SubmitterConstraint,
+		defaultWeight:  ParseSlotWeight(cfg.SlotWeightExpr),
 	}, nil
 }
 

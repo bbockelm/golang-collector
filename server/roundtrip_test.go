@@ -36,6 +36,16 @@ func mustAd(tb testing.TB, s string) *classad.ClassAd {
 	return ad
 }
 
+// mustLen returns st.Len, failing the test on error.
+func mustLen(tb testing.TB, st *store.Store, at store.AdType) int {
+	tb.Helper()
+	n, err := st.Len(at)
+	if err != nil {
+		tb.Fatalf("Len(%v): %v", at, err)
+	}
+	return n
+}
+
 // startCollector stands up the collector server on a random localhost port.
 func startCollector(t *testing.T) (*store.Store, string, func()) {
 	return startCollectorFwd(t, nil)
@@ -131,14 +141,14 @@ func TestStartdPrivateAd(t *testing.T) {
 
 	// Give the server a moment to process both frames.
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && st.Len(store.StartdPvtAd) == 0 {
+	for time.Now().Before(deadline) && mustLen(t, st, store.StartdPvtAd) == 0 {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if got := st.Len(store.StartdAd); got != 1 {
+	if got := mustLen(t, st, store.StartdAd); got != 1 {
 		t.Fatalf("public table has %d ads, want 1", got)
 	}
-	if got := st.Len(store.StartdPvtAd); got != 1 {
+	if got := mustLen(t, st, store.StartdPvtAd); got != 1 {
 		t.Fatalf("private table has %d ads, want 1", got)
 	}
 	keyAd := mustAd(t, `[Name="slot1@a"; MyAddress="<1.2.3.4:5>"]`)
@@ -232,8 +242,8 @@ func TestViewForwarding(t *testing.T) {
 	}
 
 	// The ad should propagate to the view collector.
-	if !waitFor(2*time.Second, func() bool { return viewStore.Len(store.StartdAd) == 1 }) {
-		t.Fatalf("update not forwarded to view collector (view has %d ads)", viewStore.Len(store.StartdAd))
+	if !waitFor(2*time.Second, func() bool { return mustLen(t, viewStore, store.StartdAd) == 1 }) {
+		t.Fatalf("update not forwarded to view collector (view has %d ads)", mustLen(t, viewStore, store.StartdAd))
 	}
 
 	// Now invalidate on the primary; the view collector should drop it too.
@@ -241,8 +251,8 @@ func TestViewForwarding(t *testing.T) {
 	if err := col.Advertise(ctx, inv, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_STARTD_ADS}); err != nil {
 		t.Fatalf("invalidate on primary: %v", err)
 	}
-	if !waitFor(2*time.Second, func() bool { return viewStore.Len(store.StartdAd) == 0 }) {
-		t.Fatalf("invalidation not forwarded to view collector (view still has %d ads)", viewStore.Len(store.StartdAd))
+	if !waitFor(2*time.Second, func() bool { return mustLen(t, viewStore, store.StartdAd) == 0 }) {
+		t.Fatalf("invalidation not forwarded to view collector (view still has %d ads)", mustLen(t, viewStore, store.StartdAd))
 	}
 }
 

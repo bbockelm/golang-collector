@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"iter"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -9,6 +10,26 @@ import (
 	"github.com/bbockelm/golang-collector/negotiator/negtest"
 	"github.com/bbockelm/golang-collector/store"
 )
+
+// mustLen returns st.Len, failing the test on error.
+func mustLen(t *testing.T, st *store.Store, at store.AdType) int {
+	t.Helper()
+	n, err := st.Len(at)
+	if err != nil {
+		t.Fatalf("Len(%v): %v", at, err)
+	}
+	return n
+}
+
+// mustQueryAds runs a store query, failing the test on error.
+func mustQueryAds(t *testing.T, st *store.Store, at store.AdType, constraint string) iter.Seq[*classad.ClassAd] {
+	t.Helper()
+	seq, err := st.Query(at, constraint, 0)
+	if err != nil {
+		t.Fatalf("Query(%v, %q): %v", at, constraint, err)
+	}
+	return seq
+}
 
 func TestEmbeddedSnapshot_FlatPool(t *testing.T) {
 	st := store.New()
@@ -94,10 +115,10 @@ func TestEmbeddedSnapshot_FixupsFiltersClaims(t *testing.T) {
 	negtest.SeedStore(t, st, ads)
 
 	// Sanity: the private ad landed in the private table, not the public one.
-	if n := st.Len(store.StartdAd); n != 1 {
+	if n := mustLen(t, st, store.StartdAd); n != 1 {
 		t.Fatalf("public startd table = %d, want 1", n)
 	}
-	if n := st.Len(store.StartdPvtAd); n != 1 {
+	if n := mustLen(t, st, store.StartdPvtAd); n != 1 {
 		t.Fatalf("private startd table = %d, want 1", n)
 	}
 
@@ -173,7 +194,7 @@ func TestEmbeddedSnapshot_MutationIsolation(t *testing.T) {
 
 	// Re-read the store directly: the stored ad must be untouched.
 	found := false
-	for ad := range st.Query(store.StartdAd, nil) {
+	for ad := range mustQueryAds(t, st, store.StartdAd, "") {
 		name, _ := ad.EvaluateAttrString("Name")
 		if name != vname {
 			continue
@@ -208,7 +229,7 @@ MyAddress="<10.0.0.1:9618>"`)
 	if err := src.PublishNegotiatorAd(ctx, neg); err != nil {
 		t.Fatal(err)
 	}
-	if n := st.Len(store.NegotiatorAd); n != 1 {
+	if n := mustLen(t, st, store.NegotiatorAd); n != 1 {
 		t.Errorf("negotiator table = %d, want 1", n)
 	}
 
@@ -225,7 +246,7 @@ Priority=2.0`),
 	if err := src.PublishAccountingAds(ctx, acct); err != nil {
 		t.Fatal(err)
 	}
-	if n := st.Len(store.AccountingAd); n != 2 {
+	if n := mustLen(t, st, store.AccountingAd); n != 2 {
 		t.Errorf("accounting table = %d, want 2", n)
 	}
 }

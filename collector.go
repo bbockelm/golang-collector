@@ -89,7 +89,7 @@ type Config struct {
 type Collector struct {
 	cfg   Config
 	log   *slog.Logger
-	store *store.Store
+	store store.Backend
 	fwd   *server.Forwarder
 	srv   *cedarserver.Server
 }
@@ -146,10 +146,12 @@ func (c *Collector) RegisterOn(cs *cedarserver.Server) {
 // unset. Safe to call once.
 func (c *Collector) StartBackground(ctx context.Context) func() {
 	var stops []func()
-	if c.cfg.DictRetrainInterval > 0 {
+	// Dictionary retraining is an in-memory-backend optimization (store.Retrainer);
+	// a backend that manages its own storage (a database) does not implement it.
+	if r, ok := c.store.(store.Retrainer); ok && c.cfg.DictRetrainInterval > 0 {
 		c.log.Info("collector: dictionary auto-retraining enabled",
 			"interval", c.cfg.DictRetrainInterval.String(), "sample_size", c.cfg.DictSampleSize)
-		stops = append(stops, c.store.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
+		stops = append(stops, r.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
 	}
 	if c.cfg.ExpireInterval > 0 {
 		loopCtx, cancel := context.WithCancel(ctx)
@@ -173,7 +175,10 @@ func (c *Collector) expireLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n := c.store.Expire(); n > 0 {
+			n, err := c.store.Expire()
+			if err != nil {
+				c.log.Warn("collector: ad expiry sweep failed", "error", err)
+			} else if n > 0 {
 				c.log.Info("collector: reaped expired ads", "count", n)
 			}
 		}
@@ -193,9 +198,10 @@ func (c *Collector) ServeConn(ctx context.Context, conn net.Conn) error {
 	return c.srv.ServeConn(ctx, conn)
 }
 
-// Store returns the underlying ad store, for introspection and metrics
-// (Store().Stats() gives per-table ad counts and compressed byte footprints).
-func (c *Collector) Store() *store.Store { return c.store }
+// Store returns the underlying ad store backend, for introspection, metrics
+// (assert store.Statser for per-table counts/byte footprints), and the embedded
+// negotiator's in-process reads.
+func (c *Collector) Store() store.Backend { return c.store }
 
 // Server returns the Collector's internal cedar command server, for callers that
 // want to register additional commands (e.g. DC_* defaults) or set an Authorizer

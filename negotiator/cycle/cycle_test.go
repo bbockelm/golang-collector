@@ -178,7 +178,11 @@ func TestFlatCycleEndToEnd(t *testing.T) {
 
 			// Accounting ads were published back through the AdSource.
 			nAcct := 0
-			for range st.Query(store.AccountingAd, nil) {
+			acctSeq, err := st.Query(store.AccountingAd, "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range acctSeq {
 				nAcct++
 			}
 			if nAcct == 0 {

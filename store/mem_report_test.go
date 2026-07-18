@@ -39,7 +39,13 @@ func TestCollectorMemoryFootprint(t *testing.T) {
 	st := New()
 	reportFootprint(t, sample, func(i int, ad *classad.ClassAd) error {
 		return st.Update(StartdAd, ad)
-	}, func() int { return st.Len(StartdAd) }, st)
+	}, func() int {
+		n, err := st.Len(StartdAd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}, st)
 }
 
 // TestCollectionMemoryFootprintBare measures the same ads in a bare collection

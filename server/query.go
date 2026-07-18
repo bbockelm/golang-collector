@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // Query-ad attribute names (a subset of condor_attributes.h). The C++ tools use
@@ -19,23 +18,20 @@ const (
 )
 
 // parseQuery extracts the constraint, projection and result limit from a query
-// ad. A nil *vm.Query means "match everything" (an absent or literally-true
-// Requirements), which the store serves with a plain scan.
-func parseQuery(queryAd *classad.ClassAd) (q *vm.Query, projection []string, limit int, err error) {
+// ad. An empty constraint means "match everything" (an absent or literally-true
+// Requirements). The constraint is a ClassAd expression string handed to the
+// store, which compiles it (and reports any parse error) when the query runs.
+func parseQuery(queryAd *classad.ClassAd) (constraint string, projection []string, limit int) {
 	if expr, ok := queryAd.Lookup(attrRequirements); ok {
-		s := strings.TrimSpace(expr.String())
-		if s != "" && !strings.EqualFold(s, "true") {
-			q, err = vm.Parse(s)
-			if err != nil {
-				return nil, nil, 0, err
-			}
+		if s := strings.TrimSpace(expr.String()); !strings.EqualFold(s, "true") {
+			constraint = s
 		}
 	}
 	projection = parseProjection(queryAd)
 	if l, ok := queryAd.EvaluateAttrInt(attrLimitResults); ok && l > 0 {
 		limit = int(l)
 	}
-	return q, projection, limit, nil
+	return constraint, projection, limit
 }
 
 // parseSubQuery extracts the constraint, projection and limit for one target type
@@ -43,18 +39,15 @@ func parseQuery(queryAd *classad.ClassAd) (q *vm.Query, projection []string, lim
 // name (e.g. "MachineRequirements", "MachineProjection", "MachineLimitResults"),
 // falling back to the query's global Requirements/Projection/LimitResults. This
 // mirrors CondorQuery::convertToMulti on the client.
-func parseSubQuery(queryAd *classad.ClassAd, target string) (q *vm.Query, projection []string, limit int, err error) {
+func parseSubQuery(queryAd *classad.ClassAd, target string) (constraint string, projection []string, limit int) {
 	// Constraint: <target>Requirements, else global Requirements.
 	reqAttr := attrRequirements
 	if _, ok := queryAd.Lookup(target + attrRequirements); ok {
 		reqAttr = target + attrRequirements
 	}
 	if expr, ok := queryAd.Lookup(reqAttr); ok {
-		s := strings.TrimSpace(expr.String())
-		if s != "" && !strings.EqualFold(s, "true") {
-			if q, err = vm.Parse(s); err != nil {
-				return nil, nil, 0, err
-			}
+		if s := strings.TrimSpace(expr.String()); !strings.EqualFold(s, "true") {
+			constraint = s
 		}
 	}
 	// Projection: <target>Projection, else global.
@@ -69,7 +62,7 @@ func parseSubQuery(queryAd *classad.ClassAd, target string) (q *vm.Query, projec
 	} else if l, ok := queryAd.EvaluateAttrInt(attrLimitResults); ok && l > 0 {
 		limit = int(l)
 	}
-	return q, projection, limit, nil
+	return constraint, projection, limit
 }
 
 // parseProjection returns the attribute whitelist a query requests, or nil for

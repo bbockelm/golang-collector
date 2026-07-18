@@ -251,10 +251,37 @@ func (s *Store) Get(t AdType, ad *classad.ClassAd) (*classad.ClassAd, bool) {
 	return col.Get(key)
 }
 
-// Query yields every ad in table t matching constraint q (or all ads if q is
-// nil). For AnyAd it yields matches across all public tables. The caller applies
-// any result limit by stopping iteration.
-func (s *Store) Query(t AdType, q *vm.Query) iter.Seq[*classad.ClassAd] {
+// parseConstraint compiles a constraint string into a *vm.Query, treating "" and
+// a literal "true" as "match everything" (a nil query). It is the single place
+// the Backend's string constraints become the collection's compiled form.
+func parseConstraint(constraint string) (*vm.Query, error) {
+	s := strings.TrimSpace(constraint)
+	if s == "" || strings.EqualFold(s, "true") {
+		return nil, nil
+	}
+	q, err := vm.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("collector: constraint %q: %w", constraint, err)
+	}
+	return q, nil
+}
+
+// Query yields every ad in table t matching constraint (a ClassAd expression, or
+// "" for all ads). For AnyAd it yields matches across all public tables. limit is
+// accepted for the Backend contract but not enforced here -- the caller stops
+// iteration at the limit (the query handlers already do). It errors only if the
+// constraint does not parse.
+func (s *Store) Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+	q, err := parseConstraint(constraint)
+	if err != nil {
+		return nil, err
+	}
+	return s.query(t, q), nil
+}
+
+// query is the compiled-query core shared by Query (string) and in-process
+// callers that already hold a *vm.Query.
+func (s *Store) query(t AdType, q *vm.Query) iter.Seq[*classad.ClassAd] {
 	if t == AnyAd {
 		return func(yield func(*classad.ClassAd) bool) {
 			for at := AnyAd + 1; at < numAdTypes; at++ {
@@ -286,8 +313,17 @@ func (s *Store) queryOne(t AdType, q *vm.Query) iter.Seq[*classad.ClassAd] {
 // QueryRaw is Query, but yields each matching ad as collections.RawAd -- the
 // old-ClassAd expression strings decoded straight from the stored form with no
 // AST -- for streaming a result set to the wire via message.PutClassAdRaw. It is
-// used only when the query has no projection (raw ads are whole ads).
-func (s *Store) QueryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+// used only when the query has no projection (raw ads are whole ads). QueryRaw
+// makes Store a store.RawQueryer. limit is not enforced here (the caller stops).
+func (s *Store) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	q, err := parseConstraint(constraint)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryRaw(t, q), nil
+}
+
+func (s *Store) queryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
 	if t == AnyAd {
 		return func(yield func(collections.RawAd) bool) {
 			for at := AnyAd + 1; at < numAdTypes; at++ {
@@ -319,10 +355,14 @@ func (s *Store) queryOneRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
 // Invalidate removes ads from table t. If a constraint q is given, every ad it
 // matches is removed; otherwise the single ad identified by keyAd (by HashKey)
 // is removed. It returns the number of ads removed.
-func (s *Store) Invalidate(t AdType, q *vm.Query, keyAd *classad.ClassAd) int {
+func (s *Store) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
+	q, err := parseConstraint(constraint)
+	if err != nil {
+		return 0, err
+	}
 	col := s.cols[t]
 	if col == nil {
-		return 0
+		return 0, nil
 	}
 
 	// Determine the keys to remove: the single identified ad, or every ad the
@@ -331,7 +371,7 @@ func (s *Store) Invalidate(t AdType, q *vm.Query, keyAd *classad.ClassAd) int {
 	var keys [][]byte
 	if q == nil {
 		if keyAd == nil {
-			return 0
+			return 0, nil
 		}
 		if key, ok := HashKey(t, keyAd); ok {
 			keys = append(keys, key)
@@ -358,13 +398,15 @@ func (s *Store) Invalidate(t AdType, q *vm.Query, keyAd *classad.ClassAd) int {
 			pvt.Delete(key)
 		}
 	}
-	return n
+	return n, nil
 }
 
 // Expire removes ads whose ATTR_LAST_HEARD_FROM is older than their lifetime
 // (ATTR_CLASSAD_LIFETIME, or DefaultLifetime). It is meant to be called on a
-// timer. It returns the number of ads reaped.
-func (s *Store) Expire() int {
+// timer and at startup/shutdown. It returns the number of ads reaped. The error
+// is always nil for the in-memory backend (the Backend contract allows a
+// persistent backend's sweep to fail).
+func (s *Store) Expire() (int, error) {
 	now := s.now()
 	n := 0
 	for at := AnyAd + 1; at < numAdTypes; at++ {
@@ -394,13 +436,17 @@ func (s *Store) Expire() int {
 			}
 		}
 	}
-	return n
+	return n, nil
 }
 
 // Len returns the number of ads in table t.
-func (s *Store) Len(t AdType) int {
+func (s *Store) Len(t AdType) (int, error) {
 	if col := s.cols[t]; col != nil {
-		return col.Len()
+		return col.Len(), nil
 	}
-	return 0
+	return 0, nil
 }
+
+// Close releases the in-memory backend. It is a no-op (nothing to flush or
+// close), present to satisfy store.Backend.
+func (s *Store) Close() error { return nil }

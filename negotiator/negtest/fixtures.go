@@ -67,7 +67,7 @@ func LoadAds(tb testing.TB, path string) []*classad.ClassAd {
 // _forcePvt="true" attribute (test convenience) are routed to the StartdPvt
 // table instead. Unknown MyTypes are skipped. It fails the test on a store
 // error so fixtures with un-keyable ads are caught early.
-func SeedStore(tb testing.TB, st *store.Store, ads []*classad.ClassAd) {
+func SeedStore(tb testing.TB, st store.Backend, ads []*classad.ClassAd) {
 	tb.Helper()
 	for _, ad := range ads {
 		t, ok := tableFor(ad)

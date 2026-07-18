@@ -347,7 +347,7 @@ func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Co
 // $(SPOOL)/GoAccountant.log — the Go-native transaction-log format, NOT the
 // C++ Accountantnew.log ClassAdLog (whose importer is deferred; design doc
 // 3.4). Point the knob at a fresh path when migrating from a C++ negotiator.
-func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st *store.Store, pubAddr string) error {
+func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st store.Backend, pubAddr string) error {
 	if !configBool(cfg, "NEGOTIATOR_EMBEDDED", false) {
 		return nil
 	}
@@ -467,9 +467,16 @@ func metricsListenAddr(cfg *config.Config, flagAddr string) string {
 // startMetrics serves the collector's Prometheus metrics at /metrics on addr
 // until ctx is cancelled. Bind failures are logged, not fatal -- metrics are
 // observability, not core function.
-func startMetrics(ctx context.Context, addr string, st *store.Store, log *logging.Logger) {
+func startMetrics(ctx context.Context, addr string, st store.Backend, log *logging.Logger) {
+	// Per-table metrics come from store.Statser; a backend that doesn't expose
+	// them (e.g. a remote database) simply has no metrics endpoint.
+	statser, ok := st.(store.Statser)
+	if !ok {
+		log.Info(logging.DestinationGeneral, "metrics endpoint disabled: backend has no stats")
+		return
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler(st))
+	mux.Handle("/metrics", metrics.Handler(statser))
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")

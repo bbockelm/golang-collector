@@ -51,7 +51,7 @@ func TestWriteReuseStoresAll(t *testing.T) {
 			// The server processes ads asynchronously; poll briefly.
 			var got int
 			for i := 0; i < 200; i++ {
-				if got = st.Len(store.StartdAd); got == n {
+				if got = mustLen(t, st, store.StartdAd); got == n {
 					return
 				}
 				time.Sleep(5 * time.Millisecond)
