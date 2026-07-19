@@ -84,21 +84,34 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 		if err != nil {
 			return err
 		}
+		// The startd's public and private ads arrive in the SAME message
+		// (finishUpdate puts both under one end_of_message). Read the optional
+		// private ad now -- before storing the public one -- so the stream stays
+		// aligned for the next command even when a bad public ad is skipped below.
+		// io.EOF (empty pvt) means there is none.
+		pvt, havePvt := "", false
+		if t == store.StartdAd {
+			if p, perr := msg.GetClassAdRaw(ctx); perr == nil && p != "" {
+				pvt, havePvt = p, true
+			}
+		}
 		if err := st.UpdateOldText(ctx, t, text); err != nil {
-			slog.Warn("collector: dropped update", "type", t.String(), "err", err)
-			return err
+			// A single unparseable/rejected ad must not tear down the persistent
+			// command socket (which would drop every following update from this
+			// daemon) -- log the offending ad and skip it, keeping the session up.
+			slog.Warn("collector: rejected ad update; skipping (connection kept open)",
+				"type", t.String(), "name", store.AdName(text), "err", err, "ad", store.AdExcerpt(text))
+			return nil
 		}
 		// Relay the public ad to any CONDOR_VIEW_HOST collectors (never the
-		// private ad below -- claim ids must not leak to a monitoring collector).
+		// private ad -- claim ids must not leak to a monitoring collector). Only a
+		// stored (well-formed) ad is forwarded, so a bad ad cannot poison the
+		// downstream collector.
 		fwd.forwardText(cmd, text)
-		if t == store.StartdAd {
-			// The startd's public and private ads arrive in the SAME message
-			// (finishUpdate puts both under one end_of_message), so read the
-			// optional private ad from that same message; io.EOF means none.
-			if pvt, err := msg.GetClassAdRaw(ctx); err == nil && pvt != "" {
-				if err := st.UpdatePvt(ctx, text, pvt); err != nil {
-					return err
-				}
+		if havePvt {
+			if err := st.UpdatePvt(ctx, text, pvt); err != nil {
+				slog.Warn("collector: rejected private ad update; skipping (connection kept open)",
+					"type", t.String(), "name", store.AdName(text), "err", err, "ad", store.AdExcerpt(pvt))
 			}
 		}
 		return nil
