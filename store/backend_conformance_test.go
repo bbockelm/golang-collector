@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -46,7 +47,9 @@ var backends = map[string]backendFactory{
 			go func() { _ = srv.ServeConnOpts(dbrpc.NewStreamConn(sc), dbrpc.ServeOptions{IncludePrivate: true}) }()
 			return dbrpc.NewStreamConn(cc), nil
 		}
-		b := NewRPCBackend(context.Background(), dial)
+		b := NewRPCBackend(context.Background(), dial, RetryPolicy{
+			Initial: time.Millisecond, Max: 10 * time.Millisecond, Multiplier: 2, MaxElapsed: time.Second,
+		})
 		t.Cleanup(func() { _ = b.Close(); srv.Close(); _ = cat.Close() })
 		return b, func(n int64) { b.now = func() int64 { return n } }
 	},
@@ -63,7 +66,7 @@ func mustParse(t *testing.T, text string) *classad.ClassAd {
 
 func countAds(t *testing.T, b Backend, at AdType, constraint string) int {
 	t.Helper()
-	seq, err := b.Query(at, constraint, 0)
+	seq, err := b.Query(context.Background(), at, constraint, 0)
 	if err != nil {
 		t.Fatalf("query %s %q: %v", at, constraint, err)
 	}
@@ -93,12 +96,12 @@ func testUpdateQueryGetLen(t *testing.T, factory backendFactory) {
 		`Name = "slot1@a"` + "\n" + `State = "Unclaimed"` + "\n" + `Cpus = 4`,
 		`Name = "slot2@a"` + "\n" + `State = "Claimed"` + "\n" + `Cpus = 8`,
 	} {
-		if err := b.UpdateOldText(StartdAd, ad); err != nil {
+		if err := b.UpdateOldText(context.Background(), StartdAd, ad); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if n, _ := b.Len(StartdAd); n != 2 {
+	if n, _ := b.Len(context.Background(), StartdAd); n != 2 {
 		t.Fatalf("Len = %d, want 2", n)
 	}
 	if got := countAds(t, b, StartdAd, ""); got != 2 {
@@ -111,14 +114,14 @@ func testUpdateQueryGetLen(t *testing.T, factory backendFactory) {
 		t.Fatalf("query Cpus>5 = %d, want 1", got)
 	}
 	// AnyAd spans public tables.
-	if err := b.Update(ScheddAd, mustParse(t, `Name = "sched@a"`+"\n"+`MyType = "Scheduler"`)); err != nil {
+	if err := b.Update(context.Background(), ScheddAd, mustParse(t, `Name = "sched@a"`+"\n"+`MyType = "Scheduler"`)); err != nil {
 		t.Fatal(err)
 	}
 	if got := countAds(t, b, AnyAd, ""); got != 3 {
 		t.Fatalf("AnyAd query = %d, want 3", got)
 	}
 	// Get by key.
-	if ad, ok := b.Get(StartdAd, mustParse(t, `Name = "slot1@a"`)); !ok {
+	if ad, ok := b.Get(context.Background(), StartdAd, mustParse(t, `Name = "slot1@a"`)); !ok {
 		t.Fatal("Get slot1@a missing")
 	} else if s, _ := ad.EvaluateAttrString("State"); s != "Unclaimed" {
 		t.Fatalf("Get slot1@a State = %q, want Unclaimed", s)
@@ -132,13 +135,13 @@ func testInvalidate(t *testing.T, factory backendFactory) {
 		`Name = "slot2@a"` + "\n" + `State = "Claimed"`,
 		`Name = "slot3@a"` + "\n" + `State = "Unclaimed"`,
 	} {
-		if err := b.UpdateOldText(StartdAd, ad); err != nil {
+		if err := b.UpdateOldText(context.Background(), StartdAd, ad); err != nil {
 			t.Fatalf("update %d: %v", i, err)
 		}
 	}
 
 	// By constraint.
-	n, err := b.Invalidate(StartdAd, `State == "Unclaimed"`, nil)
+	n, err := b.Invalidate(context.Background(), StartdAd, `State == "Unclaimed"`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +153,7 @@ func testInvalidate(t *testing.T, factory backendFactory) {
 	}
 
 	// By key.
-	n, err = b.Invalidate(StartdAd, "", mustParse(t, `Name = "slot2@a"`))
+	n, err = b.Invalidate(context.Background(), StartdAd, "", mustParse(t, `Name = "slot2@a"`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,16 +171,16 @@ func testUpdatePvt(t *testing.T, factory backendFactory) {
 	pvt := `Capability = "secret-claim-id"` // Name copied from the public ad
 	// The real flow: the public ad is stored on its own, the private ad via
 	// UpdatePvt (which stores only the private ad, keyed by the public's key).
-	if err := b.UpdateOldText(StartdAd, pub); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, pub); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.UpdatePvt(pub, pvt); err != nil {
+	if err := b.UpdatePvt(context.Background(), pub, pvt); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := b.Len(StartdAd); n != 1 {
+	if n, _ := b.Len(context.Background(), StartdAd); n != 1 {
 		t.Fatalf("StartdAd len = %d, want 1", n)
 	}
-	if n, _ := b.Len(StartdPvtAd); n != 1 {
+	if n, _ := b.Len(context.Background(), StartdPvtAd); n != 1 {
 		t.Fatalf("StartdPvtAd len = %d, want 1", n)
 	}
 	// AnyAd never returns private ads.
@@ -185,16 +188,16 @@ func testUpdatePvt(t *testing.T, factory backendFactory) {
 		t.Fatalf("AnyAd returned %d ads, want 1 (private excluded)", got)
 	}
 	// The private channel is queryable directly and carries the claim id.
-	if ad, ok := b.Get(StartdPvtAd, mustParse(t, `Name = "slot1@a"`)); !ok {
+	if ad, ok := b.Get(context.Background(), StartdPvtAd, mustParse(t, `Name = "slot1@a"`)); !ok {
 		t.Fatal("private ad missing")
 	} else if c, _ := ad.EvaluateAttrString("Capability"); c != "secret-claim-id" {
 		t.Fatalf("private Capability = %q", c)
 	}
 	// Invalidating the public ad drops its private shadow too.
-	if _, err := b.Invalidate(StartdAd, "", mustParse(t, `Name = "slot1@a"`)); err != nil {
+	if _, err := b.Invalidate(context.Background(), StartdAd, "", mustParse(t, `Name = "slot1@a"`)); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := b.Len(StartdPvtAd); n != 0 {
+	if n, _ := b.Len(context.Background(), StartdPvtAd); n != 0 {
 		t.Fatalf("StartdPvtAd len = %d after invalidate, want 0 (shadow removed)", n)
 	}
 }
@@ -211,12 +214,12 @@ func testRawQuery(t *testing.T, factory backendFactory) {
 		`MyType = "Machine"` + "\n" + `Name = "slot1@a"` + "\n" + `State = "Idle"`,
 		`MyType = "Machine"` + "\n" + `Name = "slot2@a"` + "\n" + `State = "Busy"`,
 	} {
-		if err := b.UpdateOldText(StartdAd, ad); err != nil {
+		if err := b.UpdateOldText(context.Background(), StartdAd, ad); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	seq, err := rq.QueryRaw(StartdAd, "", 0)
+	seq, err := rq.QueryRaw(context.Background(), StartdAd, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +237,7 @@ func testRawQuery(t *testing.T, factory backendFactory) {
 		t.Fatalf("QueryRaw all = %d, want 2", all)
 	}
 
-	seq, err = rq.QueryRaw(StartdAd, `State == "Idle"`, 0)
+	seq, err = rq.QueryRaw(context.Background(), StartdAd, `State == "Idle"`, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,29 +255,29 @@ func testExpire(t *testing.T, factory backendFactory) {
 
 	setNow(1000)
 	// Two ads stamped at t=1000; one with a short lifetime, one with the default.
-	if err := b.UpdateOldText(StartdAd, `Name = "short@a"`+"\n"+`ClassAdLifetime = 60`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "short@a"`+"\n"+`ClassAdLifetime = 60`); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.UpdateOldText(StartdAd, `Name = "default@a"`); err != nil { // default lifetime 900
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "default@a"`); err != nil { // default lifetime 900
 		t.Fatal(err)
 	}
 
 	// Advance past the short lifetime but not the default: only the short one expires.
 	setNow(1000 + 61)
-	n, err := b.Expire()
+	n, err := b.Expire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
 		t.Fatalf("first expire removed %d, want 1 (the short-lived ad)", n)
 	}
-	if _, ok := b.Get(StartdAd, mustParse(t, `Name = "default@a"`)); !ok {
+	if _, ok := b.Get(context.Background(), StartdAd, mustParse(t, `Name = "default@a"`)); !ok {
 		t.Fatal("default-lifetime ad should survive the first sweep")
 	}
 
 	// Advance past the default lifetime: the second ad expires.
 	setNow(1000 + 901)
-	n, err = b.Expire()
+	n, err = b.Expire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

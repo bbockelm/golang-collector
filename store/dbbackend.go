@@ -37,11 +37,11 @@ var (
 // UpdateBatch applies a buffer of upserts, grouping ordinary ads by table into
 // one wire-native shard-commit each (db.UpdateOldBatch); private ads go through
 // UpdatePvt individually (they share the public ad's key).
-func (b *DBBackend) UpdateBatch(batch []PendingUpdate) error {
+func (b *DBBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) error {
 	byTable := make(map[AdType][]db.OldAdText)
 	for _, p := range batch {
 		if p.Pvt {
-			if err := b.UpdatePvt(p.Text, p.PvtText); err != nil {
+			if err := b.UpdatePvt(ctx, p.Text, p.PvtText); err != nil {
 				return err
 			}
 			continue
@@ -108,7 +108,7 @@ func newDBBackend(cfg db.CatalogConfig) (*DBBackend, error) {
 }
 
 // Update inserts or replaces ad in table t, stamping ATTR_LAST_HEARD_FROM.
-func (b *DBBackend) Update(t AdType, ad *classad.ClassAd) error {
+func (b *DBBackend) Update(ctx context.Context, t AdType, ad *classad.ClassAd) error {
 	tbl := b.tables[t]
 	if tbl == nil {
 		return fmt.Errorf("collector: %s is not a storage table", t)
@@ -124,7 +124,7 @@ func (b *DBBackend) Update(t AdType, ad *classad.ClassAd) error {
 // UpdateOldText ingests an ad from old-ClassAd wire text via db.UpdateOld -- the
 // wire-native path, no AST -- stamping ATTR_LAST_HEARD_FROM into the text. (An
 // encrypted store takes the parse+seal path internally; see db.UpdateOld.)
-func (b *DBBackend) UpdateOldText(t AdType, text string) error {
+func (b *DBBackend) UpdateOldText(ctx context.Context, t AdType, text string) error {
 	tbl := b.tables[t]
 	if tbl == nil {
 		return fmt.Errorf("collector: %s is not a storage table", t)
@@ -141,7 +141,7 @@ func (b *DBBackend) UpdateOldText(t AdType, text string) error {
 // ad; the caller stores the public ad separately via UpdateOldText. Identifying
 // attributes (Name/MyAddress/MyType) are copied from the public ad so the private
 // ad is self-describing.
-func (b *DBBackend) UpdatePvt(publicText, pvtText string) error {
+func (b *DBBackend) UpdatePvt(ctx context.Context, publicText, pvtText string) error {
 	key, ok := hashKeyFromText(StartdAd, publicText)
 	if !ok {
 		return fmt.Errorf("collector: startd private ad's public ad has no Name to key on")
@@ -167,7 +167,7 @@ func dbConstraint(constraint string) string {
 
 // Query yields ads in table t matching constraint (all if ""). For AnyAd it spans
 // every public table (never the private one).
-func (b *DBBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+func (b *DBBackend) Query(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
 	if t == AnyAd {
 		if _, err := parseConstraint(constraint); err != nil { // validate once, before iterating
 			return nil, err
@@ -200,7 +200,7 @@ func (b *DBBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*cla
 // wire-form (collections.RawAd, no AST) via db.QueryRaw, which decodes straight
 // from the (inline) stored records, so the collector's unprojected query fast
 // path relays them without materializing each ad.
-func (b *DBBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+func (b *DBBackend) QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
 	if t == AnyAd {
 		if _, err := parseConstraint(constraint); err != nil {
 			return nil, err
@@ -230,7 +230,7 @@ func (b *DBBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[c
 }
 
 // Get returns the ad stored under keyAd's key.
-func (b *DBBackend) Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
+func (b *DBBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
 	tbl := b.tables[t]
 	if tbl == nil {
 		return nil, false
@@ -245,7 +245,7 @@ func (b *DBBackend) Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, boo
 // Invalidate removes ads from table t: the single ad keyAd identifies (constraint
 // ""), else every ad matching constraint. A startd's private ad is removed with
 // its public ad.
-func (b *DBBackend) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
+func (b *DBBackend) Invalidate(ctx context.Context, t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
 	tbl := b.tables[t]
 	if tbl == nil {
 		return 0, nil
@@ -258,7 +258,7 @@ func (b *DBBackend) Invalidate(t AdType, constraint string, keyAd *classad.Class
 		if !ok {
 			return 0, nil
 		}
-		return b.deleteKey(t, string(key))
+		return b.deleteKey(ctx, t, string(key))
 	}
 	// Non-startd tables have no private shadow, so the bulk delete-by-constraint
 	// pushdown removes the whole match set in one call.
@@ -292,7 +292,7 @@ func (b *DBBackend) Invalidate(t AdType, constraint string, keyAd *classad.Class
 }
 
 // deleteKey removes key from table t and, for the startd table, its private shadow.
-func (b *DBBackend) deleteKey(t AdType, key string) (int, error) {
+func (b *DBBackend) deleteKey(ctx context.Context, t AdType, key string) (int, error) {
 	removed, err := b.tables[t].Delete(key)
 	if err != nil {
 		return 0, err
@@ -352,7 +352,7 @@ func dbToCollectionsWatch(seq iter.Seq[db.WatchEvent]) iter.Seq[collections.Watc
 // db bulk delete-by-constraint pushdown (now > LastHeardFrom + lifetime) so the
 // sweep runs inside the store rather than scanning ads out to the collector. Ads
 // with no LastHeardFrom never match, so they are never expired (as in-memory).
-func (b *DBBackend) Expire() (int, error) {
+func (b *DBBackend) Expire(ctx context.Context) (int, error) {
 	now := b.now()
 	constraint := fmt.Sprintf("%d > %s + ifThenElse(%s =!= undefined, %s, %d)",
 		now, attrLastHeardFrom, attrClassAdLifetime, attrClassAdLifetime, b.defaultLifetime)
@@ -368,7 +368,7 @@ func (b *DBBackend) Expire() (int, error) {
 }
 
 // Len returns the number of ads in table t.
-func (b *DBBackend) Len(t AdType) (int, error) {
+func (b *DBBackend) Len(ctx context.Context, t AdType) (int, error) {
 	tbl := b.tables[t]
 	if tbl == nil {
 		return 0, nil

@@ -61,7 +61,7 @@ func startLargeGoCollector(tb testing.TB, n int) (string, func()) {
 	tb.Helper()
 	st := store.New()
 	for _, ad := range loadLargeAds(tb, n) {
-		if err := st.Update(store.StartdAd, ad); err != nil {
+		if err := st.Update(context.Background(), store.StartdAd, ad); err != nil {
 			tb.Fatal(err)
 		}
 	}

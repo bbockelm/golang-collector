@@ -84,7 +84,7 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 		if err != nil {
 			return err
 		}
-		if err := st.UpdateOldText(t, text); err != nil {
+		if err := st.UpdateOldText(ctx, t, text); err != nil {
 			slog.Warn("collector: dropped update", "type", t.String(), "err", err)
 			return err
 		}
@@ -96,7 +96,7 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 			// (finishUpdate puts both under one end_of_message), so read the
 			// optional private ad from that same message; io.EOF means none.
 			if pvt, err := msg.GetClassAdRaw(ctx); err == nil && pvt != "" {
-				if err := st.UpdatePvt(text, pvt); err != nil {
+				if err := st.UpdatePvt(ctx, text, pvt); err != nil {
 					return err
 				}
 			}
@@ -127,7 +127,7 @@ func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarser
 		if err != nil {
 			return err
 		}
-		if err := store.DurableUpdate(st, t, text); err != nil {
+		if err := store.DurableUpdate(ctx, st, t, text); err != nil {
 			return err
 		}
 		fwd.forwardText(commands.UPDATE_STARTD_AD, text)
@@ -166,7 +166,7 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
 		if len(projection) == 0 && rawOK {
-			raw, err := rq.QueryRaw(t, constraint, limit)
+			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
 			if err != nil {
 				return err
 			}
@@ -187,7 +187,7 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 				n++
 			}
 		} else {
-			ads, err := st.Query(t, constraint, limit)
+			ads, err := st.Query(ctx, t, constraint, limit)
 			if err != nil {
 				return err
 			}
@@ -239,7 +239,7 @@ func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 			// claim caps through the dedicated QUERY_STARTD_PVT_ADS command), so every
 			// response here is redacted.
 			redact := adType != store.StartdPvtAd
-			ads, err := st.Query(adType, constraint, limit)
+			ads, err := st.Query(ctx, adType, constraint, limit)
 			if err != nil {
 				return err
 			}
@@ -330,11 +330,11 @@ func invalidateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder
 		}
 		constraint, _, _ := parseQuery(ad)
 		if constraint == "" {
-			if _, err := st.Invalidate(t, "", ad); err != nil {
+			if _, err := st.Invalidate(ctx, t, "", ad); err != nil {
 				return err
 			}
 		} else {
-			if _, err := st.Invalidate(t, constraint, nil); err != nil {
+			if _, err := st.Invalidate(ctx, t, constraint, nil); err != nil {
 				return err
 			}
 		}

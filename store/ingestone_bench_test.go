@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // BenchmarkIngestOneAd ingests one real AddressV1-bearing ad repeatedly (no
 // MarshalOld in the timed loop), so -benchmem shows the true per-ad ingest cost.
@@ -20,11 +23,11 @@ func BenchmarkIngestOneAd(b *testing.B) {
 		b.Skip("no AddressV1 ad in corpus")
 	}
 	st := New()
-	_ = st.UpdateOldText(StartdAd, text)
+	_ = st.UpdateOldText(context.Background(), StartdAd, text)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := st.UpdateOldText(StartdAd, text); err != nil {
+		if err := st.UpdateOldText(context.Background(), StartdAd, text); err != nil {
 			b.Fatal(err)
 		}
 	}

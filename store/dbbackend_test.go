@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"testing"
 )
 
@@ -14,10 +15,10 @@ func TestDBBackendPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b1.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`+"\n"+`Cpus = 8`); err != nil {
+	if err := b1.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`+"\n"+`Cpus = 8`); err != nil {
 		t.Fatal(err)
 	}
-	if err := b1.UpdatePvt(`Name = "slot1@a"`, `Capability = "claim-xyz"`); err != nil {
+	if err := b1.UpdatePvt(context.Background(), `Name = "slot1@a"`, `Capability = "claim-xyz"`); err != nil {
 		t.Fatal(err)
 	}
 	if err := b1.Close(); err != nil {
@@ -31,20 +32,20 @@ func TestDBBackendPersistence(t *testing.T) {
 	}
 	defer func() { _ = b2.Close() }()
 
-	if n, _ := b2.Len(StartdAd); n != 1 {
+	if n, _ := b2.Len(context.Background(), StartdAd); n != 1 {
 		t.Fatalf("after restart StartdAd len = %d, want 1", n)
 	}
-	if n, _ := b2.Len(StartdPvtAd); n != 1 {
+	if n, _ := b2.Len(context.Background(), StartdPvtAd); n != 1 {
 		t.Fatalf("after restart StartdPvtAd len = %d, want 1", n)
 	}
-	ad, ok := b2.Get(StartdAd, mustParse(t, `Name = "slot1@a"`))
+	ad, ok := b2.Get(context.Background(), StartdAd, mustParse(t, `Name = "slot1@a"`))
 	if !ok {
 		t.Fatal("ad missing after restart")
 	}
 	if c, _ := ad.EvaluateAttrInt("Cpus"); c != 8 {
 		t.Fatalf("Cpus = %d after restart, want 8", c)
 	}
-	pvt, ok := b2.Get(StartdPvtAd, mustParse(t, `Name = "slot1@a"`))
+	pvt, ok := b2.Get(context.Background(), StartdPvtAd, mustParse(t, `Name = "slot1@a"`))
 	if !ok {
 		t.Fatal("private ad missing after restart")
 	}
@@ -64,7 +65,7 @@ func TestDBBackendStartupExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	b1.now = func() int64 { return 1000 } // stamp LastHeardFrom = 1000
-	if err := b1.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`ClassAdLifetime = 300`); err != nil {
+	if err := b1.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`ClassAdLifetime = 300`); err != nil {
 		t.Fatal(err)
 	}
 	if err := b1.Close(); err != nil {
@@ -80,7 +81,7 @@ func TestDBBackendStartupExpiry(t *testing.T) {
 	// Reopen well after the ad's lifetime elapsed (as if the collector was down a
 	// long time): the startup sweep prunes it.
 	b2.now = func() int64 { return 1000 + 301 }
-	n, err := b2.Expire()
+	n, err := b2.Expire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

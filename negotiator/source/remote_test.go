@@ -58,7 +58,7 @@ func startTestCollector(t *testing.T, st *store.Store) (string, func()) {
 func seedRemotePool(t *testing.T, st *store.Store) {
 	t.Helper()
 	seed := func(tbl store.AdType, s string) {
-		if err := st.Update(tbl, mustOld(t, s)); err != nil {
+		if err := st.Update(context.Background(), tbl, mustOld(t, s)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -237,11 +237,11 @@ Priority=2.0`),
 func waitForLen(st *store.Store, t store.AdType, want int) bool {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if n, err := st.Len(t); err == nil && n == want {
+		if n, err := st.Len(context.Background(), t); err == nil && n == want {
 			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	n, err := st.Len(t)
+	n, err := st.Len(context.Background(), t)
 	return err == nil && n == want
 }

@@ -1,6 +1,7 @@
 package negtest
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -74,7 +75,7 @@ func SeedStore(tb testing.TB, st store.Backend, ads []*classad.ClassAd) {
 		if !ok {
 			continue
 		}
-		if err := st.Update(t, ad); err != nil {
+		if err := st.Update(context.Background(), t, ad); err != nil {
 			name, _ := ad.EvaluateAttrString("Name")
 			tb.Fatalf("seed %s ad %q: %v", t, name, err)
 		}

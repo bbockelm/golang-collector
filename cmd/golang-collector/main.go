@@ -584,8 +584,10 @@ func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, e
 		if !ok || strings.TrimSpace(addr) == "" {
 			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the external database daemon's address)", kind)
 		}
-		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR", "host", addr)
-		return store.NewRPCBackend(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr))), nil
+		policy := dbRetryPolicy(cfg)
+		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR",
+			"host", addr, "retry_max_elapsed", policy.MaxElapsed.String())
+		return store.NewRPCBackend(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr)), policy), nil
 	default:
 		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"embedded\", or \"db\")", kind)
 	}
@@ -688,4 +690,27 @@ func configInt(cfg *config.Config, key string, def int) int {
 		}
 	}
 	return def
+}
+
+func configFloat(cfg *config.Config, key string, def float64) float64 {
+	if v, ok := cfg.Get(key); ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
+			return f
+		}
+	}
+	return def
+}
+
+// dbRetryPolicy builds the external-database retry/backoff policy from config. The
+// budget (COLLECTOR_DB_RETRY_MAX_ELAPSED) is a duration in seconds -- how long one
+// operation rides out an outage before giving up (drop + log for a buffered write);
+// the backoff shape is sub-second and expressed in milliseconds.
+func dbRetryPolicy(cfg *config.Config) store.RetryPolicy {
+	p := store.DefaultRetryPolicy
+	p.MaxElapsed = configSeconds(cfg, "COLLECTOR_DB_RETRY_MAX_ELAPSED", p.MaxElapsed)
+	p.Initial = time.Duration(configInt(cfg, "COLLECTOR_DB_RETRY_INITIAL_MS", int(p.Initial/time.Millisecond))) * time.Millisecond
+	p.Max = time.Duration(configInt(cfg, "COLLECTOR_DB_RETRY_MAX_MS", int(p.Max/time.Millisecond))) * time.Millisecond
+	p.Multiplier = configFloat(cfg, "COLLECTOR_DB_RETRY_MULTIPLIER", p.Multiplier)
+	p.Jitter = configFloat(cfg, "COLLECTOR_DB_RETRY_JITTER", p.Jitter)
+	return p
 }

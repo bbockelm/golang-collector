@@ -55,10 +55,10 @@ func TestWatchAdsFilter(t *testing.T) {
 	// A non-matching ad (Cpus=4) must produce no event; a matching ad (Cpus=8)
 	// must arrive as an Upsert. Store the non-matching one first: if it leaked, it
 	// would be the next event instead of w1.
-	if err := st.Update(store.StartdAd, small); err != nil {
+	if err := st.Update(context.Background(), store.StartdAd, small); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Update(store.StartdAd, big); err != nil {
+	if err := st.Update(context.Background(), store.StartdAd, big); err != nil {
 		t.Fatal(err)
 	}
 	up := next()
@@ -72,7 +72,7 @@ func TestWatchAdsFilter(t *testing.T) {
 	// Update w1 so it no longer matches (Cpus 8 -> 2): the filtered stream must
 	// convert this to a Delete so the client drops it.
 	demoted := mustAd(t, `[MyType="Machine"; Name="w1"; MyAddress="<1.2.3.4:9618>"; Cpus=2; State="Unclaimed"; Activity="Idle"]`)
-	if err := st.Update(store.StartdAd, demoted); err != nil {
+	if err := st.Update(context.Background(), store.StartdAd, demoted); err != nil {
 		t.Fatal(err)
 	}
 	del := next()

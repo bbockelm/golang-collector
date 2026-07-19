@@ -26,30 +26,35 @@ import (
 // assertion: RawQueryer (a wire-form query fast path), Retrainer (dictionary
 // compression maintenance), Statser (introspection metrics). A backend that does
 // not implement one simply loses that optimization/feature, never correctness.
+// Every I/O method takes a context.Context as its first argument: for a remote
+// backend (RPCBackend) it bounds and cancels the operation -- there are no implicit
+// timeouts, the deadline is exactly what the caller passes -- and drives retry over
+// a transient database outage. Local backends (the in-memory Store, the embedded
+// DBBackend) accept it for interface uniformity and honor cancellation where cheap.
 type Backend interface {
 	// Update inserts or replaces ad in table t, stamping ATTR_LAST_HEARD_FROM.
 	// It errors if the ad has no name/machine to key on.
-	Update(t AdType, ad *classad.ClassAd) error
+	Update(ctx context.Context, t AdType, ad *classad.ClassAd) error
 	// UpdateOldText ingests an ad from old-ClassAd wire text (the socket form),
 	// stamping ATTR_LAST_HEARD_FROM, without building an intermediate ClassAd.
-	UpdateOldText(t AdType, text string) error
+	UpdateOldText(ctx context.Context, t AdType, text string) error
 	// UpdatePvt ingests a startd's public + private ads (both keyed alike) from
 	// their old-ClassAd wire texts.
-	UpdatePvt(publicText, pvtText string) error
+	UpdatePvt(ctx context.Context, publicText, pvtText string) error
 
 	// Query yields every ad in table t matching constraint (all ads if
 	// constraint is ""). For AnyAd it yields matches across all public tables.
 	// limit > 0 caps the result count (a hint backends may push down; callers
 	// must still honor it). It errors only if constraint does not parse.
-	Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error)
+	Query(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error)
 
 	// Get returns the ad stored under keyAd's key.
-	Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool)
+	Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool)
 
 	// Invalidate removes ads from table t: the single ad keyAd identifies when
 	// constraint is "", otherwise every ad matching constraint. Returns the count
 	// removed. A startd's private ad is removed alongside its public ad.
-	Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error)
+	Invalidate(ctx context.Context, t AdType, constraint string, keyAd *classad.ClassAd) (int, error)
 
 	// Watch streams changes to table t as a resumable subscription: a nil cursor
 	// replays from the start, a cursor from a prior WatchSynced event resumes. A
@@ -61,10 +66,10 @@ type Backend interface {
 	// Expire removes every ad whose ATTR_LAST_HEARD_FROM + lifetime has passed
 	// (ATTR_CLASSAD_LIFETIME, or DefaultLifetime), across all tables. Returns the
 	// count reaped. Meant to be called on a timer and at startup/shutdown.
-	Expire() (int, error)
+	Expire(ctx context.Context) (int, error)
 
 	// Len returns the number of ads in table t.
-	Len(t AdType) (int, error)
+	Len(ctx context.Context, t AdType) (int, error)
 
 	// Close flushes and releases the backend (a persistent backend syncs and
 	// closes its database; the in-memory backend is a no-op). After Close the
@@ -79,7 +84,7 @@ type Backend interface {
 // each ad. The in-memory backend implements it; backends whose results arrive as
 // materialized ads or remote text do not, and the server falls back to Query.
 type RawQueryer interface {
-	QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error)
+	QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error)
 }
 
 // Retrainer is an optional Backend capability: periodic maintenance of the

@@ -64,12 +64,12 @@ func TestPublicQueryRedactsPrivate(t *testing.T) {
 
 	// A public startd ad that (as a misbehaving/compat sender might) carries a
 	// secret directly in the public table.
-	if err := st.Update(store.StartdAd, mustAd(t,
+	if err := st.Update(context.Background(), store.StartdAd, mustAd(t,
 		`[MyType="Machine"; Name="slot1@h"; MyAddress="<1.2.3.4:5>"; Cpus=8; ClaimId="SECRET-XYZ"; Capability="CAP-XYZ"]`)); err != nil {
 		t.Fatal(err)
 	}
 	// And the legitimate private ad in the private table.
-	if err := st.Update(store.StartdPvtAd, mustAd(t,
+	if err := st.Update(context.Background(), store.StartdPvtAd, mustAd(t,
 		`[MyType="Machine"; Name="slot1@h"; MyAddress="<1.2.3.4:5>"; ClaimId="SECRET-XYZ"]`)); err != nil {
 		t.Fatal(err)
 	}

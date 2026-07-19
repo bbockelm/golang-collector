@@ -484,7 +484,7 @@ func TestEmbeddedNegotiatorSmoke(t *testing.T) {
 		machineAd(t, "slot1@ep.test", 4),
 		submitterAd("alice@pool.test", "schedd.test", sched.Addr(), 1),
 	})
-	if err := st.Update(store.StartdPvtAd, pvtAd("slot1@ep.test", "claim-secret-xyz")); err != nil {
+	if err := st.Update(context.Background(), store.StartdPvtAd, pvtAd("slot1@ep.test", "claim-secret-xyz")); err != nil {
 		t.Fatal(err)
 	}
 

@@ -16,7 +16,7 @@ import (
 // one per ad. A database backend implements it; the in-memory backend does not
 // need it (BufferedBackend requires it).
 type BatchWriter interface {
-	UpdateBatch(batch []PendingUpdate) error
+	UpdateBatch(ctx context.Context, batch []PendingUpdate) error
 }
 
 // PendingUpdate is one buffered ad upsert: an ad in old-ClassAd wire text for a
@@ -80,17 +80,17 @@ var (
 // so a BufferedBackend -- which normally defers writes into its Nagle buffer --
 // still acknowledges only after the write is committed, never merely buffered.
 type DurableUpdater interface {
-	UpdateOldTextDurable(t AdType, text string) error
+	UpdateOldTextDurable(ctx context.Context, t AdType, text string) error
 }
 
 // DurableUpdate applies text to st and returns only once it is durable: through
 // DurableUpdater when the backend provides it, else a plain UpdateOldText (already
 // synchronous for unbuffered backends).
-func DurableUpdate(st Backend, t AdType, text string) error {
+func DurableUpdate(ctx context.Context, st Backend, t AdType, text string) error {
 	if du, ok := st.(DurableUpdater); ok {
-		return du.UpdateOldTextDurable(t, text)
+		return du.UpdateOldTextDurable(ctx, t, text)
 	}
-	return st.UpdateOldText(t, text)
+	return st.UpdateOldText(ctx, t, text)
 }
 
 // NewBufferedBackend wraps under (which must implement BatchWriter) with a buffer
@@ -131,15 +131,16 @@ func (b *BufferedBackend) run() {
 		case <-b.stop:
 			return
 		case <-t.C:
-			if err := b.flush(); err != nil {
-				b.log(err)
-			}
+			// The background flush is not tied to a request, so it uses a background
+			// context: the underlying backend's own retry budget bounds it. A failure
+			// here is already logged/handled by flush.
+			_ = b.flush(context.Background())
 		}
 	}
 }
 
 // enqueue buffers p, flushing synchronously if the buffer is full.
-func (b *BufferedBackend) enqueue(p PendingUpdate) error {
+func (b *BufferedBackend) enqueue(ctx context.Context, p PendingUpdate) error {
 	k, ok := p.dedupKey()
 	if !ok {
 		return fmt.Errorf("collector: %s ad has no Name/Machine to key on", p.Type)
@@ -149,109 +150,136 @@ func (b *BufferedBackend) enqueue(p PendingUpdate) error {
 	full := len(b.buf) >= b.maxBuf
 	b.mu.Unlock()
 	if full {
-		return b.flush()
+		return b.flush(ctx)
 	}
 	return nil
 }
 
-// flush drains the buffer and applies it as one batch. The map is swapped out
-// under the lock so writers are not blocked during the (possibly remote) apply.
-func (b *BufferedBackend) flush() error {
+// flush drains the buffer and applies it as one batch under ctx. The map is swapped
+// out under the lock so writers are not blocked during the (possibly remote) apply.
+//
+// On failure the ads are not silently lost. If ctx cut the apply short (a
+// read-triggered flush carrying a caller's short deadline), the ads are re-enqueued
+// so the background flusher retries them with a full budget -- a newer update for
+// the same ad that arrived meanwhile wins. Any other failure means the underlying
+// backend already exhausted its retry budget (or hit a permanent error), so the ads
+// are dropped with a log, per the bounded-retry policy (daemons re-advertise).
+func (b *BufferedBackend) flush(ctx context.Context) error {
 	b.mu.Lock()
 	if len(b.buf) == 0 {
 		b.mu.Unlock()
 		return nil
 	}
 	batch := make([]PendingUpdate, 0, len(b.buf))
-	for _, p := range b.buf {
+	keys := make([]dedupKey, 0, len(b.buf))
+	for k, p := range b.buf {
 		batch = append(batch, p)
+		keys = append(keys, k)
 	}
 	b.buf = make(map[dedupKey]PendingUpdate)
 	b.mu.Unlock()
-	return b.bw.UpdateBatch(batch)
+
+	err := b.bw.UpdateBatch(ctx, batch)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		// Caller's deadline cut this flush short; keep the ads for the background
+		// flusher, without clobbering any newer update that arrived during the apply.
+		b.mu.Lock()
+		for i, k := range keys {
+			if _, newer := b.buf[k]; !newer {
+				b.buf[k] = batch[i]
+			}
+		}
+		b.mu.Unlock()
+		return err
+	}
+	b.log(fmt.Errorf("collector: dropping %d buffered ad update(s) after retry budget exhausted: %w", len(batch), err))
+	return err
 }
 
 // --- buffered write paths ---
 
-func (b *BufferedBackend) UpdateOldText(t AdType, text string) error {
-	return b.enqueue(PendingUpdate{Type: t, Text: text})
+func (b *BufferedBackend) UpdateOldText(ctx context.Context, t AdType, text string) error {
+	return b.enqueue(ctx, PendingUpdate{Type: t, Text: text})
 }
 
-func (b *BufferedBackend) UpdatePvt(publicText, pvtText string) error {
-	return b.enqueue(PendingUpdate{Type: StartdAd, Text: publicText, PvtText: pvtText, Pvt: true})
+func (b *BufferedBackend) UpdatePvt(ctx context.Context, publicText, pvtText string) error {
+	return b.enqueue(ctx, PendingUpdate{Type: StartdAd, Text: publicText, PvtText: pvtText, Pvt: true})
 }
 
 // UpdateOldTextDurable flushes any buffered writes (so an earlier buffered update
 // of the same ad cannot overwrite this one) and applies text synchronously through
 // the underlying backend, returning only once it is committed. The ACK-update path
 // uses it so the acknowledgment follows durability, not mere buffering.
-func (b *BufferedBackend) UpdateOldTextDurable(t AdType, text string) error {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) UpdateOldTextDurable(ctx context.Context, t AdType, text string) error {
+	if err := b.flush(ctx); err != nil {
 		return err
 	}
-	return b.Backend.UpdateOldText(t, text)
+	return b.Backend.UpdateOldText(ctx, t, text)
 }
 
 // --- flush-then-passthrough paths (consistency) ---
 
-func (b *BufferedBackend) Update(t AdType, ad *classad.ClassAd) error {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Update(ctx context.Context, t AdType, ad *classad.ClassAd) error {
+	if err := b.flush(ctx); err != nil {
 		return err
 	}
-	return b.Backend.Update(t, ad)
+	return b.Backend.Update(ctx, t, ad)
 }
 
-func (b *BufferedBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Query(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+	if err := b.flush(ctx); err != nil {
 		return nil, err
 	}
-	return b.Backend.Query(t, constraint, limit)
+	return b.Backend.Query(ctx, t, constraint, limit)
 }
 
-func (b *BufferedBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	if err := b.flush(ctx); err != nil {
 		return nil, err
 	}
 	rq, ok := b.Backend.(RawQueryer)
 	if !ok {
 		return nil, fmt.Errorf("collector: backend %T has no raw query", b.Backend)
 	}
-	return rq.QueryRaw(t, constraint, limit)
+	return rq.QueryRaw(ctx, t, constraint, limit)
 }
 
-func (b *BufferedBackend) Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
+	if err := b.flush(ctx); err != nil {
 		return nil, false
 	}
-	return b.Backend.Get(t, keyAd)
+	return b.Backend.Get(ctx, t, keyAd)
 }
 
-func (b *BufferedBackend) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Invalidate(ctx context.Context, t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
+	if err := b.flush(ctx); err != nil {
 		return 0, err
 	}
-	return b.Backend.Invalidate(t, constraint, keyAd)
+	return b.Backend.Invalidate(ctx, t, constraint, keyAd)
 }
 
 func (b *BufferedBackend) Watch(ctx context.Context, t AdType, cursor []byte, constraint string) (iter.Seq[collections.WatchEvent], error) {
-	if err := b.flush(); err != nil {
+	if err := b.flush(ctx); err != nil {
 		return nil, err
 	}
 	return b.Backend.Watch(ctx, t, cursor, constraint)
 }
 
-func (b *BufferedBackend) Expire() (int, error) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Expire(ctx context.Context) (int, error) {
+	if err := b.flush(ctx); err != nil {
 		return 0, err
 	}
-	return b.Backend.Expire()
+	return b.Backend.Expire(ctx)
 }
 
-func (b *BufferedBackend) Len(t AdType) (int, error) {
-	if err := b.flush(); err != nil {
+func (b *BufferedBackend) Len(ctx context.Context, t AdType) (int, error) {
+	if err := b.flush(ctx); err != nil {
 		return 0, err
 	}
-	return b.Backend.Len(t)
+	return b.Backend.Len(ctx, t)
 }
 
 // Close stops the flusher, drains the buffer, and closes the underlying backend.
@@ -260,7 +288,9 @@ func (b *BufferedBackend) Close() error {
 		close(b.stop)
 		b.wg.Wait()
 	}
-	ferr := b.flush()
+	// Final drain on shutdown: a background context, bounded by the underlying
+	// backend's own retry budget.
+	ferr := b.flush(context.Background())
 	cerr := b.Backend.Close()
 	if ferr != nil {
 		return ferr

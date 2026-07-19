@@ -56,7 +56,7 @@ func TestWatchAdsEndToEnd(t *testing.T) {
 	// Live: store an ad -> an Upsert carrying that ad and a live cursor.
 	ad := benchAd(1)
 	wantName, _ := ad.EvaluateAttrString("Name")
-	if err := st.Update(store.StartdAd, ad); err != nil {
+	if err := st.Update(context.Background(), store.StartdAd, ad); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	up := next()

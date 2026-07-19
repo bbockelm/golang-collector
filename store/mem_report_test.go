@@ -2,6 +2,7 @@ package store
 
 import (
 	"compress/gzip"
+	"context"
 	"io"
 	"math/rand"
 	"os"
@@ -38,9 +39,9 @@ func TestCollectorMemoryFootprint(t *testing.T) {
 	sample := loadStartdCorpus(t)
 	st := New()
 	reportFootprint(t, sample, func(i int, ad *classad.ClassAd) error {
-		return st.Update(StartdAd, ad)
+		return st.Update(context.Background(), StartdAd, ad)
 	}, func() int {
-		n, err := st.Len(StartdAd)
+		n, err := st.Len(context.Background(), StartdAd)
 		if err != nil {
 			t.Fatal(err)
 		}

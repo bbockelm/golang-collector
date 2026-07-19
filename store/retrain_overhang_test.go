@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"math/rand"
 	"runtime"
 	"runtime/debug"
@@ -29,7 +30,7 @@ func TestRetrainMemoryOverhang(t *testing.T) {
 	st := New()
 	rng := rand.New(rand.NewSource(1))
 	for i := 0; i < n; i++ {
-		if err := st.Update(StartdAd, mutate(sample[i%len(sample)], i, rng)); err != nil {
+		if err := st.Update(context.Background(), StartdAd, mutate(sample[i%len(sample)], i, rng)); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -99,7 +99,7 @@ func (s *Store) Watch(ctx context.Context, t AdType, cursor []byte, constraint s
 // Update inserts or replaces ad in table t, stamping it with the current time
 // as ATTR_LAST_HEARD_FROM (which drives expiration). It returns an error only if
 // the ad carries no name to key on.
-func (s *Store) Update(t AdType, ad *classad.ClassAd) error {
+func (s *Store) Update(ctx context.Context, t AdType, ad *classad.ClassAd) error {
 	col := s.cols[t]
 	if col == nil {
 		return fmt.Errorf("collector: %s is not a storage table", t)
@@ -118,7 +118,7 @@ func (s *Store) Update(t AdType, ad *classad.ClassAd) error {
 // form via UpdateOld, without building an intermediate *classad.ClassAd -- the
 // efficient ingest path for ads read off a socket. It errors only if the text
 // carries no name to key on.
-func (s *Store) UpdateOldText(t AdType, text string) error {
+func (s *Store) UpdateOldText(ctx context.Context, t AdType, text string) error {
 	col := s.cols[t]
 	if col == nil {
 		return fmt.Errorf("collector: %s is not a storage table", t)
@@ -147,7 +147,7 @@ func (s *Store) UpdateOldText(t AdType, text string) error {
 // (collector_engine.cpp receive_update), we copy Name, MyAddress and MyType from
 // the public ad into the private ad. These are prepended so they win under the
 // wire encoder's first-occurrence-wins semantics.
-func (s *Store) UpdatePvt(publicText, pvtText string) error {
+func (s *Store) UpdatePvt(ctx context.Context, publicText, pvtText string) error {
 	col := s.cols[StartdPvtAd]
 	if col == nil {
 		return fmt.Errorf("collector: StartdPvt is not a storage table")
@@ -239,7 +239,7 @@ func (s *Store) Stats() map[AdType]collections.Stats {
 }
 
 // Get returns the stored ad identified the same way ad would be (by HashKey).
-func (s *Store) Get(t AdType, ad *classad.ClassAd) (*classad.ClassAd, bool) {
+func (s *Store) Get(ctx context.Context, t AdType, ad *classad.ClassAd) (*classad.ClassAd, bool) {
 	col := s.cols[t]
 	if col == nil {
 		return nil, false
@@ -271,7 +271,7 @@ func parseConstraint(constraint string) (*vm.Query, error) {
 // accepted for the Backend contract but not enforced here -- the caller stops
 // iteration at the limit (the query handlers already do). It errors only if the
 // constraint does not parse.
-func (s *Store) Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+func (s *Store) Query(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
 	q, err := parseConstraint(constraint)
 	if err != nil {
 		return nil, err
@@ -315,7 +315,7 @@ func (s *Store) queryOne(t AdType, q *vm.Query) iter.Seq[*classad.ClassAd] {
 // AST -- for streaming a result set to the wire via message.PutClassAdRaw. It is
 // used only when the query has no projection (raw ads are whole ads). QueryRaw
 // makes Store a store.RawQueryer. limit is not enforced here (the caller stops).
-func (s *Store) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+func (s *Store) QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
 	q, err := parseConstraint(constraint)
 	if err != nil {
 		return nil, err
@@ -355,7 +355,7 @@ func (s *Store) queryOneRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
 // Invalidate removes ads from table t. If a constraint q is given, every ad it
 // matches is removed; otherwise the single ad identified by keyAd (by HashKey)
 // is removed. It returns the number of ads removed.
-func (s *Store) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
+func (s *Store) Invalidate(ctx context.Context, t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
 	q, err := parseConstraint(constraint)
 	if err != nil {
 		return 0, err
@@ -406,7 +406,7 @@ func (s *Store) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) 
 // timer and at startup/shutdown. It returns the number of ads reaped. The error
 // is always nil for the in-memory backend (the Backend contract allows a
 // persistent backend's sweep to fail).
-func (s *Store) Expire() (int, error) {
+func (s *Store) Expire(ctx context.Context) (int, error) {
 	now := s.now()
 	n := 0
 	for at := AnyAd + 1; at < numAdTypes; at++ {
@@ -440,7 +440,7 @@ func (s *Store) Expire() (int, error) {
 }
 
 // Len returns the number of ads in table t.
-func (s *Store) Len(t AdType) (int, error) {
+func (s *Store) Len(ctx context.Context, t AdType) (int, error) {
 	if col := s.cols[t]; col != nil {
 		return col.Len(), nil
 	}
