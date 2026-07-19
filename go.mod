@@ -7,9 +7,9 @@ require (
 	github.com/PelicanPlatform/classad/collections v0.9.0
 	github.com/PelicanPlatform/classad/db v0.9.0
 	github.com/PelicanPlatform/classad/dbrpc v0.9.0
-	github.com/bbockelm/cedar v0.5.5
-	github.com/bbockelm/golang-ccb v0.1.0
-	github.com/bbockelm/golang-htcondor v0.6.2
+	github.com/bbockelm/cedar v0.5.6
+	github.com/bbockelm/golang-ccb v0.4.0
+	github.com/bbockelm/golang-htcondor v0.7.0
 	github.com/prometheus/client_golang v1.13.0
 )
 
@@ -19,10 +19,12 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
