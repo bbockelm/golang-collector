@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"iter"
 	"log/slog"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
@@ -175,14 +177,13 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 		// stored bytes straight out without materializing each ad. Backends
 		// without it fall through to the materialized Query path below.
 		rq, rawOK := st.(store.RawQueryer)
+		prq, prqOK := st.(store.ProjectedRawQueryer)
 
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
-		if len(projection) == 0 && rawOK {
-			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
-			if err != nil {
-				return err
-			}
+		// sendRaw streams already-wire-form RawAds (whole-ad or projected),
+		// redacting private attributes for the public tables.
+		sendRaw := func(raw iter.Seq[collections.RawAd]) error {
 			for ra := range raw {
 				if limit > 0 && n >= limit {
 					break
@@ -199,7 +200,30 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 				}
 				n++
 			}
-		} else {
+			return nil
+		}
+		switch {
+		case len(projection) == 0 && rawOK:
+			// Whole-ad wire-form fast path: stream stored bytes straight out.
+			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
+			if err != nil {
+				return err
+			}
+			if err := sendRaw(raw); err != nil {
+				return err
+			}
+		case len(projection) > 0 && prqOK:
+			// Projected wire-form fast path: the backend applies the projection (a
+			// remote database pushes it down), so only the requested attributes cross
+			// the wire -- no whole-ad fetch + local project.
+			raw, err := prq.QueryRawProject(ctx, t, constraint, projection, limit)
+			if err != nil {
+				return err
+			}
+			if err := sendRaw(raw); err != nil {
+				return err
+			}
+		default:
 			ads, err := st.Query(ctx, t, constraint, limit)
 			if err != nil {
 				return err
