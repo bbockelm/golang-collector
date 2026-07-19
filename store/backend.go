@@ -87,6 +87,16 @@ type RawQueryer interface {
 	QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error)
 }
 
+// ProjectedRawQueryer is RawQueryer with a server-side projection: each returned
+// RawAd carries only the requested attributes (plus MyType/TargetType). A remote
+// database backend implements this by pushing the projection to the server, so a
+// projected query (e.g. condor_status -totals) does not pull every attribute of
+// every ad across the wire and then discard most of it. Backends without it fall
+// back to the materialized Query path, which projects locally.
+type ProjectedRawQueryer interface {
+	QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error)
+}
+
 // Retrainer is an optional Backend capability: periodic maintenance of the
 // ClassAd compression dictionary (the in-memory backend's memory-footprint
 // lever). Backends that manage their own storage do not implement it.

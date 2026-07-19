@@ -247,6 +247,19 @@ func (b *BufferedBackend) QueryRaw(ctx context.Context, t AdType, constraint str
 	return rq.QueryRaw(ctx, t, constraint, limit)
 }
 
+// QueryRawProject flushes, then delegates to the underlying backend's projected
+// raw query if it has one (a remote database pushes the projection down).
+func (b *BufferedBackend) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	if err := b.flush(ctx); err != nil {
+		return nil, err
+	}
+	prq, ok := b.Backend.(ProjectedRawQueryer)
+	if !ok {
+		return nil, fmt.Errorf("collector: backend %T has no projected raw query", b.Backend)
+	}
+	return prq.QueryRawProject(ctx, t, constraint, projection, limit)
+}
+
 func (b *BufferedBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
 	if err := b.flush(ctx); err != nil {
 		return nil, false

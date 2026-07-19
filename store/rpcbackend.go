@@ -521,6 +521,51 @@ func (b *RPCBackend) fetchRawTable(ctx context.Context, t AdType, constraint str
 	return out, err
 }
 
+// QueryRawProject pushes the projection to the database (dbrpc QueryRawProject),
+// so only the requested attributes (plus MyType/TargetType) come back over the
+// wire, then rebuilds each already-projected ad as a RawAd for the server's raw
+// send path.
+func (b *RPCBackend) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return nil, err
+		}
+		var all []collections.RawAd
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
+			}
+			ras, err := b.fetchRawTableProject(ctx, at, constraint, projection, limit)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, ras...)
+		}
+		return sliceSeq(all), nil
+	}
+	ras, err := b.fetchRawTableProject(ctx, t, constraint, projection, limit)
+	if err != nil {
+		return nil, err
+	}
+	return sliceSeq(ras), nil
+}
+
+func (b *RPCBackend) fetchRawTableProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) ([]collections.RawAd, error) {
+	var out []collections.RawAd
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		rows, e := cl.QueryRawProject(ctx, t.String(), rpcConstraint(constraint), projection, limit)
+		if e != nil {
+			return e
+		}
+		out = out[:0]
+		for _, text := range rows {
+			out = append(out, rawAdFromOldText(text))
+		}
+		return nil
+	})
+	return out, err
+}
+
 // rawAdFromOldText rebuilds a collections.RawAd from old-ClassAd wire text: the
 // MyType/TargetType tag lines become the RawAd's type fields and every other
 // non-blank line is an expression, all without building an AST.
