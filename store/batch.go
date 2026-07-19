@@ -70,9 +70,10 @@ type BufferedBackend struct {
 }
 
 var (
-	_ Backend        = (*BufferedBackend)(nil)
-	_ RawQueryer     = (*BufferedBackend)(nil)
-	_ DurableUpdater = (*BufferedBackend)(nil)
+	_ Backend             = (*BufferedBackend)(nil)
+	_ RawQueryer          = (*BufferedBackend)(nil)
+	_ ProjectedRawQueryer = (*BufferedBackend)(nil)
+	_ DurableUpdater      = (*BufferedBackend)(nil)
 )
 
 // DurableUpdater is an optional Backend capability: apply one ad update and return
@@ -247,17 +248,28 @@ func (b *BufferedBackend) QueryRaw(ctx context.Context, t AdType, constraint str
 	return rq.QueryRaw(ctx, t, constraint, limit)
 }
 
-// QueryRawProject flushes, then delegates to the underlying backend's projected
-// raw query if it has one (a remote database pushes the projection down).
+// QueryRawProject flushes, then serves a projected raw query. If the underlying
+// backend can push the projection down (a remote database), it delegates. If not,
+// it falls back to a whole-ad QueryRaw and trims the projection locally -- so a
+// projected query never fails just because the backend lacks native pushdown.
+// BufferedBackend therefore satisfies ProjectedRawQueryer for any RawQueryer
+// backend, which is what the server's projected fast path relies on.
 func (b *BufferedBackend) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
 	if err := b.flush(ctx); err != nil {
 		return nil, err
 	}
-	prq, ok := b.Backend.(ProjectedRawQueryer)
-	if !ok {
-		return nil, fmt.Errorf("collector: backend %T has no projected raw query", b.Backend)
+	if prq, ok := b.Backend.(ProjectedRawQueryer); ok {
+		return prq.QueryRawProject(ctx, t, constraint, projection, limit)
 	}
-	return prq.QueryRawProject(ctx, t, constraint, projection, limit)
+	rq, ok := b.Backend.(RawQueryer)
+	if !ok {
+		return nil, fmt.Errorf("collector: backend %T has no raw query", b.Backend)
+	}
+	raw, err := rq.QueryRaw(ctx, t, constraint, limit)
+	if err != nil {
+		return nil, err
+	}
+	return projectRawSeq(raw, projection), nil
 }
 
 func (b *BufferedBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {

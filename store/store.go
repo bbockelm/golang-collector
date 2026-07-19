@@ -323,6 +323,18 @@ func (s *Store) QueryRaw(ctx context.Context, t AdType, constraint string, limit
 	return s.queryRaw(t, q), nil
 }
 
+// QueryRawProject makes Store a store.ProjectedRawQueryer: it runs QueryRaw and
+// trims each ad to the projected attributes locally (the in-memory store has no
+// wire to push a projection across, so the win is only skipping the private-attr
+// scan of unprojected columns upstream -- correctness is the point here).
+func (s *Store) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	raw, err := s.QueryRaw(ctx, t, constraint, limit)
+	if err != nil {
+		return nil, err
+	}
+	return projectRawSeq(raw, projection), nil
+}
+
 func (s *Store) queryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
 	if t == AnyAd {
 		return func(yield func(collections.RawAd) bool) {

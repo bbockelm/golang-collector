@@ -29,9 +29,10 @@ type DBBackend struct {
 }
 
 var (
-	_ Backend     = (*DBBackend)(nil)
-	_ RawQueryer  = (*DBBackend)(nil)
-	_ BatchWriter = (*DBBackend)(nil)
+	_ Backend             = (*DBBackend)(nil)
+	_ RawQueryer          = (*DBBackend)(nil)
+	_ ProjectedRawQueryer = (*DBBackend)(nil)
+	_ BatchWriter         = (*DBBackend)(nil)
 )
 
 // UpdateBatch applies a buffer of upserts, grouping ordinary ads by table into
@@ -227,6 +228,19 @@ func (b *DBBackend) QueryRaw(ctx context.Context, t AdType, constraint string, l
 		return nil, fmt.Errorf("collector: %s is not a storage table", t)
 	}
 	return tbl.QueryRaw(dbConstraint(constraint))
+}
+
+// QueryRawProject makes DBBackend a store.ProjectedRawQueryer: it runs QueryRaw
+// and trims each ad to the projected attributes. The embedded db has no wire, so
+// the projection is applied here rather than pushed down; the point is that a
+// projected query against an embedded database returns correct (projected) ads
+// instead of failing the ProjectedRawQueryer path.
+func (b *DBBackend) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	raw, err := b.QueryRaw(ctx, t, constraint, limit)
+	if err != nil {
+		return nil, err
+	}
+	return projectRawSeq(raw, projection), nil
 }
 
 // Get returns the ad stored under keyAd's key.

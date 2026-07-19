@@ -115,8 +115,9 @@ type Statser interface {
 
 // The in-memory Store is the default backend and implements every capability.
 var (
-	_ Backend    = (*Store)(nil)
-	_ RawQueryer = (*Store)(nil)
-	_ Retrainer  = (*Store)(nil)
-	_ Statser    = (*Store)(nil)
+	_ Backend             = (*Store)(nil)
+	_ RawQueryer          = (*Store)(nil)
+	_ ProjectedRawQueryer = (*Store)(nil)
+	_ Retrainer           = (*Store)(nil)
+	_ Statser             = (*Store)(nil)
 )
