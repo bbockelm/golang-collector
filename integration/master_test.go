@@ -170,11 +170,13 @@ queue 1
 // with a non-empty address appears or the timeout elapses, returning its address
 // ("" on timeout). Different daemons advertise on different intervals, so a
 // single query can race a daemon that has not yet sent its first update.
-func locateWithRetry(t *testing.T, ctx context.Context, col *htcondor.Collector, adType string, timeout time.Duration) string {
+func locateWithRetry(t *testing.T, ctx context.Context, col *htcondor.Collector, daemonType string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if loc, err := col.LocateDaemon(ctx, adType, ""); err == nil && loc != nil && loc.Address != "" {
+		// v0.8.0 LocateDaemon takes a typed htcondor.DaemonType; callers pass the daemon
+		// type name ("Schedd", "Master", ...), which matches the DaemonType constants.
+		if loc, err := col.LocateDaemon(ctx, htcondor.DaemonType(daemonType), ""); err == nil && loc != nil && loc.Address != "" {
 			return loc.Address
 		}
 		time.Sleep(500 * time.Millisecond)
