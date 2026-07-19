@@ -44,7 +44,9 @@ func newLaggyRPCBackend(tb testing.TB, lag time.Duration, reqs *atomic.Int64) *R
 		go func() { _ = srv.ServeConnOpts(dbrpc.NewStreamConn(sc), dbrpc.ServeOptions{IncludePrivate: true}) }()
 		return &laggyConn{MsgConn: dbrpc.NewStreamConn(cc), lag: lag, reqs: reqs}, nil
 	}
-	return NewRPCBackend(context.Background(), dial)
+	return NewRPCBackend(context.Background(), dial, RetryPolicy{
+		Initial: time.Millisecond, Max: 10 * time.Millisecond, Multiplier: 2, MaxElapsed: time.Second,
+	})
 }
 
 // startdText builds a distinct startd ad for slot key.
@@ -80,11 +82,11 @@ func BenchmarkBatchedIngest(b *testing.B) {
 		start := reqs.Load()
 		for i := 0; i < b.N; i++ {
 			for j := 0; j < nUpdates; j++ {
-				if err := backend.UpdateOldText(StartdAd, startdText(j%nKeys)); err != nil {
+				if err := backend.UpdateOldText(context.Background(), StartdAd, startdText(j%nKeys)); err != nil {
 					b.Fatal(err)
 				}
 			}
-			if _, err := backend.Len(StartdAd); err != nil { // flush buffered
+			if _, err := backend.Len(context.Background(), StartdAd); err != nil { // flush buffered
 				b.Fatal(err)
 			}
 		}
@@ -136,7 +138,7 @@ func BenchmarkBatchedIngestConcurrent(b *testing.B) {
 				go func(p int) {
 					defer wg.Done()
 					for j := 0; j < perProducer; j++ {
-						if err := backend.UpdateOldText(StartdAd, startdText((p*perProducer+j)%nKeys)); err != nil {
+						if err := backend.UpdateOldText(context.Background(), StartdAd, startdText((p*perProducer+j)%nKeys)); err != nil {
 							b.Error(err)
 							return
 						}
@@ -144,7 +146,7 @@ func BenchmarkBatchedIngestConcurrent(b *testing.B) {
 				}(p)
 			}
 			wg.Wait()
-			if _, err := backend.Len(StartdAd); err != nil { // flush remainder
+			if _, err := backend.Len(context.Background(), StartdAd); err != nil { // flush remainder
 				b.Fatal(err)
 			}
 		}

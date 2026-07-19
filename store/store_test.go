@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"iter"
 	"testing"
 
@@ -20,7 +21,7 @@ func mustAd(t *testing.T, s string) *classad.ClassAd {
 // result iterator.
 func mustQueryAds(t *testing.T, s *Store, at AdType, constraint string) iter.Seq[*classad.ClassAd] {
 	t.Helper()
-	seq, err := s.Query(at, constraint, 0)
+	seq, err := s.Query(context.Background(), at, constraint, 0)
 	if err != nil {
 		t.Fatalf("Query(%v, %q): %v", at, constraint, err)
 	}
@@ -30,7 +31,7 @@ func mustQueryAds(t *testing.T, s *Store, at AdType, constraint string) iter.Seq
 // mustLen returns Len, failing the test on error.
 func mustLen(t *testing.T, s *Store, at AdType) int {
 	t.Helper()
-	n, err := s.Len(at)
+	n, err := s.Len(context.Background(), at)
 	if err != nil {
 		t.Fatalf("Len(%v): %v", at, err)
 	}
@@ -47,19 +48,19 @@ func count(seq func(func(*classad.ClassAd) bool)) int {
 
 func TestUpdateGetQuery(t *testing.T) {
 	s := New()
-	s.Update(StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; State="Unclaimed"; Cpus=8]`))
-	s.Update(StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@b"; State="Claimed"; Cpus=4]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; State="Unclaimed"; Cpus=8]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@b"; State="Claimed"; Cpus=4]`))
 	if got := mustLen(t, s, StartdAd); got != 2 {
 		t.Fatalf("Len=%d, want 2", got)
 	}
 
 	// An update to an existing key replaces, not duplicates.
-	s.Update(StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; State="Claimed"; Cpus=8]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; State="Claimed"; Cpus=8]`))
 	if got := mustLen(t, s, StartdAd); got != 2 {
 		t.Fatalf("Len after re-update=%d, want 2", got)
 	}
 
-	ad, ok := s.Get(StartdAd, mustAd(t, `[Name="slot1@a"]`))
+	ad, ok := s.Get(context.Background(), StartdAd, mustAd(t, `[Name="slot1@a"]`))
 	if !ok {
 		t.Fatal("Get(slot1@a) miss")
 	}
@@ -85,8 +86,8 @@ func TestUpdateGetQuery(t *testing.T) {
 
 func TestQueryAny(t *testing.T) {
 	s := New()
-	s.Update(StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; Cpus=8]`))
-	s.Update(ScheddAd, mustAd(t, `[MyType="Scheduler"; Name="sched@a"; MyAddress="<1.2.3.4:5>"]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[MyType="Machine"; Name="slot1@a"; Cpus=8]`))
+	s.Update(context.Background(), ScheddAd, mustAd(t, `[MyType="Scheduler"; Name="sched@a"; MyAddress="<1.2.3.4:5>"]`))
 	// ANY spans every public table.
 	if got := count(mustQueryAds(t, s, AnyAd, "")); got != 2 {
 		t.Errorf("Query(Any) yielded %d, want 2", got)
@@ -98,11 +99,11 @@ func TestQueryAny(t *testing.T) {
 
 func TestInvalidate(t *testing.T) {
 	s := New()
-	s.Update(StartdAd, mustAd(t, `[Name="slot1@a"; State="Unclaimed"]`))
-	s.Update(StartdAd, mustAd(t, `[Name="slot1@b"; State="Claimed"]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[Name="slot1@a"; State="Unclaimed"]`))
+	s.Update(context.Background(), StartdAd, mustAd(t, `[Name="slot1@b"; State="Claimed"]`))
 
 	// By constraint.
-	if got, err := s.Invalidate(StartdAd, `State == "Claimed"`, nil); err != nil {
+	if got, err := s.Invalidate(context.Background(), StartdAd, `State == "Claimed"`, nil); err != nil {
 		t.Fatalf("Invalidate(constraint): %v", err)
 	} else if got != 1 {
 		t.Fatalf("Invalidate(constraint) removed %d, want 1", got)
@@ -112,7 +113,7 @@ func TestInvalidate(t *testing.T) {
 	}
 
 	// By specific ad (fast path).
-	if got, err := s.Invalidate(StartdAd, "", mustAd(t, `[Name="slot1@a"]`)); err != nil {
+	if got, err := s.Invalidate(context.Background(), StartdAd, "", mustAd(t, `[Name="slot1@a"]`)); err != nil {
 		t.Fatalf("Invalidate(ad): %v", err)
 	} else if got != 1 {
 		t.Fatalf("Invalidate(ad) removed %d, want 1", got)
@@ -127,16 +128,16 @@ func TestExpire(t *testing.T) {
 	now := int64(1000)
 	s.now = func() int64 { return now }
 
-	s.Update(ScheddAd, mustAd(t, `[Name="sched@a"; MyAddress="<1.2.3.4:5>"]`))
+	s.Update(context.Background(), ScheddAd, mustAd(t, `[Name="sched@a"; MyAddress="<1.2.3.4:5>"]`))
 	// An ad with a short explicit lifetime.
-	s.Update(ScheddAd, mustAd(t, `[Name="sched@b"; MyAddress="<1.2.3.4:6>"; ClassAdLifetime=10]`))
+	s.Update(context.Background(), ScheddAd, mustAd(t, `[Name="sched@b"; MyAddress="<1.2.3.4:6>"; ClassAdLifetime=10]`))
 	if got := mustLen(t, s, ScheddAd); got != 2 {
 		t.Fatalf("Len=%d, want 2", got)
 	}
 
 	// After 11s, only the short-lived ad is stale.
 	now = 1011
-	if got, err := s.Expire(); err != nil {
+	if got, err := s.Expire(context.Background()); err != nil {
 		t.Fatalf("Expire@1011: %v", err)
 	} else if got != 1 {
 		t.Fatalf("Expire@1011 reaped %d, want 1 (short-lived)", got)
@@ -147,14 +148,14 @@ func TestExpire(t *testing.T) {
 
 	// Just at the default lifetime boundary: not yet stale.
 	now = 1000 + DefaultLifetime
-	if got, err := s.Expire(); err != nil {
+	if got, err := s.Expire(context.Background()); err != nil {
 		t.Fatalf("Expire at exact lifetime: %v", err)
 	} else if got != 0 {
 		t.Fatalf("Expire at exact lifetime reaped %d, want 0", got)
 	}
 	// One second past: reaped.
 	now = 1000 + DefaultLifetime + 1
-	if got, err := s.Expire(); err != nil {
+	if got, err := s.Expire(context.Background()); err != nil {
 		t.Fatalf("Expire past lifetime: %v", err)
 	} else if got != 1 {
 		t.Fatalf("Expire past lifetime reaped %d, want 1", got)

@@ -121,7 +121,7 @@ func startLargeGoStore(tb testing.TB, ads []*classad.ClassAd, zstd bool) (string
 	tb.Helper()
 	st := store.New()
 	for _, ad := range ads {
-		if err := st.Update(store.StartdAd, ad); err != nil {
+		if err := st.Update(context.Background(), store.StartdAd, ad); err != nil {
 			tb.Fatal(err)
 		}
 	}

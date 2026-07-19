@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -31,7 +32,7 @@ func TestRetrainDictCompresses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse ad %d: %v", i, err)
 		}
-		if err := st.Update(StartdAd, ad); err != nil {
+		if err := st.Update(context.Background(), StartdAd, ad); err != nil {
 			t.Fatalf("update ad %d: %v", i, err)
 		}
 	}

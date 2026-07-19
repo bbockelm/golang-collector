@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"strings"
@@ -10,28 +11,69 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
-// RPCBackend is a store.Backend that keeps ads in an external database reached
-// over the classad/dbrpc protocol -- typically an htcondordb daemon spoken to
-// over CEDAR -- so storage is decoupled from the collector process and can be
-// shared or made highly available independently of it. Ad text flows over the
-// wire (dbrpc is text/constraint based), so this backend materializes and
-// re-encodes ads that the in-memory backend would relay untouched; it trades
-// throughput for external, restart-independent storage.
-//
-// The dbrpc transport is injected (a dial that returns a fresh MsgConn) so the
-// CEDAR client and the backend logic stay separable and testable. A single
-// multiplexed connection is used and lazily (re)established; an operation that
-// fails drops the connection so the next one redials.
-type RPCBackend struct {
-	dial func(context.Context) (dbrpc.MsgConn, error)
-	ctx  context.Context
+// RetryPolicy governs how RPCBackend rides out a transient database outage: how it
+// spaces reconnection/replay attempts and how long it keeps trying before giving up.
+// The zero value is unusable; DefaultRetryPolicy supplies sane values.
+type RetryPolicy struct {
+	Initial    time.Duration // first backoff after a failure
+	Max        time.Duration // ceiling on a single backoff interval
+	Multiplier float64       // exponential growth factor per attempt
+	Jitter     float64       // 0..1 fraction of random jitter applied to each backoff
+	// MaxElapsed bounds the total time spent retrying one operation before giving up
+	// (drop + surface the error). It is a duration, not a count. A write path uses a
+	// long-lived context, so MaxElapsed is its effective bound; a read path is also
+	// bound by the caller's context, whichever fires first. 0 means retry until the
+	// context ends (no independent budget).
+	MaxElapsed time.Duration
+}
 
-	mu     sync.Mutex
-	client *dbrpc.Client
-	closed bool
+// DefaultRetryPolicy is a reasonable outage-riding default: quick first retries that
+// back off to a few seconds, giving up on one operation after a minute.
+var DefaultRetryPolicy = RetryPolicy{
+	Initial:    100 * time.Millisecond,
+	Max:        5 * time.Second,
+	Multiplier: 2.0,
+	Jitter:     0.2,
+	MaxElapsed: 60 * time.Second,
+}
+
+// maxConflictRetries caps immediate retries of an optimistic write-write conflict
+// (a healthy connection, so no backoff) before giving up -- a safety bound; real
+// conflicts on distinct-keyed collector ads are rare and resolve at once.
+const maxConflictRetries = 100
+
+// RPCBackend is a store.Backend that keeps ads in an external database reached over
+// the classad/dbrpc protocol -- typically an htcondordb daemon spoken to over CEDAR
+// -- so storage is decoupled from the collector process and can be shared or made
+// highly available independently of it. Ad text flows over the wire (dbrpc is
+// text/constraint based), so this backend materializes and re-encodes ads that the
+// in-memory backend would relay untouched; it trades throughput for external,
+// restart-independent storage.
+//
+// It is production-hardened against transient outages: a single connection is
+// established by a SINGLE-FLIGHT dial (concurrent operations share one dial attempt
+// rather than each hammering a down server -- the reconnect-storm guard), every
+// operation is retried through withRetry with exponential backoff + jitter until it
+// succeeds, its context ends, or the retry budget is exhausted, and because every
+// operation is idempotent-by-key (keyed upserts, keyed/constraint deletes, reads) a
+// replay after an ambiguous failure converges to the same state -- so no operation
+// needs an idempotency token.
+type RPCBackend struct {
+	dial   func(context.Context) (dbrpc.MsgConn, error)
+	ctx    context.Context
+	policy RetryPolicy
+
+	mu          sync.Mutex
+	client      *dbrpc.Client
+	dialing     chan struct{} // non-nil while a shared dial is in flight
+	dialErr     error         // result of the last failed shared dial
+	nextDialAt  time.Time     // shared backoff gate: no dial before this instant
+	dialBackoff time.Duration // current dial backoff, grown per consecutive failure
+	closed      bool
 
 	now             func() int64
 	defaultLifetime int64
@@ -43,16 +85,234 @@ var (
 	_ BatchWriter = (*RPCBackend)(nil)
 )
 
+var errBackendClosed = errors.New("collector: rpc backend is closed")
+
+// NewRPCBackend builds a remote-database backend whose connection is produced by
+// dial (called to (re)establish the single shared connection; each call returns a
+// fresh MsgConn -- e.g. a freshly authenticated CEDAR DBSession stream wrapped with
+// dbrpc.NewCedarConn). ctx bounds the backend's lifetime (and the shared dial).
+// policy governs retry/backoff; a zero policy is replaced with DefaultRetryPolicy.
+func NewRPCBackend(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy) *RPCBackend {
+	if policy == (RetryPolicy{}) {
+		policy = DefaultRetryPolicy
+	}
+	return &RPCBackend{
+		dial:            dial,
+		ctx:             ctx,
+		policy:          policy,
+		now:             func() int64 { return time.Now().Unix() },
+		defaultLifetime: DefaultLifetime,
+	}
+}
+
+// conn returns the current dbrpc client, establishing one with a SINGLE-FLIGHT dial
+// if needed: at most one dial runs at a time, and every concurrent caller waits on
+// that one attempt (bounded by its own ctx) instead of dialing independently -- so a
+// burst of operations against a down database produces one reconnect attempt, not a
+// storm. The shared dial itself is bounded by the backend lifetime ctx (it serves
+// all waiters, not any single caller).
+func (b *RPCBackend) conn(ctx context.Context) (*dbrpc.Client, error) {
+	for {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return nil, errBackendClosed
+		}
+		if b.client != nil {
+			cl := b.client
+			b.mu.Unlock()
+			return cl, nil
+		}
+		// Shared backoff gate: after a failed dial, hold every caller off until
+		// nextDialAt, so a burst of operations against a down database cannot drive a
+		// reconnect storm even when individual dials fail too fast to overlap (which
+		// single-flight alone would dedup). We LOOP on the gate -- a caller that wakes
+		// re-checks under the lock rather than committing to a dial -- so a batch of
+		// callers whose waits expire together does not each fire a serial dial;
+		// aggregate dial rate stays ~one attempt per backoff interval regardless of
+		// how many operations are waiting.
+		if wait := time.Until(b.nextDialAt); wait > 0 {
+			b.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+		// Gate open: single-flight the dial (concurrent callers share this one).
+		if b.dialing == nil {
+			b.dialing = make(chan struct{})
+			go b.dialShared()
+		}
+		done := b.dialing
+		b.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return nil, errBackendClosed
+		}
+		if b.client != nil {
+			cl := b.client
+			b.mu.Unlock()
+			return cl, nil
+		}
+		err := b.dialErr
+		b.mu.Unlock()
+		return nil, err
+	}
+}
+
+// dialShared performs the one shared dial and wakes every waiter.
+func (b *RPCBackend) dialShared() {
+	mc, err := b.dial(b.ctx)
+	var cl *dbrpc.Client
+	if err == nil {
+		cl = dbrpc.NewClient(mc)
+		// The server does not auto-create tables on first write; ensure each AdType's
+		// table exists. CreateTable is idempotent; ignore errors (a genuinely dead
+		// connection surfaces on the first real operation).
+		for t := AnyAd + 1; t < numAdTypes; t++ {
+			_ = cl.CreateTable(b.ctx, t.String())
+		}
+	}
+	b.mu.Lock()
+	if err == nil {
+		b.client = cl
+		b.dialErr = nil
+		b.dialBackoff = 0
+		b.nextDialAt = time.Time{}
+	} else {
+		b.dialErr = fmt.Errorf("collector: connect to ad database: %w", err)
+		b.dialBackoff = b.grow(b.dialBackoff) // 0 -> Initial on the first failure
+		b.nextDialAt = time.Now().Add(b.backoff(b.dialBackoff))
+	}
+	close(b.dialing)
+	b.dialing = nil
+	b.mu.Unlock()
+}
+
+// drop discards cl so the next operation redials, but only if cl is still the
+// current client (a concurrent reconnect may already have replaced it).
+func (b *RPCBackend) drop(cl *dbrpc.Client) {
+	b.mu.Lock()
+	if b.client != nil && b.client == cl {
+		_ = b.client.Close()
+		b.client = nil
+	}
+	b.mu.Unlock()
+}
+
+// withRetry runs op against the shared connection, retrying until it succeeds, ctx
+// ends, or the retry budget is exhausted. It classifies failures:
+//   - optimistic write-write conflict (*db.ConflictError): a healthy connection, so
+//     retry the whole operation immediately (bounded by maxConflictRetries);
+//   - server/logical error (*dbrpc.ServerError): deterministic, surfaced at once;
+//   - context error: surfaced (the caller's deadline/cancellation wins);
+//   - anything else (transport failure, dbrpc.ErrConnClosed, a dial error): the
+//     connection is suspect -- drop it, back off, and replay (every op is
+//     idempotent-by-key, so a replay after an ambiguous failure is safe).
+func (b *RPCBackend) withRetry(ctx context.Context, op func(cl *dbrpc.Client) error) error {
+	start := time.Now()
+	backoff := b.policy.Initial
+	conflicts := 0
+	var lastErr error
+	for {
+		cl, err := b.conn(ctx)
+		if err == nil {
+			opErr := op(cl)
+			if opErr == nil {
+				return nil
+			}
+			switch {
+			case isConflict(opErr):
+				conflicts++
+				if conflicts > maxConflictRetries {
+					return opErr
+				}
+				continue // immediate retry on the same healthy connection
+			case isPermanent(opErr):
+				return opErr
+			case ctx.Err() != nil:
+				return ctx.Err()
+			default:
+				b.drop(cl)
+				lastErr = opErr
+			}
+		} else {
+			if ctx.Err() != nil {
+				return err
+			}
+			lastErr = err
+		}
+		if b.policy.MaxElapsed > 0 && time.Since(start) >= b.policy.MaxElapsed {
+			return fmt.Errorf("collector: ad database unavailable, gave up after %s: %w", b.policy.MaxElapsed, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(b.backoff(backoff)):
+		}
+		backoff = b.grow(backoff)
+	}
+}
+
+// backoff applies jitter to d (a random +/- policy.Jitter fraction).
+func (b *RPCBackend) backoff(d time.Duration) time.Duration {
+	if b.policy.Jitter <= 0 {
+		return d
+	}
+	// Deterministic-free jitter: derive from the current nanosecond, avoiding a
+	// dependency on math/rand's global state. +/- Jitter fraction.
+	frac := b.policy.Jitter
+	n := time.Now().UnixNano()
+	r := float64(n%1000)/1000.0*2 - 1 // in [-1, 1)
+	j := 1 + r*frac
+	if j < 0 {
+		j = 0
+	}
+	return time.Duration(float64(d) * j)
+}
+
+// grow multiplies the backoff by the policy multiplier, capped at Max.
+func (b *RPCBackend) grow(d time.Duration) time.Duration {
+	next := time.Duration(float64(d) * b.policy.Multiplier)
+	if next > b.policy.Max {
+		return b.policy.Max
+	}
+	if next <= 0 {
+		return b.policy.Initial
+	}
+	return next
+}
+
+// isConflict reports an optimistic write-write conflict (retry on the same
+// connection) rather than a transport or logical failure.
+func isConflict(err error) bool {
+	var ce *db.ConflictError
+	return errors.As(err, &ce)
+}
+
+// isPermanent reports a deterministic server/logical error (bad constraint, unknown
+// table, malformed op): replaying it fails identically, so it is surfaced at once.
+func isPermanent(err error) bool {
+	var se *dbrpc.ServerError
+	return errors.As(err, &se)
+}
+
 type keyedText struct{ key, text string }
 
-// UpdateBatch applies a buffer of upserts as one transaction per table (one
-// round trip per table instead of per ad -- the batching win over a remote
-// database).
-func (b *RPCBackend) UpdateBatch(batch []PendingUpdate) error {
-	cl, err := b.conn()
-	if err != nil {
-		return err
-	}
+// UpdateBatch applies a buffer of upserts as one transaction per table, wrapped in a
+// single retry envelope. Because every write is an idempotent keyed upsert, replaying
+// the whole batch after a transient failure (including tables that already committed)
+// converges to the same state.
+func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) error {
 	byTable := make(map[string][]keyedText)
 	for _, p := range batch {
 		if p.Pvt {
@@ -75,127 +335,46 @@ func (b *RPCBackend) UpdateBatch(batch []PendingUpdate) error {
 		}
 		byTable[p.Type.String()] = append(byTable[p.Type.String()], keyedText{string(key), stampText(p.Text, b.now())})
 	}
-	for table, items := range byTable {
-		if err := b.putBatch(cl, table, items); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// putBatch upserts all items into one table in a single optimistic transaction,
-// retrying the commit on conflict.
-func (b *RPCBackend) putBatch(cl *dbrpc.Client, table string, items []keyedText) error {
-	for attempt := 0; attempt < 8; attempt++ {
-		tx, err := cl.BeginTable(table)
-		if err != nil {
-			b.drop()
-			return err
-		}
-		for _, it := range items {
-			if err := tx.NewClassAd(it.key, it.text); err != nil {
-				_ = tx.Abort()
-				b.drop()
+	return b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		for table, items := range byTable {
+			if err := putBatchTx(ctx, cl, table, items); err != nil {
 				return err
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			if isConflict(err) {
-				continue
-			}
-			b.drop()
-			return err
-		}
 		return nil
-	}
-	return fmt.Errorf("collector: batch write to %s did not commit after repeated conflicts", table)
+	})
 }
 
-// NewRPCBackend builds a remote-database backend whose connection is produced by
-// dial (call it repeatedly; each returns a fresh MsgConn -- e.g. a freshly
-// authenticated CEDAR DBSession stream wrapped with dbrpc.NewCedarConn). ctx
-// bounds the backend's lifetime.
-func NewRPCBackend(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error)) *RPCBackend {
-	return &RPCBackend{
-		dial:            dial,
-		ctx:             ctx,
-		now:             func() int64 { return time.Now().Unix() },
-		defaultLifetime: DefaultLifetime,
-	}
-}
-
-// conn returns the current dbrpc client, dialing one if needed.
-func (b *RPCBackend) conn() (*dbrpc.Client, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return nil, fmt.Errorf("collector: rpc backend is closed")
-	}
-	if b.client != nil {
-		return b.client, nil
-	}
-	mc, err := b.dial(b.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("collector: connect to ad database: %w", err)
-	}
-	b.client = dbrpc.NewClient(mc)
-	// The server does not auto-create a table on first write, so ensure each
-	// AdType's table exists. CreateTable is idempotent; ignore its error
-	// (best-effort -- a genuinely unusable connection surfaces on the first real
-	// operation).
-	for t := AnyAd + 1; t < numAdTypes; t++ {
-		_ = b.client.CreateTable(t.String())
-	}
-	return b.client, nil
-}
-
-// drop discards the current connection so the next operation redials; called when
-// an operation fails (the connection may be dead).
-func (b *RPCBackend) drop() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.client != nil {
-		_ = b.client.Close()
-		b.client = nil
-	}
-}
-
-// put upserts key=text in table, retrying the optimistic-concurrency commit on
-// conflict. text must already be a complete old-ClassAd body.
-func (b *RPCBackend) put(table, key, text string) error {
-	cl, err := b.conn()
+// putBatchTx upserts all items into one table in one transaction (no internal retry;
+// withRetry owns retry/backoff/reconnect).
+func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []keyedText) error {
+	tx, err := cl.BeginTable(ctx, table)
 	if err != nil {
 		return err
 	}
-	for attempt := 0; attempt < 8; attempt++ {
-		tx, err := cl.BeginTable(table)
-		if err != nil {
-			b.drop()
+	for _, it := range items {
+		if err := tx.NewClassAd(ctx, it.key, it.text); err != nil {
+			_ = tx.Abort(ctx)
 			return err
 		}
-		if err := tx.NewClassAd(key, text); err != nil {
-			_ = tx.Abort()
-			b.drop()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			// A commit conflict is retryable; anything else likely means the
-			// connection is unusable, so drop it and surface the error.
-			if isConflict(err) {
-				continue
-			}
-			b.drop()
-			return err
-		}
-		return nil
 	}
-	return fmt.Errorf("collector: write to %s did not commit after repeated conflicts", table)
+	return tx.Commit(ctx)
 }
 
-// isConflict reports whether a dbrpc commit error is an optimistic write-write
-// conflict (retryable) rather than a transport/logical failure.
-func isConflict(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "conflict")
+// put upserts key=text in table under one retry envelope. text must already be a
+// complete old-ClassAd body.
+func (b *RPCBackend) put(ctx context.Context, table, key, text string) error {
+	return b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		tx, err := cl.BeginTable(ctx, table)
+		if err != nil {
+			return err
+		}
+		if err := tx.NewClassAd(ctx, key, text); err != nil {
+			_ = tx.Abort(ctx)
+			return err
+		}
+		return tx.Commit(ctx)
+	})
 }
 
 // stampText appends a LastHeardFrom line to an old-ClassAd body (daemons do not
@@ -207,24 +386,24 @@ func stampText(text string, now int64) string {
 	return text + attrLastHeardFrom + " = " + fmt.Sprintf("%d", now) + "\n"
 }
 
-func (b *RPCBackend) Update(t AdType, ad *classad.ClassAd) error {
+func (b *RPCBackend) Update(ctx context.Context, t AdType, ad *classad.ClassAd) error {
 	key, ok := HashKey(t, ad)
 	if !ok {
 		return fmt.Errorf("collector: %s ad has no Name/Machine to key on", t)
 	}
 	ad.InsertAttr(attrLastHeardFrom, b.now())
-	return b.put(t.String(), string(key), ad.MarshalOldWithPrivate())
+	return b.put(ctx, t.String(), string(key), ad.MarshalOldWithPrivate())
 }
 
-func (b *RPCBackend) UpdateOldText(t AdType, text string) error {
+func (b *RPCBackend) UpdateOldText(ctx context.Context, t AdType, text string) error {
 	key, ok := hashKeyFromText(t, text)
 	if !ok {
 		return fmt.Errorf("collector: %s ad has no Name/Machine to key on", t)
 	}
-	return b.put(t.String(), string(key), stampText(text, b.now()))
+	return b.put(ctx, t.String(), string(key), stampText(text, b.now()))
 }
 
-func (b *RPCBackend) UpdatePvt(publicText, pvtText string) error {
+func (b *RPCBackend) UpdatePvt(ctx context.Context, publicText, pvtText string) error {
 	key, ok := hashKeyFromText(StartdAd, publicText)
 	if !ok {
 		return fmt.Errorf("collector: startd private ad's public ad has no Name to key on")
@@ -235,52 +414,65 @@ func (b *RPCBackend) UpdatePvt(publicText, pvtText string) error {
 	if !strings.HasSuffix(pvtText, "\n") {
 		pvtText += "\n"
 	}
-	return b.put(StartdPvtAd.String(), string(key), stampText(header+pvtText, b.now()))
+	return b.put(ctx, StartdPvtAd.String(), string(key), stampText(header+pvtText, b.now()))
 }
 
-// query returns matching ads from one table as parsed ClassAds.
-func (b *RPCBackend) queryTable(t AdType, constraint string, limit int) iter.Seq[*classad.ClassAd] {
-	return func(yield func(*classad.ClassAd) bool) {
-		cl, err := b.conn()
-		if err != nil {
-			return
-		}
-		rows, err := cl.QueryTable(t.String(), rpcConstraint(constraint), limit)
-		if err != nil {
-			b.drop()
-			return
-		}
-		for _, text := range rows {
-			ad, err := classad.Parse(text)
-			if err != nil {
-				continue
-			}
-			if !yield(ad) {
+// sliceSeq yields the elements of s.
+func sliceSeq[T any](s []T) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		for _, v := range s {
+			if !yield(v) {
 				return
 			}
 		}
 	}
 }
 
-func (b *RPCBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+// fetchTable fetches matching ads from one table as parsed ClassAds, under one retry
+// envelope. Fetching eagerly (rather than lazily inside the returned iterator) lets
+// Query surface a persistent outage as an error to the caller instead of a silently
+// empty result.
+func (b *RPCBackend) fetchTable(ctx context.Context, t AdType, constraint string, limit int) ([]*classad.ClassAd, error) {
+	var out []*classad.ClassAd
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		rows, e := cl.QueryTable(ctx, t.String(), rpcConstraint(constraint), limit)
+		if e != nil {
+			return e
+		}
+		out = out[:0]
+		for _, text := range rows {
+			if ad, e := classad.Parse(text); e == nil {
+				out = append(out, ad)
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (b *RPCBackend) Query(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
 	if t == AnyAd {
 		if _, err := parseConstraint(constraint); err != nil {
 			return nil, err
 		}
-		return func(yield func(*classad.ClassAd) bool) {
-			for at := AnyAd + 1; at < numAdTypes; at++ {
-				if at == StartdPvtAd {
-					continue
-				}
-				for ad := range b.queryTable(at, constraint, limit) {
-					if !yield(ad) {
-						return
-					}
-				}
+		var all []*classad.ClassAd
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
 			}
-		}, nil
+			ads, err := b.fetchTable(ctx, at, constraint, limit)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, ads...)
+		}
+		return sliceSeq(all), nil
 	}
-	return b.queryTable(t, constraint, limit), nil
+	ads, err := b.fetchTable(ctx, t, constraint, limit)
+	if err != nil {
+		return nil, err
+	}
+	return sliceSeq(ads), nil
 }
 
 // QueryRaw makes RPCBackend a store.RawQueryer: it fetches matching ads as
@@ -288,44 +480,45 @@ func (b *RPCBackend) Query(t AdType, constraint string, limit int) (iter.Seq[*cl
 // from each by splitting lines -- no AST parse -- so the collector's unprojected
 // query fast path relays them. The collector connects privileged, so private
 // attributes arrive here and are redacted per-client upstream.
-func (b *RPCBackend) QueryRaw(t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+func (b *RPCBackend) QueryRaw(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
 	if t == AnyAd {
 		if _, err := parseConstraint(constraint); err != nil {
 			return nil, err
 		}
-		return func(yield func(collections.RawAd) bool) {
-			for at := AnyAd + 1; at < numAdTypes; at++ {
-				if at == StartdPvtAd {
-					continue
-				}
-				for ra := range b.queryRawTable(at, constraint, limit) {
-					if !yield(ra) {
-						return
-					}
-				}
+		var all []collections.RawAd
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
 			}
-		}, nil
+			ras, err := b.fetchRawTable(ctx, at, constraint, limit)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, ras...)
+		}
+		return sliceSeq(all), nil
 	}
-	return b.queryRawTable(t, constraint, limit), nil
+	ras, err := b.fetchRawTable(ctx, t, constraint, limit)
+	if err != nil {
+		return nil, err
+	}
+	return sliceSeq(ras), nil
 }
 
-func (b *RPCBackend) queryRawTable(t AdType, constraint string, limit int) iter.Seq[collections.RawAd] {
-	return func(yield func(collections.RawAd) bool) {
-		cl, err := b.conn()
-		if err != nil {
-			return
+func (b *RPCBackend) fetchRawTable(ctx context.Context, t AdType, constraint string, limit int) ([]collections.RawAd, error) {
+	var out []collections.RawAd
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		rows, e := cl.QueryRawTable(ctx, t.String(), rpcConstraint(constraint), limit)
+		if e != nil {
+			return e
 		}
-		rows, err := cl.QueryRawTable(t.String(), rpcConstraint(constraint), limit)
-		if err != nil {
-			b.drop()
-			return
-		}
+		out = out[:0]
 		for _, text := range rows {
-			if !yield(rawAdFromOldText(text)) {
-				return
-			}
+			out = append(out, rawAdFromOldText(text))
 		}
-	}
+		return nil
+	})
+	return out, err
 }
 
 // rawAdFromOldText rebuilds a collections.RawAd from old-ClassAd wire text: the
@@ -370,41 +563,41 @@ func rawLineValue(line string) string {
 	return v
 }
 
-func (b *RPCBackend) Get(t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
+func (b *RPCBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
 	key, ok := HashKey(t, keyAd)
 	if !ok {
 		return nil, false
 	}
-	cl, err := b.conn()
-	if err != nil {
+	var found *classad.ClassAd
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		tx, err := cl.BeginTable(ctx, t.String())
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Abort(ctx) }()
+		text, present, err := tx.LookupClassAd(ctx, string(key))
+		if err != nil {
+			return err
+		}
+		if !present {
+			found = nil
+			return nil
+		}
+		ad, perr := classad.Parse(text)
+		if perr != nil {
+			found = nil
+			return nil
+		}
+		found = ad
+		return nil
+	})
+	if err != nil || found == nil {
 		return nil, false
 	}
-	tx, err := cl.BeginTable(t.String())
-	if err != nil {
-		b.drop()
-		return nil, false
-	}
-	defer func() { _ = tx.Abort() }()
-	text, ok, err := tx.LookupClassAd(string(key))
-	if err != nil {
-		b.drop()
-		return nil, false
-	}
-	if !ok {
-		return nil, false
-	}
-	ad, err := classad.Parse(text)
-	if err != nil {
-		return nil, false
-	}
-	return ad, true
+	return found, true
 }
 
-func (b *RPCBackend) Invalidate(t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
-	cl, err := b.conn()
-	if err != nil {
-		return 0, err
-	}
+func (b *RPCBackend) Invalidate(ctx context.Context, t AdType, constraint string, keyAd *classad.ClassAd) (int, error) {
 	if constraint == "" {
 		if keyAd == nil {
 			return 0, nil
@@ -413,61 +606,77 @@ func (b *RPCBackend) Invalidate(t AdType, constraint string, keyAd *classad.Clas
 		if !ok {
 			return 0, nil
 		}
-		return b.deleteKeys(cl, t, []string{string(key)})
+		return b.deleteKeys(ctx, t, []string{string(key)})
 	}
 	if t != StartdAd {
-		n, err := cl.DeleteWhereTable(t.String(), rpcConstraint(constraint))
-		if err != nil {
-			b.drop()
-		}
+		var n int
+		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+			var e error
+			n, e = cl.DeleteWhereTable(ctx, t.String(), rpcConstraint(constraint))
+			return e
+		})
 		return n, err
 	}
 	// startd: match public ads, then delete their keys from both tables.
+	ads, err := b.fetchTable(ctx, StartdAd, constraint, 0)
+	if err != nil {
+		return 0, err
+	}
 	var keys []string
-	for ad := range b.queryTable(StartdAd, constraint, 0) {
+	for _, ad := range ads {
 		if key, ok := HashKey(StartdAd, ad); ok {
 			keys = append(keys, string(key))
 		}
 	}
-	return b.deleteKeys(cl, StartdAd, keys)
+	return b.deleteKeys(ctx, StartdAd, keys)
 }
 
 // deleteKeys removes the given keys from table t (and, for startd, the private
-// shadow) in one transaction, returning how many public ads were present.
-func (b *RPCBackend) deleteKeys(cl *dbrpc.Client, t AdType, keys []string) (int, error) {
+// shadow), each in its own retried transaction, returning how many public ads were
+// present.
+func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (int, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
 	n := 0
 	for _, k := range keys {
-		tx, err := cl.BeginTable(t.String())
+		var present bool
+		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+			tx, err := cl.BeginTable(ctx, t.String())
+			if err != nil {
+				return err
+			}
+			_, present, err = tx.LookupClassAd(ctx, k)
+			if err != nil {
+				_ = tx.Abort(ctx)
+				return err
+			}
+			if present {
+				_ = tx.DestroyClassAd(ctx, k)
+			}
+			return tx.Commit(ctx)
+		})
 		if err != nil {
-			b.drop()
 			return n, err
 		}
-		if _, present, err := tx.LookupClassAd(k); err == nil && present {
-			_ = tx.DestroyClassAd(k)
+		if present {
 			n++
 		}
-		if err := tx.Commit(); err != nil {
-			b.drop()
-			return n, err
-		}
 		if t == StartdAd {
-			if tx, err := cl.BeginTable(StartdPvtAd.String()); err == nil {
-				_ = tx.DestroyClassAd(k)
-				_ = tx.Commit()
-			}
+			_ = b.withRetry(ctx, func(cl *dbrpc.Client) error {
+				tx, err := cl.BeginTable(ctx, StartdPvtAd.String())
+				if err != nil {
+					return err
+				}
+				_ = tx.DestroyClassAd(ctx, k)
+				return tx.Commit(ctx)
+			})
 		}
 	}
 	return n, nil
 }
 
 func (b *RPCBackend) Watch(ctx context.Context, t AdType, cursor []byte, constraint string) (iter.Seq[collections.WatchEvent], error) {
-	cl, err := b.conn()
-	if err != nil {
-		return nil, err
-	}
 	var q = (*queryMatcher)(nil)
 	if constraint != "" {
 		cq, err := parseConstraint(constraint)
@@ -478,9 +687,17 @@ func (b *RPCBackend) Watch(ctx context.Context, t AdType, cursor []byte, constra
 			q = &queryMatcher{cq.Matches}
 		}
 	}
-	ch, cancel, err := cl.WatchTable(t.String(), cursor)
+	var ch <-chan dbrpc.WatchEvent
+	var cancel func()
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		c, cf, e := cl.WatchTable(ctx, t.String(), cursor)
+		if e != nil {
+			return e
+		}
+		ch, cancel = c, cf
+		return nil
+	})
 	if err != nil {
-		b.drop()
 		return nil, err
 	}
 	seq := func(yield func(collections.WatchEvent) bool) {
@@ -524,37 +741,37 @@ func dbrpcToCollectionsWatch(ev dbrpc.WatchEvent) collections.WatchEvent {
 	return ce
 }
 
-func (b *RPCBackend) Expire() (int, error) {
-	cl, err := b.conn()
-	if err != nil {
-		return 0, err
-	}
+func (b *RPCBackend) Expire(ctx context.Context) (int, error) {
 	now := b.now()
 	constraint := fmt.Sprintf("%d > %s + ifThenElse(%s =!= undefined, %s, %d)",
 		now, attrLastHeardFrom, attrClassAdLifetime, attrClassAdLifetime, b.defaultLifetime)
 	total := 0
 	for t := AnyAd + 1; t < numAdTypes; t++ {
-		n, err := cl.DeleteWhereTable(t.String(), constraint)
+		var n int
+		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+			var e error
+			n, e = cl.DeleteWhereTable(ctx, t.String(), constraint)
+			return e
+		})
 		total += n
 		if err != nil {
-			b.drop()
 			return total, err
 		}
 	}
 	return total, nil
 }
 
-func (b *RPCBackend) Len(t AdType) (int, error) {
-	cl, err := b.conn()
-	if err != nil {
-		return 0, err
-	}
-	rows, err := cl.QueryTable(t.String(), "true", 0)
-	if err != nil {
-		b.drop()
-		return 0, err
-	}
-	return len(rows), nil
+func (b *RPCBackend) Len(ctx context.Context, t AdType) (int, error) {
+	var n int
+	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		rows, e := cl.QueryTable(ctx, t.String(), "true", 0)
+		if e != nil {
+			return e
+		}
+		n = len(rows)
+		return nil
+	})
+	return n, err
 }
 
 func (b *RPCBackend) Close() error {

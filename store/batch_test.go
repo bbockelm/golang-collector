@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"testing"
 )
 
@@ -20,27 +21,27 @@ func TestBufferedBackendDedupAndFlush(t *testing.T) {
 	defer func() { _ = b.Close() }()
 
 	// Same ad twice within the buffer -> collapses to the latest value.
-	if err := b.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`State = "Idle"`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`State = "Idle"`); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.UpdateOldText(StartdAd, `Name = "slot2@a"`+"\n"+`State = "Idle"`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "slot2@a"`+"\n"+`State = "Idle"`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Before any flush, the underlying store is empty (updates are buffered).
-	if n, _ := under.Len(StartdAd); n != 0 {
+	if n, _ := under.Len(context.Background(), StartdAd); n != 0 {
 		t.Fatalf("underlying Len = %d before flush, want 0 (updates should be buffered)", n)
 	}
 
 	// A read through the buffer flushes first, so both distinct ads are visible
 	// and slot1 carries the latest (deduped) value.
-	if n, _ := b.Len(StartdAd); n != 2 {
+	if n, _ := b.Len(context.Background(), StartdAd); n != 2 {
 		t.Fatalf("Len = %d after flush, want 2 (slot1 deduped, slot2 distinct)", n)
 	}
-	ad, ok := b.Get(StartdAd, mustParse(t, `Name = "slot1@a"`))
+	ad, ok := b.Get(context.Background(), StartdAd, mustParse(t, `Name = "slot1@a"`))
 	if !ok {
 		t.Fatal("slot1 missing after flush")
 	}
@@ -66,19 +67,19 @@ func TestBufferedBackendDurableUpdate(t *testing.T) {
 
 	// A buffered (non-ack) update of slot1, then a durable (ack) update of the same
 	// ad. The durable call must flush the stale buffered value and land the latest.
-	if err := b.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`State = "Idle"`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`State = "Idle"`); err != nil {
 		t.Fatal(err)
 	}
-	if err := DurableUpdate(b, StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
+	if err := DurableUpdate(context.Background(), b, StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Read the UNDERLYING store directly (not through b) to prove durability without
 	// a buffer flush: the ad must already be committed.
-	if n, _ := under.Len(StartdAd); n != 1 {
+	if n, _ := under.Len(context.Background(), StartdAd); n != 1 {
 		t.Fatalf("underlying Len = %d after DurableUpdate, want 1 (ack write must be committed, not buffered)", n)
 	}
-	ad, ok := under.Get(StartdAd, mustParse(t, `Name = "slot1@a"`))
+	ad, ok := under.Get(context.Background(), StartdAd, mustParse(t, `Name = "slot1@a"`))
 	if !ok {
 		t.Fatal("slot1 missing from underlying store after DurableUpdate")
 	}
@@ -101,21 +102,21 @@ func TestBufferedBackendPvtAndInvalidate(t *testing.T) {
 	}
 	defer func() { _ = b.Close() }()
 
-	if err := b.UpdateOldText(StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
+	if err := b.UpdateOldText(context.Background(), StartdAd, `Name = "slot1@a"`+"\n"+`State = "Claimed"`); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.UpdatePvt(`Name = "slot1@a"`, `Capability = "claim-1"`); err != nil {
+	if err := b.UpdatePvt(context.Background(), `Name = "slot1@a"`, `Capability = "claim-1"`); err != nil {
 		t.Fatal(err)
 	}
 	// Invalidate flushes the buffer (so slot1 lands), then removes it and its
 	// private shadow.
-	if _, err := b.Invalidate(StartdAd, "", mustParse(t, `Name = "slot1@a"`)); err != nil {
+	if _, err := b.Invalidate(context.Background(), StartdAd, "", mustParse(t, `Name = "slot1@a"`)); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := b.Len(StartdAd); n != 0 {
+	if n, _ := b.Len(context.Background(), StartdAd); n != 0 {
 		t.Fatalf("StartdAd Len = %d after invalidate, want 0", n)
 	}
-	if n, _ := b.Len(StartdPvtAd); n != 0 {
+	if n, _ := b.Len(context.Background(), StartdPvtAd); n != 0 {
 		t.Fatalf("StartdPvtAd Len = %d after invalidate, want 0 (shadow removed)", n)
 	}
 }

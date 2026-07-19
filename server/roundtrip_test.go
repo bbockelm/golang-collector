@@ -39,7 +39,7 @@ func mustAd(tb testing.TB, s string) *classad.ClassAd {
 // mustLen returns st.Len, failing the test on error.
 func mustLen(tb testing.TB, st *store.Store, at store.AdType) int {
 	tb.Helper()
-	n, err := st.Len(at)
+	n, err := st.Len(context.Background(), at)
 	if err != nil {
 		tb.Fatalf("Len(%v): %v", at, err)
 	}
@@ -152,14 +152,14 @@ func TestStartdPrivateAd(t *testing.T) {
 		t.Fatalf("private table has %d ads, want 1", got)
 	}
 	keyAd := mustAd(t, `[Name="slot1@a"; MyAddress="<1.2.3.4:5>"]`)
-	pub, ok := st.Get(store.StartdAd, keyAd)
+	pub, ok := st.Get(context.Background(), store.StartdAd, keyAd)
 	if !ok {
 		t.Fatal("public ad not found")
 	}
 	if _, leaked := pub.EvaluateAttrString("ClaimId"); leaked {
 		t.Error("public startd ad leaked the private ClaimId")
 	}
-	pvt, ok := st.Get(store.StartdPvtAd, keyAd)
+	pvt, ok := st.Get(context.Background(), store.StartdPvtAd, keyAd)
 	if !ok {
 		t.Fatal("private ad not found under the public ad's key")
 	}

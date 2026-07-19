@@ -14,7 +14,7 @@ import (
 // mustLen returns st.Len, failing the test on error.
 func mustLen(t *testing.T, st *store.Store, at store.AdType) int {
 	t.Helper()
-	n, err := st.Len(at)
+	n, err := st.Len(context.Background(), at)
 	if err != nil {
 		t.Fatalf("Len(%v): %v", at, err)
 	}
@@ -24,7 +24,7 @@ func mustLen(t *testing.T, st *store.Store, at store.AdType) int {
 // mustQueryAds runs a store query, failing the test on error.
 func mustQueryAds(t *testing.T, st *store.Store, at store.AdType, constraint string) iter.Seq[*classad.ClassAd] {
 	t.Helper()
-	seq, err := st.Query(at, constraint, 0)
+	seq, err := st.Query(context.Background(), at, constraint, 0)
 	if err != nil {
 		t.Fatalf("Query(%v, %q): %v", at, constraint, err)
 	}

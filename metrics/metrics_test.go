@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -22,7 +23,7 @@ func TestMetricsHandler(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.Update(store.StartdAd, ad); err != nil {
+		if err := st.Update(context.Background(), store.StartdAd, ad); err != nil {
 			t.Fatal(err)
 		}
 	}

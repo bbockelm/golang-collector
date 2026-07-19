@@ -64,7 +64,7 @@ func startEncryptedCollector(tb testing.TB) (addr string, stop func()) {
 	tb.Helper()
 	st := store.New()
 	for i := 0; i < benchNumAds; i++ {
-		if err := st.Update(store.StartdAd, benchAd(i)); err != nil {
+		if err := st.Update(context.Background(), store.StartdAd, benchAd(i)); err != nil {
 			tb.Fatal(err)
 		}
 	}

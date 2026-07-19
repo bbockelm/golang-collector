@@ -60,7 +60,7 @@ func BenchmarkIngestScaling(b *testing.B) {
 				for i := range texts {
 					ad := mutate(sample[i%len(sample)], w*perG+i, rng)
 					texts[i] = stripLastHeardFrom(ad.MarshalOld())
-					_ = st.UpdateOldText(StartdAd, texts[i])
+					_ = st.UpdateOldText(context.Background(), StartdAd, texts[i])
 				}
 				textByG[w] = texts
 			}
@@ -73,7 +73,7 @@ func BenchmarkIngestScaling(b *testing.B) {
 					defer wg.Done()
 					i := 0
 					for atomic.AddInt64(&claimed, 1) <= int64(b.N) {
-						if err := st.UpdateOldText(StartdAd, texts[i%len(texts)]); err != nil {
+						if err := st.UpdateOldText(context.Background(), StartdAd, texts[i%len(texts)]); err != nil {
 							b.Error(err)
 							return
 						}
@@ -103,7 +103,7 @@ func BenchmarkSerializeScaling(b *testing.B) {
 	st := New()
 	rng := rand.New(rand.NewSource(1))
 	for i := 0; i < 2000; i++ {
-		_ = st.Update(StartdAd, mutate(sample[i%len(sample)], i, rng))
+		_ = st.Update(context.Background(), StartdAd, mutate(sample[i%len(sample)], i, rng))
 	}
 
 	for _, g := range []int{1, 2, 4, 6, 8, 12} {
@@ -120,7 +120,7 @@ func BenchmarkSerializeScaling(b *testing.B) {
 					var local int64
 					for atomic.AddInt64(&claimed, 1) <= int64(b.N) {
 						msg := message.NewMessageForStream(st2)
-						seq, err := st.QueryRaw(StartdAd, "", 0)
+						seq, err := st.QueryRaw(context.Background(), StartdAd, "", 0)
 						if err != nil {
 							b.Error(err)
 							return
@@ -179,7 +179,7 @@ func BenchmarkQuerySerialize(b *testing.B) {
 			ad, _ := classad.Parse("[MyType=\"Machine\"; Name=\"slot" + strconv.Itoa(i) +
 				"@h\"; MyAddress=\"<1.2.3.4:9618>\"; State=\"Unclaimed\"; Activity=\"Idle\"; " +
 				"Cpus=8; Memory=2048; Disk=1000000; Arch=\"X86_64\"; OpSys=\"LINUX\"]")
-			_ = st.Update(StartdAd, ad)
+			_ = st.Update(context.Background(), StartdAd, ad)
 		}
 		benchSerialize(b, st)
 	})
@@ -188,7 +188,7 @@ func BenchmarkQuerySerialize(b *testing.B) {
 		st := New()
 		rng := rand.New(rand.NewSource(1))
 		for i := 0; i < 2000; i++ {
-			_ = st.Update(StartdAd, mutate(sample[i%len(sample)], i, rng))
+			_ = st.Update(context.Background(), StartdAd, mutate(sample[i%len(sample)], i, rng))
 		}
 		benchSerialize(b, st)
 	})
@@ -209,7 +209,7 @@ func benchSerialize(b *testing.B, st *Store) {
 		var ads int64
 		for i := 0; i < b.N; i++ {
 			msg := message.NewMessageForStream(st2)
-			seq, err := st.Query(StartdAd, "", 0) // "" == match all
+			seq, err := st.Query(context.Background(), StartdAd, "", 0) // "" == match all
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -233,7 +233,7 @@ func benchSerialize(b *testing.B, st *Store) {
 		var ads int64
 		for i := 0; i < b.N; i++ {
 			msg := message.NewMessageForStream(st2)
-			seq, err := st.QueryRaw(StartdAd, "", 0)
+			seq, err := st.QueryRaw(context.Background(), StartdAd, "", 0)
 			if err != nil {
 				b.Fatal(err)
 			}

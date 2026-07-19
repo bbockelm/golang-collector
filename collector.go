@@ -161,7 +161,7 @@ func (c *Collector) StartBackground(ctx context.Context) func() {
 	// behind, some of which went stale while the collector was down. Prune them
 	// before serving so a long outage does not resurrect dead ads (a short one
 	// keeps the pool warm). A no-op for the empty in-memory backend.
-	if n, err := c.store.Expire(); err != nil {
+	if n, err := c.store.Expire(ctx); err != nil {
 		c.log.Warn("collector: startup expiry sweep failed", "error", err)
 	} else if n > 0 {
 		c.log.Info("collector: pruned stale ads at startup", "count", n)
@@ -197,7 +197,7 @@ func (c *Collector) expireLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := c.store.Expire()
+			n, err := c.store.Expire(ctx)
 			if err != nil {
 				c.log.Warn("collector: ad expiry sweep failed", "error", err)
 			} else if n > 0 {
@@ -236,7 +236,7 @@ func (c *Collector) Server() *cedarserver.Server { return c.srv }
 // Close is a no-op. Callers embedding via RegisterOn that own the backend should
 // close it themselves instead.
 func (c *Collector) Close() error {
-	if n, err := c.store.Expire(); err != nil {
+	if n, err := c.store.Expire(context.Background()); err != nil {
 		c.log.Warn("collector: shutdown expiry sweep failed", "error", err)
 	} else if n > 0 {
 		c.log.Info("collector: pruned stale ads at shutdown", "count", n)

@@ -56,7 +56,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Slots: query (with slot constraint pushed to the store) + per-slot fixup.
 	go func() {
 		defer wg.Done()
-		ads, err := s.store.Query(store.StartdAd, s.slotConstraint, 0)
+		ads, err := s.store.Query(ctx, store.StartdAd, s.slotConstraint, 0)
 		if err != nil {
 			errs[0] = err
 			return
@@ -73,7 +73,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Submitters: query (with submitter constraint) + filter.
 	go func() {
 		defer wg.Done()
-		ads, err := s.store.Query(store.SubmitterAd, s.subConstraint, 0)
+		ads, err := s.store.Query(ctx, store.SubmitterAd, s.subConstraint, 0)
 		if err != nil {
 			errs[1] = err
 			return
@@ -91,7 +91,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 	// Private ads: build the claim-id map (never republished).
 	go func() {
 		defer wg.Done()
-		ads, err := s.store.Query(store.StartdPvtAd, "", 0)
+		ads, err := s.store.Query(ctx, store.StartdPvtAd, "", 0)
 		if err != nil {
 			errs[2] = err
 			return
@@ -127,7 +127,7 @@ func (s *EmbeddedSource) Snapshot(ctx context.Context) (*negotiator.PoolSnapshot
 // PublishNegotiatorAd writes the negotiator's daemon ad into the store's
 // NegotiatorAd table.
 func (s *EmbeddedSource) PublishNegotiatorAd(ctx context.Context, ad *classad.ClassAd) error {
-	return s.store.Update(store.NegotiatorAd, ad)
+	return s.store.Update(ctx, store.NegotiatorAd, ad)
 }
 
 // PublishAccountingAds writes the per-submitter/per-group accounting ads into
@@ -137,7 +137,7 @@ func (s *EmbeddedSource) PublishAccountingAds(ctx context.Context, ads []*classa
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.store.Update(store.AccountingAd, ad); err != nil {
+		if err := s.store.Update(ctx, store.AccountingAd, ad); err != nil {
 			return err
 		}
 	}
