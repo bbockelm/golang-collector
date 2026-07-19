@@ -6,7 +6,7 @@ require (
 	github.com/PelicanPlatform/classad v0.9.0
 	github.com/PelicanPlatform/classad/collections v0.9.0
 	github.com/PelicanPlatform/classad/db v0.9.0
-	github.com/PelicanPlatform/classad/dbrpc v0.9.0
+	github.com/PelicanPlatform/classad/dbrpc v0.10.0
 	github.com/bbockelm/cedar v0.5.6
 	github.com/bbockelm/golang-ccb v0.4.0
 	github.com/bbockelm/golang-htcondor v0.7.0
