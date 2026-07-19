@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -354,6 +355,19 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	}
 	for _, it := range items {
 		if err := tx.NewClassAd(ctx, it.key, it.text); err != nil {
+			// A *dbrpc.ServerError means the db server rejected THIS ad (e.g. an
+			// unparseable value): opNewAd returned an error without adding it to the
+			// transaction, which stays open. Log the offending ad (the wire bytes
+			// are otherwise encrypted) and skip it, so one bad ad does not abort the
+			// batch -- a partial commit using the transaction the good ads already
+			// sit in. Any other error is a transport/transaction failure: abort and
+			// let withRetry retry the whole batch.
+			var se *dbrpc.ServerError
+			if errors.As(err, &se) {
+				slog.Warn("collector: db rejected ad update; skipping (batch continues)",
+					"table", table, "name", AdName(it.text), "err", se, "ad", AdExcerpt(it.text))
+				continue
+			}
 			_ = tx.Abort(ctx)
 			return err
 		}

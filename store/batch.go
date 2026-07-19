@@ -195,8 +195,49 @@ func (b *BufferedBackend) flush(ctx context.Context) error {
 		b.mu.Unlock()
 		return err
 	}
-	b.log(fmt.Errorf("collector: dropping %d buffered ad update(s) after retry budget exhausted: %w", len(batch), err))
-	return err
+	// The batch failed as a unit, but the cause is usually ONE bad ad (e.g. an
+	// unparseable value) among many good ones. Re-apply each update on its own so
+	// a single culprit does not drop the rest: keep the ads that succeed, and log
+	// + drop only those that still fail -- with the offending ad's text, so an
+	// operator can see exactly which ad and value the sender forwarded (the wire
+	// bytes are otherwise encrypted).
+	var failed int
+	for i := range batch {
+		if e := b.bw.UpdateBatch(ctx, batch[i:i+1]); e != nil {
+			if ctx.Err() != nil {
+				// Deadline hit mid-isolation: re-enqueue the not-yet-applied
+				// remainder for the background flusher (newer updates win).
+				b.mu.Lock()
+				for j := i; j < len(batch); j++ {
+					if _, newer := b.buf[keys[j]]; !newer {
+						b.buf[keys[j]] = batch[j]
+					}
+				}
+				b.mu.Unlock()
+				return e
+			}
+			failed++
+			b.log(fmt.Errorf("collector: rejected ad update name=%q type=%s (dropping just this one, keeping the rest): %w\n--- ad ---\n%s\n--- end ad ---",
+				AdName(batch[i].Text), batch[i].Type, e, AdExcerpt(rejectedText(batch[i]))))
+		}
+	}
+	if failed > 0 {
+		b.log(fmt.Errorf("collector: dropped %d of %d buffered ad update(s); the rest were applied", failed, len(batch)))
+	}
+	// The buffer is fully drained (good ads applied; bad ones logged above), so
+	// report success -- a rejected ad is an operator-visible drop, not a flush
+	// failure to propagate to a flush-before-read.
+	return nil
+}
+
+// rejectedText returns the ad text to show for a rejected PendingUpdate: the ad,
+// plus the private ad appended when this is a startd public+private update (the
+// parse failure may be in either).
+func rejectedText(p PendingUpdate) string {
+	if p.Pvt && p.PvtText != "" {
+		return p.Text + "\n# --- private ad ---\n" + p.PvtText
+	}
+	return p.Text
 }
 
 // --- buffered write paths ---
