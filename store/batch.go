@@ -180,7 +180,13 @@ func (b *BufferedBackend) flush(ctx context.Context) error {
 	b.buf = make(map[dedupKey]PendingUpdate)
 	b.mu.Unlock()
 
+	// Metrics: one flushed batch, its ad count (a batch touches ~all shards, so
+	// this drives the store's lock contention), and its wall-clock time.
+	Metrics.batchesTotal.Inc()
+	Metrics.adsPerBatch.Observe(float64(len(batch)))
+	flushStart := time.Now()
 	err := b.bw.UpdateBatch(ctx, batch)
+	Metrics.batchSeconds.Observe(time.Since(flushStart).Seconds())
 	if err == nil {
 		return nil
 	}

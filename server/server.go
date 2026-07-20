@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"log/slog"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -97,12 +99,27 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 				pvt, havePvt = p, true
 			}
 		}
-		if err := st.UpdateOldText(ctx, t, text); err != nil {
+		start := time.Now()
+		uerr := st.UpdateOldText(ctx, t, text)
+		elapsed := time.Since(start)
+		store.ObserveUpdate("public", elapsed)
+		if uerr != nil {
+			if isCanceled(uerr) {
+				// The context was cancelled (the collector is shutting down, or the
+				// client went away) -- the ad was not rejected, the operation was
+				// aborted. End the handler cleanly instead of logging a misleading
+				// "rejected ad" warning per in-flight update. The elapsed time (logged
+				// at debug) distinguishes an update that was merely in flight when
+				// shutdown hit (~0) from one stuck retrying against a slow/down database.
+				slog.Debug("collector: ad update aborted (context cancelled)",
+					"type", t.String(), "name", store.AdName(text), "elapsed", elapsed)
+				return uerr
+			}
 			// A single unparseable/rejected ad must not tear down the persistent
 			// command socket (which would drop every following update from this
 			// daemon) -- log the offending ad and skip it, keeping the session up.
 			slog.Warn("collector: rejected ad update; skipping (connection kept open)",
-				"type", t.String(), "name", store.AdName(text), "err", err, "ad", store.AdExcerpt(text))
+				"type", t.String(), "name", store.AdName(text), "elapsed", elapsed, "err", uerr, "ad", store.AdExcerpt(text))
 			return nil
 		}
 		// Relay the public ad to any CONDOR_VIEW_HOST collectors (never the
@@ -111,13 +128,31 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 		// downstream collector.
 		fwd.forwardText(cmd, text)
 		if havePvt {
-			if err := st.UpdatePvt(ctx, text, pvt); err != nil {
+			pstart := time.Now()
+			perr := st.UpdatePvt(ctx, text, pvt)
+			elapsed := time.Since(pstart)
+			store.ObserveUpdate("private", elapsed)
+			if perr != nil {
+				if isCanceled(perr) {
+					// Aborted (shutdown / peer gone), not rejected. elapsed at debug
+					// shows whether it was in flight (~0) or stuck retrying.
+					slog.Debug("collector: private ad update aborted (context cancelled)",
+						"type", t.String(), "name", store.AdName(text), "elapsed", elapsed)
+					return perr
+				}
 				slog.Warn("collector: rejected private ad update; skipping (connection kept open)",
-					"type", t.String(), "name", store.AdName(text), "err", err, "ad", store.AdExcerpt(pvt))
+					"type", t.String(), "name", store.AdName(text), "elapsed", elapsed, "err", perr, "ad", store.AdExcerpt(pvt))
 			}
 		}
 		return nil
 	}
+}
+
+// isCanceled reports whether err is a context cancellation or deadline -- i.e. the
+// operation was aborted (collector shutdown, or the peer went away), not rejected.
+// Such an error is not a bad ad and must not be logged as one.
+func isCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // adMessage returns the message a handler should read its ad from: the message
