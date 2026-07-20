@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -55,7 +56,7 @@ const maxConflictRetries = 100
 // in-memory backend would relay untouched; it trades throughput for external,
 // restart-independent storage.
 //
-// It is production-hardened against transient outages: a single connection is
+// It is production-hardened against transient outages: each connection is
 // established by a SINGLE-FLIGHT dial (concurrent operations share one dial attempt
 // rather than each hammering a down server -- the reconnect-storm guard), every
 // operation is retried through withRetry with exponential backoff + jitter until it
@@ -63,9 +64,34 @@ const maxConflictRetries = 100
 // operation is idempotent-by-key (keyed upserts, keyed/constraint deletes, reads) a
 // replay after an ambiguous failure converges to the same state -- so no operation
 // needs an idempotency token.
+//
+// Reads and writes ride SEPARATE connections. dbrpc multiplexes a connection with a
+// single reader goroutine that demuxes response frames by request id; a streaming
+// query whose consumer falls behind fills that stream's frame buffer and blocks the
+// reader (head-of-line blocking), stalling every other in-flight call on the same
+// connection -- including write-transaction commit responses, which then time out and
+// surface as "no such transaction". So writes ride a dedicated lane, and reads ride a
+// small round-robin pool of lanes, so a slow query can never stall a commit (nor,
+// beyond its own pool slot, other queries).
 type RPCBackend struct {
-	dial   func(context.Context) (dbrpc.MsgConn, error)
-	ctx    context.Context
+	write  *connLane   // dedicated to write transactions
+	reads  []*connLane // round-robin pool for queries/streams
+	readRR atomic.Uint64
+
+	policy RetryPolicy
+
+	now             func() int64
+	defaultLifetime int64
+}
+
+// connLane is one reconnect-managed dbrpc connection: a single client (re)established
+// on demand by a single-flight dial behind a shared backoff gate. Each lane owns an
+// independent connection -- and therefore an independent dbrpc reader goroutine -- so
+// a stall on one lane's connection does not affect any other lane.
+type connLane struct {
+	dial func(context.Context) (dbrpc.MsgConn, error)
+	ctx  context.Context
+
 	policy RetryPolicy
 
 	mu          sync.Mutex
@@ -75,9 +101,6 @@ type RPCBackend struct {
 	nextDialAt  time.Time     // shared backoff gate: no dial before this instant
 	dialBackoff time.Duration // current dial backoff, grown per consecutive failure
 	closed      bool
-
-	now             func() int64
-	defaultLifetime int64
 }
 
 var (
@@ -88,40 +111,70 @@ var (
 
 var errBackendClosed = errors.New("collector: rpc backend is closed")
 
-// NewRPCBackend builds a remote-database backend whose connection is produced by
-// dial (called to (re)establish the single shared connection; each call returns a
-// fresh MsgConn -- e.g. a freshly authenticated CEDAR DBSession stream wrapped with
-// dbrpc.NewCedarConn). ctx bounds the backend's lifetime (and the shared dial).
-// policy governs retry/backoff; a zero policy is replaced with DefaultRetryPolicy.
+// DefaultReadConns is the size of the read-connection pool when NewRPCBackend is used
+// (or NewRPCBackendPool is given a non-positive count). A small pool spreads
+// concurrent queries across connections so one slow consumer stalls only its slot.
+const DefaultReadConns = 4
+
+// NewRPCBackend builds a remote-database backend with a dedicated write connection and
+// a DefaultReadConns-sized read pool, each produced by dial (called to (re)establish a
+// connection; each call returns a fresh MsgConn -- e.g. a freshly authenticated CEDAR
+// DBSession stream wrapped with dbrpc.NewCedarConn). ctx bounds the backend's lifetime
+// (and every dial). policy governs retry/backoff; a zero policy becomes DefaultRetryPolicy.
 func NewRPCBackend(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy) *RPCBackend {
+	return NewRPCBackendPool(ctx, dial, policy, DefaultReadConns)
+}
+
+// NewRPCBackendPool is NewRPCBackend with an explicit read-pool size (clamped to at
+// least 1). One extra connection is always used for writes.
+func NewRPCBackendPool(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy, readConns int) *RPCBackend {
 	if policy == (RetryPolicy{}) {
 		policy = DefaultRetryPolicy
 	}
-	return &RPCBackend{
-		dial:            dial,
-		ctx:             ctx,
+	if readConns < 1 {
+		readConns = 1
+	}
+	newLane := func() *connLane {
+		return &connLane{dial: dial, ctx: ctx, policy: policy}
+	}
+	b := &RPCBackend{
+		write:           newLane(),
 		policy:          policy,
 		now:             func() int64 { return time.Now().Unix() },
 		defaultLifetime: DefaultLifetime,
 	}
+	for i := 0; i < readConns; i++ {
+		b.reads = append(b.reads, newLane())
+	}
+	return b
 }
 
-// conn returns the current dbrpc client, establishing one with a SINGLE-FLIGHT dial
-// if needed: at most one dial runs at a time, and every concurrent caller waits on
-// that one attempt (bounded by its own ctx) instead of dialing independently -- so a
-// burst of operations against a down database produces one reconnect attempt, not a
-// storm. The shared dial itself is bounded by the backend lifetime ctx (it serves
-// all waiters, not any single caller).
-func (b *RPCBackend) conn(ctx context.Context) (*dbrpc.Client, error) {
+// readLane picks the next read-pool lane round-robin. A transaction (Get) or query
+// runs entirely on the one lane returned here, so its multiplexed calls stay coherent.
+func (b *RPCBackend) readLane() *connLane {
+	if len(b.reads) == 1 {
+		return b.reads[0]
+	}
+	i := b.readRR.Add(1) - 1
+	return b.reads[int(i%uint64(len(b.reads)))]
+}
+
+// conn returns the lane's current dbrpc client, establishing one with a SINGLE-FLIGHT
+// dial if needed: at most one dial runs at a time on this lane, and every concurrent
+// caller waits on that one attempt (bounded by its own ctx) instead of dialing
+// independently -- so a burst of operations against a down database produces one
+// reconnect attempt per lane, not a storm. The shared dial itself is bounded by the
+// backend lifetime ctx (it serves all waiters, not any single caller).
+func (lane *connLane) conn(ctx context.Context) (*dbrpc.Client, error) {
 	for {
-		b.mu.Lock()
-		if b.closed {
-			b.mu.Unlock()
+		lane.mu.Lock()
+		if lane.closed {
+			lane.mu.Unlock()
 			return nil, errBackendClosed
 		}
-		if b.client != nil {
-			cl := b.client
-			b.mu.Unlock()
+		if lane.client != nil {
+			cl := lane.client
+			lane.mu.Unlock()
 			return cl, nil
 		}
 		// Shared backoff gate: after a failed dial, hold every caller off until
@@ -132,8 +185,8 @@ func (b *RPCBackend) conn(ctx context.Context) (*dbrpc.Client, error) {
 		// callers whose waits expire together does not each fire a serial dial;
 		// aggregate dial rate stays ~one attempt per backoff interval regardless of
 		// how many operations are waiting.
-		if wait := time.Until(b.nextDialAt); wait > 0 {
-			b.mu.Unlock()
+		if wait := time.Until(lane.nextDialAt); wait > 0 {
+			lane.mu.Unlock()
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -142,76 +195,93 @@ func (b *RPCBackend) conn(ctx context.Context) (*dbrpc.Client, error) {
 			continue
 		}
 		// Gate open: single-flight the dial (concurrent callers share this one).
-		if b.dialing == nil {
-			b.dialing = make(chan struct{})
-			go b.dialShared()
+		if lane.dialing == nil {
+			lane.dialing = make(chan struct{})
+			go lane.dialShared()
 		}
-		done := b.dialing
-		b.mu.Unlock()
+		done := lane.dialing
+		lane.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-done:
 		}
-		b.mu.Lock()
-		if b.closed {
-			b.mu.Unlock()
+		lane.mu.Lock()
+		if lane.closed {
+			lane.mu.Unlock()
 			return nil, errBackendClosed
 		}
-		if b.client != nil {
-			cl := b.client
-			b.mu.Unlock()
+		if lane.client != nil {
+			cl := lane.client
+			lane.mu.Unlock()
 			return cl, nil
 		}
-		err := b.dialErr
-		b.mu.Unlock()
+		err := lane.dialErr
+		lane.mu.Unlock()
 		return nil, err
 	}
 }
 
-// dialShared performs the one shared dial and wakes every waiter.
-func (b *RPCBackend) dialShared() {
-	mc, err := b.dial(b.ctx)
+// dialShared performs the one shared dial for this lane and wakes every waiter.
+func (lane *connLane) dialShared() {
+	mc, err := lane.dial(lane.ctx)
 	var cl *dbrpc.Client
 	if err == nil {
 		cl = dbrpc.NewClient(mc)
 		// The server does not auto-create tables on first write; ensure each AdType's
-		// table exists. CreateTable is idempotent; ignore errors (a genuinely dead
-		// connection surfaces on the first real operation).
+		// table exists (idempotent). Done on every lane -- including read lanes -- so a
+		// query that reaches a fresh database before any write does not fail on a
+		// missing table. Ignore errors (a genuinely dead connection surfaces on the
+		// first real operation).
 		for t := AnyAd + 1; t < numAdTypes; t++ {
-			_ = cl.CreateTable(b.ctx, t.String())
+			_ = cl.CreateTable(lane.ctx, t.String())
 		}
 	}
-	b.mu.Lock()
+	lane.mu.Lock()
 	if err == nil {
-		b.client = cl
-		b.dialErr = nil
-		b.dialBackoff = 0
-		b.nextDialAt = time.Time{}
+		lane.client = cl
+		lane.dialErr = nil
+		lane.dialBackoff = 0
+		lane.nextDialAt = time.Time{}
 	} else {
-		b.dialErr = fmt.Errorf("collector: connect to ad database: %w", err)
-		b.dialBackoff = b.grow(b.dialBackoff) // 0 -> Initial on the first failure
-		b.nextDialAt = time.Now().Add(b.backoff(b.dialBackoff))
+		lane.dialErr = fmt.Errorf("collector: connect to ad database: %w", err)
+		lane.dialBackoff = lane.grow(lane.dialBackoff) // 0 -> Initial on the first failure
+		lane.nextDialAt = time.Now().Add(lane.backoff(lane.dialBackoff))
 	}
-	close(b.dialing)
-	b.dialing = nil
-	b.mu.Unlock()
+	close(lane.dialing)
+	lane.dialing = nil
+	lane.mu.Unlock()
 }
 
-// drop discards cl so the next operation redials, but only if cl is still the
-// current client (a concurrent reconnect may already have replaced it).
-func (b *RPCBackend) drop(cl *dbrpc.Client) {
-	b.mu.Lock()
-	if b.client != nil && b.client == cl {
-		_ = b.client.Close()
-		b.client = nil
+// drop discards cl so the next operation on this lane redials, but only if cl is still
+// the current client (a concurrent reconnect may already have replaced it).
+func (lane *connLane) drop(cl *dbrpc.Client) {
+	lane.mu.Lock()
+	if lane.client != nil && lane.client == cl {
+		_ = lane.client.Close()
+		lane.client = nil
 	}
-	b.mu.Unlock()
+	lane.mu.Unlock()
 }
 
-// withRetry runs op against the shared connection, retrying until it succeeds, ctx
-// ends, or the retry budget is exhausted. It classifies failures:
+// close tears down the lane's connection.
+func (lane *connLane) close() error {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.closed = true
+	if lane.client != nil {
+		err := lane.client.Close()
+		lane.client = nil
+		return err
+	}
+	return nil
+}
+
+// withRetry runs op against the given lane's connection, retrying until it succeeds,
+// ctx ends, or the retry budget is exhausted. The whole op runs on the one lane passed
+// in, so a multiplexed transaction (BeginTable...Commit) stays coherent on one
+// connection. It classifies failures:
 //   - optimistic write-write conflict (*db.ConflictError): a healthy connection, so
 //     retry the whole operation immediately (bounded by maxConflictRetries);
 //   - server/logical error (*dbrpc.ServerError): deterministic, surfaced at once;
@@ -219,13 +289,13 @@ func (b *RPCBackend) drop(cl *dbrpc.Client) {
 //   - anything else (transport failure, dbrpc.ErrConnClosed, a dial error): the
 //     connection is suspect -- drop it, back off, and replay (every op is
 //     idempotent-by-key, so a replay after an ambiguous failure is safe).
-func (b *RPCBackend) withRetry(ctx context.Context, op func(cl *dbrpc.Client) error) error {
+func (b *RPCBackend) withRetry(ctx context.Context, lane *connLane, op func(cl *dbrpc.Client) error) error {
 	start := time.Now()
 	backoff := b.policy.Initial
 	conflicts := 0
 	var lastErr error
 	for {
-		cl, err := b.conn(ctx)
+		cl, err := lane.conn(ctx)
 		if err == nil {
 			opErr := op(cl)
 			if opErr == nil {
@@ -243,7 +313,7 @@ func (b *RPCBackend) withRetry(ctx context.Context, op func(cl *dbrpc.Client) er
 			case ctx.Err() != nil:
 				return ctx.Err()
 			default:
-				b.drop(cl)
+				lane.drop(cl)
 				lastErr = opErr
 			}
 		} else {
@@ -263,21 +333,21 @@ func (b *RPCBackend) withRetry(ctx context.Context, op func(cl *dbrpc.Client) er
 		case <-ctx.Done():
 			Metrics.backoffSeconds.Observe(time.Since(waitStart).Seconds())
 			return ctx.Err()
-		case <-time.After(b.backoff(backoff)):
+		case <-time.After(lane.backoff(backoff)):
 		}
 		Metrics.backoffSeconds.Observe(time.Since(waitStart).Seconds())
-		backoff = b.grow(backoff)
+		backoff = lane.grow(backoff)
 	}
 }
 
 // backoff applies jitter to d (a random +/- policy.Jitter fraction).
-func (b *RPCBackend) backoff(d time.Duration) time.Duration {
-	if b.policy.Jitter <= 0 {
+func (lane *connLane) backoff(d time.Duration) time.Duration {
+	if lane.policy.Jitter <= 0 {
 		return d
 	}
 	// Deterministic-free jitter: derive from the current nanosecond, avoiding a
 	// dependency on math/rand's global state. +/- Jitter fraction.
-	frac := b.policy.Jitter
+	frac := lane.policy.Jitter
 	n := time.Now().UnixNano()
 	r := float64(n%1000)/1000.0*2 - 1 // in [-1, 1)
 	j := 1 + r*frac
@@ -288,13 +358,13 @@ func (b *RPCBackend) backoff(d time.Duration) time.Duration {
 }
 
 // grow multiplies the backoff by the policy multiplier, capped at Max.
-func (b *RPCBackend) grow(d time.Duration) time.Duration {
-	next := time.Duration(float64(d) * b.policy.Multiplier)
-	if next > b.policy.Max {
-		return b.policy.Max
+func (lane *connLane) grow(d time.Duration) time.Duration {
+	next := time.Duration(float64(d) * lane.policy.Multiplier)
+	if next > lane.policy.Max {
+		return lane.policy.Max
 	}
 	if next <= 0 {
-		return b.policy.Initial
+		return lane.policy.Initial
 	}
 	return next
 }
@@ -356,7 +426,7 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 		}
 		byTable[p.Type.String()] = append(byTable[p.Type.String()], keyedText{string(key), stampText(p.Text, b.now())})
 	}
-	return b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	return b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 		for table, items := range byTable {
 			if err := putBatchTx(ctx, cl, table, items); err != nil {
 				return err
@@ -408,7 +478,7 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 // put upserts key=text in table under one retry envelope. text must already be a
 // complete old-ClassAd body.
 func (b *RPCBackend) put(ctx context.Context, table, key, text string) error {
-	return b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	return b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 		tx, err := cl.BeginTable(ctx, table)
 		if err != nil {
 			return err
@@ -478,7 +548,7 @@ func sliceSeq[T any](s []T) iter.Seq[T] {
 // empty result.
 func (b *RPCBackend) fetchTable(ctx context.Context, t AdType, constraint string, limit int) ([]*classad.ClassAd, error) {
 	var out []*classad.ClassAd
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		rows, e := cl.QueryTable(ctx, t.String(), rpcConstraint(constraint), limit)
 		if e != nil {
 			return e
@@ -551,7 +621,7 @@ func (b *RPCBackend) QueryRaw(ctx context.Context, t AdType, constraint string, 
 
 func (b *RPCBackend) fetchRawTable(ctx context.Context, t AdType, constraint string, limit int) ([]collections.RawAd, error) {
 	var out []collections.RawAd
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		rows, e := cl.QueryRawTable(ctx, t.String(), rpcConstraint(constraint), limit)
 		if e != nil {
 			return e
@@ -596,7 +666,7 @@ func (b *RPCBackend) QueryRawProject(ctx context.Context, t AdType, constraint s
 
 func (b *RPCBackend) fetchRawTableProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) ([]collections.RawAd, error) {
 	var out []collections.RawAd
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		rows, e := cl.QueryRawProject(ctx, t.String(), rpcConstraint(constraint), projection, limit)
 		if e != nil {
 			return e
@@ -658,7 +728,7 @@ func (b *RPCBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) 
 		return nil, false
 	}
 	var found *classad.ClassAd
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		tx, err := cl.BeginTable(ctx, t.String())
 		if err != nil {
 			return err
@@ -699,7 +769,7 @@ func (b *RPCBackend) Invalidate(ctx context.Context, t AdType, constraint string
 	}
 	if t != StartdAd {
 		var n int
-		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 			var e error
 			n, e = cl.DeleteWhereTable(ctx, t.String(), rpcConstraint(constraint))
 			return e
@@ -730,7 +800,7 @@ func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (i
 	n := 0
 	for _, k := range keys {
 		var present bool
-		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 			tx, err := cl.BeginTable(ctx, t.String())
 			if err != nil {
 				return err
@@ -752,7 +822,7 @@ func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (i
 			n++
 		}
 		if t == StartdAd {
-			_ = b.withRetry(ctx, func(cl *dbrpc.Client) error {
+			_ = b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 				tx, err := cl.BeginTable(ctx, StartdPvtAd.String())
 				if err != nil {
 					return err
@@ -778,7 +848,7 @@ func (b *RPCBackend) Watch(ctx context.Context, t AdType, cursor []byte, constra
 	}
 	var ch <-chan dbrpc.WatchEvent
 	var cancel func()
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		c, cf, e := cl.WatchTable(ctx, t.String(), cursor)
 		if e != nil {
 			return e
@@ -837,7 +907,7 @@ func (b *RPCBackend) Expire(ctx context.Context) (int, error) {
 	total := 0
 	for t := AnyAd + 1; t < numAdTypes; t++ {
 		var n int
-		err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
 			var e error
 			n, e = cl.DeleteWhereTable(ctx, t.String(), constraint)
 			return e
@@ -852,7 +922,7 @@ func (b *RPCBackend) Expire(ctx context.Context) (int, error) {
 
 func (b *RPCBackend) Len(ctx context.Context, t AdType) (int, error) {
 	var n int
-	err := b.withRetry(ctx, func(cl *dbrpc.Client) error {
+	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
 		rows, e := cl.QueryTable(ctx, t.String(), "true", 0)
 		if e != nil {
 			return e
@@ -863,16 +933,19 @@ func (b *RPCBackend) Len(ctx context.Context, t AdType) (int, error) {
 	return n, err
 }
 
+// Close tears down every lane (the write connection and the whole read pool),
+// returning the first close error encountered.
 func (b *RPCBackend) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.closed = true
-	if b.client != nil {
-		err := b.client.Close()
-		b.client = nil
-		return err
+	var firstErr error
+	if err := b.write.close(); err != nil {
+		firstErr = err
 	}
-	return nil
+	for _, r := range b.reads {
+		if err := r.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // rpcConstraint maps the Backend's "" (match everything) to the "true" the dbrpc

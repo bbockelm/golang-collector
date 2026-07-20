@@ -21,6 +21,8 @@ type dialController struct {
 	attempts atomic.Int32
 	mu       sync.Mutex
 	fail     bool
+	gateNext bool            // the next dial returns a wedged connection
+	gated    []*blockingConn // wedged connections handed out, released at cleanup
 }
 
 func newDialController(t *testing.T) *dialController {
@@ -30,7 +32,9 @@ func newDialController(t *testing.T) *dialController {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cat.Close() })
-	return &dialController{srv: dbrpc.NewServerCatalog(cat)}
+	dc := &dialController{srv: dbrpc.NewServerCatalog(cat)}
+	t.Cleanup(dc.releaseGated)
+	return dc
 }
 
 func (dc *dialController) setFail(f bool) {
@@ -39,18 +43,64 @@ func (dc *dialController) setFail(f bool) {
 	dc.mu.Unlock()
 }
 
+// setGateNext makes the next dial hand out a connection whose reader is wedged (never
+// returns a frame), simulating a connection whose dbrpc demux loop is stalled behind a
+// slow stream consumer.
+func (dc *dialController) setGateNext(g bool) {
+	dc.mu.Lock()
+	dc.gateNext = g
+	dc.mu.Unlock()
+}
+
+func (dc *dialController) releaseGated() {
+	dc.mu.Lock()
+	gated := dc.gated
+	dc.gated = nil
+	dc.mu.Unlock()
+	for _, g := range gated {
+		g.release()
+	}
+}
+
 func (dc *dialController) dial(context.Context) (dbrpc.MsgConn, error) {
 	dc.attempts.Add(1)
 	dc.mu.Lock()
 	fail := dc.fail
+	gate := dc.gateNext
+	dc.gateNext = false
 	dc.mu.Unlock()
 	if fail {
 		return nil, errors.New("dial: connection refused")
 	}
 	sc, cc := net.Pipe()
 	go func() { _ = dc.srv.ServeConnOpts(dbrpc.NewStreamConn(sc), dbrpc.ServeOptions{IncludePrivate: true}) }()
-	return dbrpc.NewStreamConn(cc), nil
+	conn := dbrpc.NewStreamConn(cc)
+	if gate {
+		bc := &blockingConn{MsgConn: conn, released: make(chan struct{})}
+		dc.mu.Lock()
+		dc.gated = append(dc.gated, bc)
+		dc.mu.Unlock()
+		return bc, nil
+	}
+	return conn, nil
 }
+
+// blockingConn wraps a MsgConn whose ReadMsg blocks until released -- so the dbrpc
+// client's reader goroutine wedges on it exactly as it would behind a stream consumer
+// that has fallen too far behind. Everything else delegates.
+type blockingConn struct {
+	dbrpc.MsgConn
+	once     sync.Once
+	released chan struct{}
+}
+
+func (b *blockingConn) ReadMsg() ([]byte, error) {
+	<-b.released
+	return nil, errors.New("blockingConn: released")
+}
+
+// release unblocks the wedged reader (idempotent).
+func (b *blockingConn) release() { b.once.Do(func() { close(b.released) }) }
 
 func fastPolicy() RetryPolicy {
 	return RetryPolicy{Initial: 10 * time.Millisecond, Max: 40 * time.Millisecond, Multiplier: 2, Jitter: 0.1, MaxElapsed: 500 * time.Millisecond}
@@ -132,9 +182,92 @@ func TestRPCBackendSingleFlightDial(t *testing.T) {
 	}
 	wg.Wait()
 
+	// Without single-flight, each op would dial on nearly every retry round -- ~50 ops
+	// x ~14 rounds over the 500ms budget ~= hundreds of dials. Single-flight collapses
+	// that to roughly budget/backoff windows (a few dozen); the gate leaks a couple of
+	// extra dials per window under scheduler contention, so bound generously (ops*3)
+	// while still catching a real storm by an order of magnitude.
 	dials := dc.attempts.Load()
-	if int(dials) >= ops {
+	if int(dials) >= ops*3 {
 		t.Fatalf("dial attempts = %d for %d concurrent ops; single-flight should make it far fewer (a reconnect storm otherwise)", dials, ops)
 	}
 	t.Logf("single-flight: %d dial attempts served %d concurrent operations", dials, ops)
+}
+
+// TestReadStallDoesNotBlockWrites is the regression guard for the read/write
+// connection split: a wedged read connection (its dbrpc demux reader stalled, as when
+// a streaming query's consumer falls behind) must NOT stall write transactions, which
+// ride a separate connection. Were reads and writes multiplexed on one connection, the
+// wedged reader would starve the write's commit response and this test would hang.
+func TestReadStallDoesNotBlockWrites(t *testing.T) {
+	dc := newDialController(t)
+	// One read lane so the wedged dial deterministically lands on it.
+	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 1)
+	defer b.Close()
+	ctx := context.Background()
+
+	// Bring the write lane up on a healthy connection.
+	if err := b.UpdateOldText(ctx, StartdAd, `Name = "w1"`+"\n"+`State = "Idle"`); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// The read lane's next dial gets a wedged connection; a read on it must hang.
+	dc.setGateNext(true)
+	readDone := make(chan struct{})
+	go func() { _, _ = b.Len(ctx, StartdAd); close(readDone) }()
+	select {
+	case <-readDone:
+		t.Fatal("read unexpectedly completed on a wedged connection")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// The write lane is a different connection, so a write completes promptly despite
+	// the wedged read.
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- b.UpdateOldText(ctx, StartdAd, `Name = "w2"`+"\n"+`State = "Idle"`)
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write failed while a read connection was wedged: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("write stalled behind a wedged read connection -- read and write lanes are not isolated")
+	}
+
+	// The wedged read is still stuck (released only at cleanup); confirm the write
+	// really did overtake it rather than both having completed.
+	select {
+	case <-readDone:
+		t.Fatal("read should still be wedged")
+	default:
+	}
+}
+
+// TestReadWriteUseSeparateConnections asserts, white-box, that a read and a write land
+// on distinct dbrpc client connections -- the structural invariant behind the stall
+// fix.
+func TestReadWriteUseSeparateConnections(t *testing.T) {
+	dc := newDialController(t)
+	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 2)
+	defer b.Close()
+	ctx := context.Background()
+
+	if err := b.UpdateOldText(ctx, StartdAd, `Name = "x"`+"\n"+`State = "Idle"`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := b.Len(ctx, StartdAd); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	wc := b.write.client
+	if wc == nil {
+		t.Fatal("write lane has no connection after a write")
+	}
+	for i, r := range b.reads {
+		if r.client != nil && r.client == wc {
+			t.Fatalf("read lane %d shares the write lane's connection; reads and writes must be isolated", i)
+		}
+	}
 }
