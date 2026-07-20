@@ -69,6 +69,10 @@ type BufferedBackend struct {
 	wg   sync.WaitGroup
 }
 
+// Base returns the wrapped backend, so a caller can reach an optional capability the
+// wrapper does not itself expose (e.g. the RPCBackend's DBDiagnostics for metrics).
+func (b *BufferedBackend) Base() Backend { return b.Backend }
+
 var (
 	_ Backend             = (*BufferedBackend)(nil)
 	_ RawQueryer          = (*BufferedBackend)(nil)

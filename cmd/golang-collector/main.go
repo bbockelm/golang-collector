@@ -483,8 +483,9 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 	// precisely the one with no store.Statser. The per-ad-type storage gauges are
 	// added only when the backend exposes them.
 	statser, _ := st.(store.Statser) // nil for a backend without stats; Handler tolerates it
+	dbd := dbDiagnoser(st)           // non-nil only for the remote-database backend
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler(statser))
+	mux.Handle("/metrics", metrics.Handler(statser, dbd))
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")
@@ -496,6 +497,22 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
+}
+
+// dbDiagnoser finds a metrics.DBDiagnoser (the remote database's per-table diagnostics
+// source) in st, unwrapping the BufferedBackend that fronts the RPCBackend. Returns nil
+// for a local backend, so the collector's /metrics adds the remote-database metrics
+// only when there is a remote database behind it.
+func dbDiagnoser(st store.Backend) metrics.DBDiagnoser {
+	if d, ok := st.(metrics.DBDiagnoser); ok {
+		return d
+	}
+	if u, ok := st.(interface{ Base() store.Backend }); ok {
+		if d, ok := u.Base().(metrics.DBDiagnoser); ok {
+			return d
+		}
+	}
+	return nil
 }
 
 // buildBackend selects the collector's ad-store backend from COLLECTOR_STORE:

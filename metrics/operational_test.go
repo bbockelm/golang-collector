@@ -18,7 +18,7 @@ func TestOperationalMetricsServedWithoutStatser(t *testing.T) {
 	store.ObserveUpdate("private", 5*time.Millisecond)
 	store.ObserveUpdate("public", 1*time.Millisecond)
 
-	h := Handler(nil) // nil Statser == the RPCBackend backend
+	h := Handler(nil, nil) // nil Statser == the RPCBackend backend
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
 	body := w.Body.String()
