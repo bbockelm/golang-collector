@@ -302,9 +302,23 @@ func isConflict(err error) bool {
 
 // isPermanent reports a deterministic server/logical error (bad constraint, unknown
 // table, malformed op): replaying it fails identically, so it is surfaced at once.
+// A "no such transaction" is explicitly NOT permanent: the transaction was aborted
+// underneath us (a connection reset triggers the server's disconnect cleanup to abort
+// its open transactions, and an op can arrive just after), which a replay on a fresh
+// connection + transaction resolves. So it falls through to the transport path
+// (drop + backoff + replay).
 func isPermanent(err error) bool {
 	var se *dbrpc.ServerError
-	return errors.As(err, &se)
+	return errors.As(err, &se) && !isNoSuchTxn(err)
+}
+
+// isNoSuchTxn reports the server's "no such transaction" error -- the transaction
+// this op names is gone (committed, aborted, or cleaned up when its connection
+// dropped). It is transient: a fresh transaction succeeds. The string matches the
+// message dbrpc's server sends (dbrpc.ServerError carries only a message, no code).
+func isNoSuchTxn(err error) bool {
+	var se *dbrpc.ServerError
+	return errors.As(err, &se) && se.Msg == "no such transaction"
 }
 
 type keyedText struct{ key, text string }
@@ -355,19 +369,29 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	}
 	for _, it := range items {
 		if err := tx.NewClassAd(ctx, it.key, it.text); err != nil {
-			// A *dbrpc.ServerError means the db server rejected THIS ad (e.g. an
-			// unparseable value): opNewAd returned an error without adding it to the
-			// transaction, which stays open. Log the offending ad (the wire bytes
-			// are otherwise encrypted) and skip it, so one bad ad does not abort the
-			// batch -- a partial commit using the transaction the good ads already
-			// sit in. Any other error is a transport/transaction failure: abort and
-			// let withRetry retry the whole batch.
+			// "no such transaction" means the transaction is gone (aborted underneath
+			// us -- e.g. a connection reset cleaned it up server-side), NOT that this
+			// ad was rejected. The remaining ads were never given a chance, so do not
+			// keep skipping them (that silently drops them and mislabels them as
+			// "rejected"): abort and return so withRetry replays the whole batch on a
+			// fresh transaction. Every write is an idempotent keyed upsert, so replay
+			// is safe.
+			if isNoSuchTxn(err) {
+				_ = tx.Abort(ctx)
+				return err
+			}
+			// Any other *dbrpc.ServerError means the server rejected THIS ad (e.g. an
+			// unparseable value): opNewAd returned an error without adding it, and the
+			// transaction stays open. Log the offending ad (the wire bytes are otherwise
+			// encrypted) and skip just it -- a partial commit using the transaction the
+			// good ads already sit in -- so one bad ad does not lose the batch.
 			var se *dbrpc.ServerError
 			if errors.As(err, &se) {
 				slog.Warn("collector: db rejected ad update; skipping (batch continues)",
 					"table", table, "name", AdName(it.text), "err", se, "ad", AdExcerpt(it.text))
 				continue
 			}
+			// A transport/transaction failure: abort and let withRetry retry the batch.
 			_ = tx.Abort(ctx)
 			return err
 		}
