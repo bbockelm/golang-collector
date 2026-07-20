@@ -30,7 +30,7 @@ func TestMetricsHandler(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	w := httptest.NewRecorder()
-	Handler(st).ServeHTTP(w, req)
+	Handler(st, nil).ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("scrape status = %d", w.Code)
 	}

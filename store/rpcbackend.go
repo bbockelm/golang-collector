@@ -933,6 +933,34 @@ func (b *RPCBackend) Len(ctx context.Context, t AdType) (int, error) {
 	return n, err
 }
 
+// DBDiagnostics fetches per-table diagnostics (storage stats + operational timing
+// counters) from the remote database over dbrpc -- one entry per ad-type table that
+// responds. It is best-effort: a table that errors (e.g. not yet created) is skipped
+// and the first such error is returned alongside whatever succeeded, so a partial
+// snapshot still feeds metrics. Reads ride the read-lane pool. The fetch is not free
+// (the server samples ads for index suggestions), so a scraper should cache it.
+func (b *RPCBackend) DBDiagnostics(ctx context.Context) (map[string]*dbrpc.Diagnostics, error) {
+	out := make(map[string]*dbrpc.Diagnostics)
+	var firstErr error
+	for t := AnyAd + 1; t < numAdTypes; t++ {
+		table := t.String()
+		var d *dbrpc.Diagnostics
+		err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+			var e error
+			d, e = cl.DiagnosticsTable(ctx, table)
+			return e
+		})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		out[table] = d
+	}
+	return out, firstErr
+}
+
 // Close tears down every lane (the write connection and the whole read pool),
 // returning the first close error encountered.
 func (b *RPCBackend) Close() error {
