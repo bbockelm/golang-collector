@@ -172,7 +172,14 @@ func adMessage(c *cedarserver.Conn) *message.Message {
 // otherwise ack a merely-buffered write).
 func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
-		msg := message.NewMessageFromStream(c.Stream)
+		// Keep the connection open and read from the follow-on frame (c.Message),
+		// like updateHandler: a startd may stream several WITH_ACK updates down one
+		// persistent socket, each a raw command int + ad, waiting for the ack
+		// between them. Without this the socket closes after the first ack and the
+		// follow-on frame is misread.
+		c.KeepAlive()
+
+		msg := adMessage(c)
 		text, err := msg.GetClassAdRaw(ctx)
 		if err != nil {
 			return err
@@ -395,7 +402,18 @@ func redactRawExprs(exprs [][]byte) [][]byte {
 // Requirements constraint if present, otherwise the single ad it identifies.
 func invalidateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
-		msg := message.NewMessageFromStream(c.Stream)
+		// Keep the connection open for follow-on commands. HTCondor collectors
+		// forward UPDATE_* and INVALIDATE_* interleaved down ONE persistent command
+		// socket (a view collector's feed). Without this, the server closes the
+		// socket after an invalidation and the sender only discovers it a few
+		// buffered writes later -- "condor_write(): Socket closed ... to collector".
+		c.KeepAlive()
+
+		// Read from the follow-on message that already carried the command int
+		// (c.Message), exactly as updateHandler does. A fresh NewMessageFromStream
+		// would read the wrong frame on a kept-alive socket, desyncing the stream
+		// (the invalidation would miss and every following forwarded ad be lost).
+		msg := adMessage(c)
 		ad, err := msg.GetClassAd(ctx)
 		if err != nil {
 			return err
