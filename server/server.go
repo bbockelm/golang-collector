@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"log/slog"
 
@@ -98,6 +99,13 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 			}
 		}
 		if err := st.UpdateOldText(ctx, t, text); err != nil {
+			if isCanceled(err) {
+				// The context was cancelled (the collector is shutting down, or the
+				// client went away) -- the ad was not rejected, the operation was
+				// aborted. End the handler cleanly instead of logging a misleading
+				// "rejected ad" warning per in-flight update.
+				return err
+			}
 			// A single unparseable/rejected ad must not tear down the persistent
 			// command socket (which would drop every following update from this
 			// daemon) -- log the offending ad and skip it, keeping the session up.
@@ -112,12 +120,22 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 		fwd.forwardText(cmd, text)
 		if havePvt {
 			if err := st.UpdatePvt(ctx, text, pvt); err != nil {
+				if isCanceled(err) {
+					return err // shutting down / connection gone -- not a rejection
+				}
 				slog.Warn("collector: rejected private ad update; skipping (connection kept open)",
 					"type", t.String(), "name", store.AdName(text), "err", err, "ad", store.AdExcerpt(pvt))
 			}
 		}
 		return nil
 	}
+}
+
+// isCanceled reports whether err is a context cancellation or deadline -- i.e. the
+// operation was aborted (collector shutdown, or the peer went away), not rejected.
+// Such an error is not a bad ad and must not be logged as one.
+func isCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // adMessage returns the message a handler should read its ad from: the message
