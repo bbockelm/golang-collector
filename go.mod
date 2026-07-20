@@ -7,9 +7,9 @@ require (
 	github.com/PelicanPlatform/classad/collections v0.9.0
 	github.com/PelicanPlatform/classad/db v0.9.0
 	github.com/PelicanPlatform/classad/dbrpc v0.10.0
-	github.com/bbockelm/cedar v0.5.7
+	github.com/bbockelm/cedar v0.6.1
 	github.com/bbockelm/golang-ccb v0.4.0
-	github.com/bbockelm/golang-htcondor v0.8.0
+	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/prometheus/client_golang v1.13.0
 )
 
@@ -24,7 +24,13 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
+	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
+	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
+	github.com/jcmturner/gofork v1.7.6 // indirect
+	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
+	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
@@ -41,6 +47,7 @@ require (
 	github.com/tidwall/btree v1.8.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
