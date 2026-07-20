@@ -478,13 +478,11 @@ func metricsListenAddr(cfg *config.Config, flagAddr string) string {
 // until ctx is cancelled. Bind failures are logged, not fatal -- metrics are
 // observability, not core function.
 func startMetrics(ctx context.Context, addr string, st store.Backend, log *logging.Logger) {
-	// Per-table metrics come from store.Statser; a backend that doesn't expose
-	// them (e.g. a remote database) simply has no metrics endpoint.
-	statser, ok := st.(store.Statser)
-	if !ok {
-		log.Info(logging.DestinationGeneral, "metrics endpoint disabled: backend has no stats")
-		return
-	}
+	// The operational metrics (update/batch/backoff timings, counts) are always
+	// served -- they matter most for the remote-database backend, which is
+	// precisely the one with no store.Statser. The per-ad-type storage gauges are
+	// added only when the backend exposes them.
+	statser, _ := st.(store.Statser) // nil for a backend without stats; Handler tolerates it
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(statser))
 	srv := &http.Server{Addr: addr, Handler: mux}

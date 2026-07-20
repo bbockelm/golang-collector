@@ -255,11 +255,17 @@ func (b *RPCBackend) withRetry(ctx context.Context, op func(cl *dbrpc.Client) er
 		if b.policy.MaxElapsed > 0 && time.Since(start) >= b.policy.MaxElapsed {
 			return fmt.Errorf("collector: ad database unavailable, gave up after %s: %w", b.policy.MaxElapsed, lastErr)
 		}
+		// A retry: count it, and measure the time parked in backoff (blocked, not
+		// working) -- the direct measure of how much a slow/down database stalls us.
+		Metrics.retriesTotal.Inc()
+		waitStart := time.Now()
 		select {
 		case <-ctx.Done():
+			Metrics.backoffSeconds.Observe(time.Since(waitStart).Seconds())
 			return ctx.Err()
 		case <-time.After(b.backoff(backoff)):
 		}
+		Metrics.backoffSeconds.Observe(time.Since(waitStart).Seconds())
 		backoff = b.grow(backoff)
 	}
 }

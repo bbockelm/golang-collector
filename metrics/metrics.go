@@ -68,16 +68,22 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// Handler returns an http.Handler that serves Prometheus metrics for the store:
-// the per-ad-type storage gauges above, plus standard Go runtime and process
-// (RSS, open FDs, ...) collectors. It uses a private registry so it can be
-// mounted alongside any other metrics without global-registry collisions.
+// Handler returns an http.Handler that serves the collector's Prometheus metrics:
+// the operational instruments (update/batch/backoff timings and counts, from
+// store.MetricsRegistry), standard Go runtime and process (RSS, open FDs, ...)
+// collectors, and -- when st is non-nil -- the per-ad-type storage gauges. st is
+// nil for a backend with no storage stats (the remote-database RPCBackend), which
+// still gets the operational metrics that matter most for it. A private registry
+// is combined with the store's operational registry via a Gatherers set, so this
+// can be mounted anywhere without global-registry collisions.
 func Handler(st store.Statser) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
-		newStoreCollector(st),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
-	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+	if st != nil {
+		reg.MustRegister(newStoreCollector(st))
+	}
+	return promhttp.HandlerFor(prometheus.Gatherers{reg, store.MetricsRegistry}, promhttp.HandlerOpts{})
 }
