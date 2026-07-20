@@ -137,7 +137,14 @@ func adMessage(c *cedarserver.Conn) *message.Message {
 // otherwise ack a merely-buffered write).
 func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarserver.HandlerFunc {
 	return func(ctx context.Context, c *cedarserver.Conn) error {
-		msg := message.NewMessageFromStream(c.Stream)
+		// Keep the connection open and read from the follow-on frame (c.Message),
+		// like updateHandler: a startd may stream several WITH_ACK updates down one
+		// persistent socket, each a raw command int + ad, waiting for the ack
+		// between them. Without this the socket closes after the first ack and the
+		// follow-on frame is misread.
+		c.KeepAlive()
+
+		msg := adMessage(c)
 		text, err := msg.GetClassAdRaw(ctx)
 		if err != nil {
 			return err

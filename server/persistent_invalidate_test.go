@@ -97,3 +97,75 @@ func sendFollowOn(t *testing.T, ctx context.Context, strm *stream.Stream, cmd in
 		t.Fatalf("finish cmd %d: %v", cmd, err)
 	}
 }
+
+// TestAckUpdateKeepsConnectionOpen is the WITH_ACK analogue of
+// TestInvalidateKeepsConnectionOpen: a startd may stream several
+// UPDATE_STARTD_AD_WITH_ACK updates down one persistent socket, reading the ack
+// between each. ackUpdateHandler must keep the socket open and read the follow-on
+// frame; otherwise the socket closes after the first ack and the second update's
+// ack read fails / its ad is lost.
+func TestAckUpdateKeepsConnectionOpen(t *testing.T) {
+	st, addr, stop := startCollector(t)
+	defer stop()
+
+	ctx := context.Background()
+	sec := plaintextSec()
+	sec.Command = commands.UPDATE_STARTD_AD_WITH_ACK // first command carried by the handshake
+	cl, err := client.ConnectAndAuthenticate(ctx, addr, sec)
+	if err != nil {
+		t.Fatalf("connect+authenticate: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	strm := cl.GetStream()
+
+	adA := benchAd(5) // acked via the first (handshake) command
+	adB := benchAd(7) // acked as a follow-on -- lost on the bug
+
+	sendAckUpdate(t, ctx, strm, adA, true)
+	sendAckUpdate(t, ctx, strm, adB, false)
+
+	// Both durable updates must be stored (DurableUpdate commits before the ack).
+	// If the socket closed after adA's ack or the follow-on frame desynced, adB's
+	// ack read above already fails; this confirms both ads actually landed.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, haveA := st.Get(ctx, store.StartdAd, adA)
+		_, haveB := st.Get(ctx, store.StartdAd, adB)
+		if haveA && haveB {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("WITH_ACK on a persistent socket: haveA=%v haveB=%v (want both stored). "+
+				"The follow-on WITH_ACK update was lost -- the socket closed after the first ack "+
+				"or the follow-on frame desynced.", haveA, haveB)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sendAckUpdate sends one UPDATE_STARTD_AD_WITH_ACK on a persistent socket and
+// waits for the collector's one-int acknowledgment. firstOnConn omits the
+// command-int prefix (the command was carried by the handshake).
+func sendAckUpdate(t *testing.T, ctx context.Context, strm *stream.Stream, ad *classad.ClassAd, firstOnConn bool) {
+	t.Helper()
+	msg := message.NewMessageForStream(strm)
+	if !firstOnConn {
+		if err := msg.PutInt(ctx, commands.UPDATE_STARTD_AD_WITH_ACK); err != nil {
+			t.Fatalf("put WITH_ACK cmd: %v", err)
+		}
+	}
+	if err := msg.PutClassAd(ctx, ad); err != nil {
+		t.Fatalf("put ad: %v", err)
+	}
+	if err := msg.FinishMessage(ctx); err != nil {
+		t.Fatalf("finish ad: %v", err)
+	}
+	resp := message.NewMessageFromStream(strm)
+	ok, err := resp.GetInt32(ctx)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if ok != 1 {
+		t.Fatalf("ack = %d, want 1", ok)
+	}
+}
