@@ -106,9 +106,12 @@ type connLane struct {
 }
 
 var (
-	_ Backend     = (*RPCBackend)(nil)
-	_ RawQueryer  = (*RPCBackend)(nil)
-	_ BatchWriter = (*RPCBackend)(nil)
+	_ Backend              = (*RPCBackend)(nil)
+	_ RawQueryer           = (*RPCBackend)(nil)
+	_ ProjectedRawQueryer  = (*RPCBackend)(nil)
+	_ RawStreamer          = (*RPCBackend)(nil)
+	_ ProjectedRawStreamer = (*RPCBackend)(nil)
+	_ BatchWriter          = (*RPCBackend)(nil)
 )
 
 var errBackendClosed = errors.New("collector: rpc backend is closed")
@@ -397,9 +400,23 @@ func isConflict(err error) bool {
 // connection + transaction resolves. So it falls through to the transport path
 // (drop + backoff + replay).
 func isPermanent(err error) bool {
+	var nr *errNoReplay
+	if errors.As(err, &nr) {
+		return true
+	}
 	var se *dbrpc.ServerError
 	return errors.As(err, &se) && !isNoSuchTxn(err)
 }
+
+// errNoReplay wraps a streaming failure that must NOT be retried because rows were
+// already delivered to the caller -- a replay would re-deliver (duplicate) the ads a
+// relay has already forwarded to its own client. isPermanent treats it as permanent so
+// withRetry surfaces it immediately instead of replaying. (A failure before the first
+// row is delivered is left un-wrapped, so it retries normally: nothing was relayed yet.)
+type errNoReplay struct{ err error }
+
+func (e *errNoReplay) Error() string { return e.err.Error() }
+func (e *errNoReplay) Unwrap() error { return e.err }
 
 // isNoSuchTxn reports the server's "no such transaction" error -- the transaction
 // this op names is gone (committed, aborted, or cleaned up when its connection
@@ -496,44 +513,51 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 	})
 }
 
+// adBatchChunkSize bounds how many ads ride in one opNewAdBatch frame. The chunks are
+// pipelined (sent back-to-back without waiting for acks), so a whole table's batch costs
+// ~one round-trip regardless of ad count -- collapsing the per-ad request/ack round-trips
+// that used to dominate the write path -- while each frame stays well under the stream's
+// max message size.
+const adBatchChunkSize = 64
+
 // putBatchTx upserts all items into one table in one transaction (no internal retry;
-// withRetry owns retry/backoff/reconnect).
+// withRetry owns retry/backoff/reconnect). The ads are sent as pipelined batches instead
+// of one request/ack per ad.
 func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []keyedText) error {
+	if len(items) == 0 {
+		return nil
+	}
 	tx, err := cl.BeginTable(ctx, table)
 	if err != nil {
 		return err
 	}
-	for _, it := range items {
-		adStart := time.Now()
-		err := tx.NewClassAd(ctx, it.key, it.text)
-		Metrics.adWriteSeconds.Observe(time.Since(adStart).Seconds())
-		if err != nil {
-			// "no such transaction" means the transaction is gone (aborted underneath
-			// us -- e.g. a connection reset cleaned it up server-side), NOT that this
-			// ad was rejected. The remaining ads were never given a chance, so do not
-			// keep skipping them (that silently drops them and mislabels them as
-			// "rejected"): abort and return so withRetry replays the whole batch on a
-			// fresh transaction. Every write is an idempotent keyed upsert, so replay
-			// is safe.
-			if isNoSuchTxn(err) {
-				_ = tx.Abort(ctx)
-				return err
-			}
-			// Any other *dbrpc.ServerError means the server rejected THIS ad (e.g. an
-			// unparseable value): opNewAd returned an error without adding it, and the
-			// transaction stays open. Log the offending ad (the wire bytes are otherwise
-			// encrypted) and skip just it -- a partial commit using the transaction the
-			// good ads already sit in -- so one bad ad does not lose the batch.
-			var se *dbrpc.ServerError
-			if errors.As(err, &se) {
-				slog.Warn("collector: db rejected ad update; skipping (batch continues)",
-					"table", table, "name", AdName(it.text), "err", se, "ad", AdExcerpt(it.text))
-				continue
-			}
-			// A transport/transaction failure: abort and let withRetry retry the batch.
-			_ = tx.Abort(ctx)
-			return err
+	kvs := make([]dbrpc.AdKV, len(items))
+	for i, it := range items {
+		kvs[i] = dbrpc.AdKV{Key: it.key, Ad: it.text}
+	}
+	// A returned error is a whole-chunk failure: the transaction is gone ("no such
+	// transaction" -- e.g. a connection reset cleaned it up server-side) or the transport
+	// failed. The batch was not applied, so abort and return; withRetry replays the whole
+	// batch on a fresh transaction. Every write is an idempotent keyed upsert, so replay is
+	// safe.
+	writeStart := time.Now()
+	rejects, err := tx.NewClassAdBatchPipelined(ctx, kvs, adBatchChunkSize)
+	Metrics.batchWriteSeconds.Observe(time.Since(writeStart).Seconds())
+	if err != nil {
+		_ = tx.Abort(ctx)
+		return err
+	}
+	// Rejects are per-ad: the server could not parse those ads and left them out, but the
+	// transaction stays open and every other ad was applied. Log each offending ad (the
+	// wire bytes are otherwise encrypted) and commit the good ones -- one bad ad does not
+	// lose the batch. (This mirrors the old per-ad skip-on-ServerError behavior.)
+	for _, r := range rejects {
+		if r.Index < 0 || r.Index >= len(items) {
+			continue
 		}
+		it := items[r.Index]
+		slog.Warn("collector: db rejected ad update; skipping (batch continues)",
+			"table", table, "name", AdName(it.text), "err", r.Err, "ad", AdExcerpt(it.text))
 	}
 	commitStart := time.Now()
 	err = tx.Commit(ctx)
@@ -750,6 +774,81 @@ func (b *RPCBackend) fetchRawTableProject(ctx context.Context, t AdType, constra
 		return nil
 	})
 	return out, err
+}
+
+// QueryRawStream makes RPCBackend a store.RawStreamer: it hands each matching ad to
+// yield as it arrives over the wire (dbrpc QueryRawTableStream) instead of buffering the
+// whole result -- so the collector's query relay forwards each ad to its own client
+// without holding the entire result set in memory. yield returns false to stop early.
+//
+// Unlike the buffered QueryRaw, a transient failure is retried only until the FIRST ad is
+// delivered; after that a failure is terminal (errNoReplay), because a replay would
+// re-deliver ads the relay has already forwarded. The error surfaces a mid-stream backend
+// failure to the caller (an iter.Seq could not), so the relay tears its response down
+// rather than silently truncating it.
+func (b *RPCBackend) QueryRawStream(ctx context.Context, t AdType, constraint string, limit int, yield func(collections.RawAd) bool) error {
+	return b.streamRaw(ctx, t, constraint, nil, limit, yield)
+}
+
+// QueryRawProjectStream is QueryRawStream with a server-side projection pushed down
+// (dbrpc QueryRawProjectStream), so only the requested attributes cross the wire.
+func (b *RPCBackend) QueryRawProjectStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) error {
+	return b.streamRaw(ctx, t, constraint, projection, limit, yield)
+}
+
+// streamRaw drives QueryRaw{,Project}Stream. For AnyAd it streams every public table in
+// turn as one flat sequence, stopping the table walk as soon as the consumer asks to stop
+// (e.g. a global limit is reached) so it does not open a query against tables it will not
+// read.
+func (b *RPCBackend) streamRaw(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) error {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return err
+		}
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
+			}
+			stopped, err := b.streamRawTable(ctx, at, constraint, projection, limit, yield)
+			if err != nil {
+				return err
+			}
+			if stopped {
+				return nil
+			}
+		}
+		return nil
+	}
+	_, err := b.streamRawTable(ctx, t, constraint, projection, limit, yield)
+	return err
+}
+
+// streamRawTable streams one table, converting each old-ClassAd text to a RawAd for yield.
+// It reports whether the consumer stopped early (yield returned false) so the AnyAd walk
+// can end without querying the remaining tables.
+func (b *RPCBackend) streamRawTable(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) (stopped bool, err error) {
+	delivered := false
+	wrap := func(row string) bool {
+		delivered = true
+		if !yield(rawAdFromOldText(row)) {
+			stopped = true
+			return false
+		}
+		return true
+	}
+	err = b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		var e error
+		if len(projection) == 0 {
+			e = cl.QueryRawTableStream(ctx, t.String(), rpcConstraint(constraint), limit, wrap)
+		} else {
+			e = cl.QueryRawProjectStream(ctx, t.String(), rpcConstraint(constraint), projection, limit, wrap)
+		}
+		if e != nil && delivered {
+			return &errNoReplay{e} // rows already relayed; a replay would duplicate them
+		}
+		return e
+	})
+	return stopped, err
 }
 
 // rawAdFromOldText rebuilds a collections.RawAd from old-ClassAd wire text: the

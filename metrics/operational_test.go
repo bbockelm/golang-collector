@@ -32,7 +32,7 @@ func TestOperationalMetricsServedWithoutStatser(t *testing.T) {
 		"condor_collector_retries_total",
 		"condor_collector_ads_per_batch",
 		"condor_collector_rpc_inflight",
-		"condor_collector_rpc_ad_write_seconds",
+		"condor_collector_rpc_batch_write_seconds",
 		"condor_collector_rpc_commit_seconds",
 		"condor_collector_rpc_query_seconds",
 		"condor_collector_rpc_query_rows",
