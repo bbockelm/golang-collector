@@ -216,111 +216,9 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 		// through unredacted -- serving them is the whole point of that table.
 		redact := t != store.StartdPvtAd
 
-		// Whole-ad (unprojected) queries take the wire-form fast path when the
-		// backend offers one (the in-memory store; see store.RawQueryer): stream
-		// stored bytes straight out without materializing each ad. Backends
-		// without it fall through to the materialized Query path below.
-		rs, rsOK := st.(store.RawStreamer)
-		prs, prsOK := st.(store.ProjectedRawStreamer)
-		rq, rawOK := st.(store.RawQueryer)
-		prq, prqOK := st.(store.ProjectedRawQueryer)
-
 		resp := message.NewMessageForStream(c.Stream)
-		n := 0
-		// sendOne relays a single already-wire-form RawAd (whole-ad or projected),
-		// redacting private attributes for the public tables. It returns false to stop
-		// the scan -- either the limit is reached, or a write to the client failed (in
-		// which case sendErr is set and the caller returns it). Shared by the streaming
-		// fast path (backend delivers each ad as it arrives) and the buffered iter.Seq
-		// path (backends that only offer RawQueryer, e.g. the in-memory store).
-		var sendErr error
-		sendOne := func(ra collections.RawAd) bool {
-			if limit > 0 && n >= limit {
-				return false
-			}
-			exprs := ra.Exprs
-			if redact {
-				exprs = redactRawExprs(exprs)
-			}
-			if err := resp.PutInt32(ctx, 1); err != nil {
-				sendErr = err
-				return false
-			}
-			if err := resp.PutClassAdRawBytes(ctx, exprs, ra.MyType, ra.TargetType); err != nil {
-				sendErr = err
-				return false
-			}
-			n++
-			return true
-		}
-		sendRaw := func(raw iter.Seq[collections.RawAd]) error {
-			for ra := range raw {
-				if !sendOne(ra) {
-					break
-				}
-			}
-			return sendErr
-		}
-		switch {
-		case len(projection) == 0 && rsOK:
-			// Whole-ad wire-form fast path, streamed: the backend hands us each stored
-			// ad as it arrives and we relay it straight out, without either side
-			// buffering the whole result set. A mid-stream backend failure surfaces as
-			// an error (the relayed response is torn down, not silently truncated).
-			if err := rs.QueryRawStream(ctx, t, constraint, limit, sendOne); err != nil {
-				return err
-			}
-			if sendErr != nil {
-				return sendErr
-			}
-		case len(projection) == 0 && rawOK:
-			// Whole-ad wire-form fast path (buffered): stream stored bytes straight out.
-			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
-			if err != nil {
-				return err
-			}
-			if err := sendRaw(raw); err != nil {
-				return err
-			}
-		case len(projection) > 0 && prsOK:
-			// Projected wire-form fast path, streamed: the backend applies the projection
-			// (a remote database pushes it down) and delivers each projected ad as it
-			// arrives, so only the requested attributes cross the wire and neither side
-			// holds the whole result.
-			if err := prs.QueryRawProjectStream(ctx, t, constraint, projection, limit, sendOne); err != nil {
-				return err
-			}
-			if sendErr != nil {
-				return sendErr
-			}
-		case len(projection) > 0 && prqOK:
-			// Projected wire-form fast path (buffered): the backend applies the projection
-			// (a remote database pushes it down), so only the requested attributes cross
-			// the wire -- no whole-ad fetch + local project.
-			raw, err := prq.QueryRawProject(ctx, t, constraint, projection, limit)
-			if err != nil {
-				return err
-			}
-			if err := sendRaw(raw); err != nil {
-				return err
-			}
-		default:
-			ads, err := st.Query(ctx, t, constraint, limit)
-			if err != nil {
-				return err
-			}
-			for ad := range ads {
-				if limit > 0 && n >= limit {
-					break
-				}
-				if err := resp.PutInt32(ctx, 1); err != nil {
-					return err
-				}
-				if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
-					return err
-				}
-				n++
-			}
+		if err := relayMatches(ctx, resp, st, t, constraint, projection, limit, redact); err != nil {
+			return err
 		}
 		if err := resp.PutInt32(ctx, 0); err != nil {
 			return err
@@ -355,24 +253,11 @@ func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 			constraint, projection, limit := parseSubQuery(queryAd, target)
 			// Multi-queries only name public target types (the negotiator gets startd
 			// claim caps through the dedicated QUERY_STARTD_PVT_ADS command), so every
-			// response here is redacted.
+			// response here is redacted. Each target carries its own limit (reset per
+			// table), matching the single-type handler's per-query limit.
 			redact := adType != store.StartdPvtAd
-			ads, err := st.Query(ctx, adType, constraint, limit)
-			if err != nil {
+			if err := relayMatches(ctx, resp, st, adType, constraint, projection, limit, redact); err != nil {
 				return err
-			}
-			n := 0
-			for ad := range ads {
-				if limit > 0 && n >= limit {
-					break
-				}
-				if err := resp.PutInt32(ctx, 1); err != nil {
-					return err
-				}
-				if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
-					return err
-				}
-				n++
 			}
 		}
 		if err := resp.PutInt32(ctx, 0); err != nil {
@@ -380,6 +265,104 @@ func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 		}
 		return resp.FlushFrame(ctx, true)
 	}
+}
+
+// relayMatches writes every ad in table t matching constraint to resp -- PutInt32(1)
+// then the ad, up to limit -- projected to projection and redacting private attributes
+// when redact is set. It does NOT write the trailing PutInt32(0) terminator; the caller
+// does, after its last table (so a multi-target query streams several tables as one flat
+// sequence with a single terminator).
+//
+// It prefers, in order: the wire-form STREAMING fast path (RawStreamer /
+// ProjectedRawStreamer -- relay each stored ad's bytes as it arrives, no buffering, a
+// mid-stream backend failure surfaces as an error); the buffered wire-form path
+// (RawQueryer / ProjectedRawQueryer -- the in-memory store); and finally the materialized
+// Query path (decode + re-encode each ad), which every backend supports. Shared by the
+// single-type query handler and the multi-type (negotiator) handler so both get the same
+// fast paths.
+func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, t store.AdType, constraint string, projection []string, limit int, redact bool) error {
+	n := 0
+	var sendErr error
+	// sendOne relays a single already-wire-form RawAd, returning false to stop the scan
+	// (limit reached, or a client write failed -- then sendErr is set for the caller).
+	sendOne := func(ra collections.RawAd) bool {
+		if limit > 0 && n >= limit {
+			return false
+		}
+		exprs := ra.Exprs
+		if redact {
+			exprs = redactRawExprs(exprs)
+		}
+		if err := resp.PutInt32(ctx, 1); err != nil {
+			sendErr = err
+			return false
+		}
+		if err := resp.PutClassAdRawBytes(ctx, exprs, ra.MyType, ra.TargetType); err != nil {
+			sendErr = err
+			return false
+		}
+		n++
+		return true
+	}
+	sendRaw := func(raw iter.Seq[collections.RawAd]) error {
+		for ra := range raw {
+			if !sendOne(ra) {
+				break
+			}
+		}
+		return sendErr
+	}
+
+	if len(projection) == 0 {
+		// Whole-ad wire form.
+		if rs, ok := st.(store.RawStreamer); ok {
+			if err := rs.QueryRawStream(ctx, t, constraint, limit, sendOne); err != nil {
+				return err
+			}
+			return sendErr
+		}
+		if rq, ok := st.(store.RawQueryer); ok {
+			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
+			if err != nil {
+				return err
+			}
+			return sendRaw(raw)
+		}
+	} else {
+		// Projected wire form (projection pushed to the backend).
+		if prs, ok := st.(store.ProjectedRawStreamer); ok {
+			if err := prs.QueryRawProjectStream(ctx, t, constraint, projection, limit, sendOne); err != nil {
+				return err
+			}
+			return sendErr
+		}
+		if prq, ok := st.(store.ProjectedRawQueryer); ok {
+			raw, err := prq.QueryRawProject(ctx, t, constraint, projection, limit)
+			if err != nil {
+				return err
+			}
+			return sendRaw(raw)
+		}
+	}
+
+	// Materialized fallback: decode each ad, project locally, re-encode.
+	ads, err := st.Query(ctx, t, constraint, limit)
+	if err != nil {
+		return err
+	}
+	for ad := range ads {
+		if limit > 0 && n >= limit {
+			break
+		}
+		if err := resp.PutInt32(ctx, 1); err != nil {
+			return err
+		}
+		if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
+			return err
+		}
+		n++
+	}
+	return nil
 }
 
 // putAd writes ad to resp, excluding private (secret) attributes when redact is
