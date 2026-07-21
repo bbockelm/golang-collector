@@ -120,7 +120,7 @@ var errBackendClosed = errors.New("collector: rpc backend is closed")
 // DefaultReadConns is the size of the read-connection pool when NewRPCBackend is used
 // (or NewRPCBackendPool is given a non-positive count). A small pool spreads
 // concurrent queries across connections so one slow consumer stalls only its slot.
-const DefaultReadConns = 4
+const DefaultReadConns = 8
 
 // DefaultWriteConns is the size of the write-connection pool. Writes still ride lanes
 // SEPARATE from reads (so a slow query can never stall a commit), but a small pool lets
@@ -129,7 +129,7 @@ const DefaultReadConns = 4
 // serializing on one connection, and lets independent per-table transactions commit
 // concurrently server-side. Kept small: same-table commits still serialize on the
 // server's per-collection lock, so a large pool mostly just adds connections.
-const DefaultWriteConns = 2
+const DefaultWriteConns = 8
 
 // NewRPCBackend builds a remote-database backend with a DefaultWriteConns-sized write
 // pool and a DefaultReadConns-sized read pool, each connection produced by dial (called
