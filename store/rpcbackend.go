@@ -111,6 +111,7 @@ var (
 	_ ProjectedRawQueryer  = (*RPCBackend)(nil)
 	_ RawStreamer          = (*RPCBackend)(nil)
 	_ ProjectedRawStreamer = (*RPCBackend)(nil)
+	_ Streamer             = (*RPCBackend)(nil)
 	_ BatchWriter          = (*RPCBackend)(nil)
 )
 
@@ -679,6 +680,70 @@ func (b *RPCBackend) Query(ctx context.Context, t AdType, constraint string, lim
 		return nil, err
 	}
 	return sliceSeq(ads), nil
+}
+
+// QueryStream makes RPCBackend a store.Streamer: it parses each matching ad as it arrives
+// over the wire (dbrpc QueryTableStream) and hands the *classad.ClassAd to yield, instead
+// of buffering the whole table like Query/fetchTable. The wire request is identical to
+// Query's -- only the client-side delivery differs -- so a consumer that materializes
+// each ad (e.g. the multi-type query handler) gets the same ads without holding them all
+// in memory at once. yield returns false to stop early.
+//
+// Like QueryRawStream: a transient failure is retried only until the FIRST ad is
+// delivered (errNoReplay), because a replay would re-deliver ads already handed out; and
+// the returned error surfaces a mid-stream failure (an iter.Seq could not), so an outage
+// is reported, not a silently short result. Rows that fail to parse are skipped, matching
+// the buffered Query.
+func (b *RPCBackend) QueryStream(ctx context.Context, t AdType, constraint string, limit int, yield func(*classad.ClassAd) bool) error {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return err
+		}
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
+			}
+			stopped, err := b.streamTable(ctx, at, constraint, limit, yield)
+			if err != nil {
+				return err
+			}
+			if stopped {
+				return nil
+			}
+		}
+		return nil
+	}
+	_, err := b.streamTable(ctx, t, constraint, limit, yield)
+	return err
+}
+
+// streamTable streams one table's ads (parsed) to yield, reporting whether the consumer
+// stopped early so the AnyAd walk can end without querying the remaining tables.
+func (b *RPCBackend) streamTable(ctx context.Context, t AdType, constraint string, limit int, yield func(*classad.ClassAd) bool) (stopped bool, err error) {
+	delivered := false
+	err = b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		qStart := time.Now()
+		n := 0
+		e := cl.QueryTableStream(ctx, t.String(), rpcConstraint(constraint), limit, func(row string) bool {
+			n++
+			ad, perr := classad.Parse(row)
+			if perr != nil {
+				return true // skip unparseable, keep going (matches buffered Query)
+			}
+			delivered = true
+			if !yield(ad) {
+				stopped = true
+				return false
+			}
+			return true
+		})
+		observeQuery(qStart, n, e)
+		if e != nil && delivered {
+			return &errNoReplay{e} // ads already delivered; a replay would duplicate them
+		}
+		return e
+	})
+	return stopped, err
 }
 
 // QueryRaw makes RPCBackend a store.RawQueryer: it fetches matching ads as

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -115,5 +116,58 @@ func TestRPCBackendQueryRawProjectStream(t *testing.T) {
 	// Memory was not requested, so the pushdown must not send it.
 	if strings.Contains(body, "Memory") {
 		t.Errorf("projected ad carries Memory; projection was not pushed down: %q", body)
+	}
+}
+
+// TestRPCBackendQueryStream verifies the parsed streaming path (store.Streamer): every
+// matching ad is parsed and delivered as it arrives, a constraint is pushed down, and a
+// consumer that stops early receives no more ads.
+func TestRPCBackendQueryStream(t *testing.T) {
+	b := newStreamTestBackend(t)
+	ctx := context.Background()
+
+	if err := b.UpdateBatch(ctx, []PendingUpdate{
+		{Type: StartdAd, Text: `Name = "slot1@a"` + "\n" + `State = "Idle"` + "\n" + `Cpus = 8`},
+		{Type: StartdAd, Text: `Name = "slot2@a"` + "\n" + `State = "Claimed"` + "\n" + `Cpus = 4`},
+		{Type: StartdAd, Text: `Name = "slot3@a"` + "\n" + `State = "Idle"` + "\n" + `Cpus = 2`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Full delivery, parsed as ClassAds.
+	var names []string
+	if err := b.QueryStream(ctx, StartdAd, "true", 0, func(ad *classad.ClassAd) bool {
+		n, _ := ad.EvaluateAttrString("Name")
+		names = append(names, n)
+		return true
+	}); err != nil {
+		t.Fatalf("QueryStream: %v", err)
+	}
+	if len(names) != 3 {
+		t.Fatalf("streamed %d ads, want 3 (%v)", len(names), names)
+	}
+
+	// Constraint pushdown.
+	idle := 0
+	if err := b.QueryStream(ctx, StartdAd, `State == "Idle"`, 0, func(*classad.ClassAd) bool {
+		idle++
+		return true
+	}); err != nil {
+		t.Fatalf("QueryStream(Idle): %v", err)
+	}
+	if idle != 2 {
+		t.Fatalf("streamed %d Idle ads, want 2", idle)
+	}
+
+	// Early stop.
+	seen := 0
+	if err := b.QueryStream(ctx, StartdAd, "true", 0, func(*classad.ClassAd) bool {
+		seen++
+		return false
+	}); err != nil {
+		t.Fatalf("QueryStream(early-stop): %v", err)
+	}
+	if seen != 1 {
+		t.Fatalf("consumer saw %d ads after stopping, want 1", seen)
 	}
 }

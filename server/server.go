@@ -357,22 +357,48 @@ func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 			// claim caps through the dedicated QUERY_STARTD_PVT_ADS command), so every
 			// response here is redacted.
 			redact := adType != store.StartdPvtAd
-			ads, err := st.Query(ctx, adType, constraint, limit)
-			if err != nil {
-				return err
-			}
+			// send relays one materialized ad (projected + redacted) exactly as before;
+			// returning false stops the scan (per-target limit reached, or a client write
+			// failed -- then sendErr is set). The wire output is byte-identical to the old
+			// buffered loop; only delivery changes.
 			n := 0
-			for ad := range ads {
+			var sendErr error
+			send := func(ad *classad.ClassAd) bool {
 				if limit > 0 && n >= limit {
-					break
+					return false
 				}
 				if err := resp.PutInt32(ctx, 1); err != nil {
-					return err
+					sendErr = err
+					return false
 				}
 				if err := putAd(ctx, resp, project(ad, projection), redact); err != nil {
-					return err
+					sendErr = err
+					return false
 				}
 				n++
+				return true
+			}
+			// Prefer the streaming backend (a remote database) so a target's matches are
+			// relayed as they arrive instead of buffering the whole table -- the negotiator
+			// fetches every Machine ad here each cycle. The in-memory store's Query iterator
+			// is already lazy, so it uses the buffered path.
+			if s, ok := st.(store.Streamer); ok {
+				if err := s.QueryStream(ctx, adType, constraint, limit, send); err != nil {
+					return err
+				}
+			} else {
+				ads, err := st.Query(ctx, adType, constraint, limit)
+				if err != nil {
+					return err
+				}
+				for ad := range ads {
+					if !send(ad) {
+						break
+					}
+				}
+			}
+			if sendErr != nil {
+				return sendErr
 			}
 		}
 		if err := resp.PutInt32(ctx, 0); err != nil {

@@ -77,6 +77,21 @@ type Backend interface {
 	Close() error
 }
 
+// Streamer is an optional Backend capability: the streaming form of the core Query.
+// Instead of returning an iterator over an already-fetched result, it parses each
+// matching ad as it arrives from the backend and hands the *classad.ClassAd to yield,
+// so a consumer (e.g. the multi-type query handler) does not buffer the whole result.
+// yield returns false to stop early.
+//
+// A remote-database backend implements it (its buffered Query eagerly fetches the whole
+// table); the in-memory backend's Query already iterates its store lazily, so it needs no
+// separate streamer. Unlike an iter.Seq, the returned error surfaces a mid-stream backend
+// failure -- so an outage is a reported error, not a silently short (or empty) result,
+// preserving the property the eager-fetch Query was written for.
+type Streamer interface {
+	QueryStream(ctx context.Context, t AdType, constraint string, limit int, yield func(*classad.ClassAd) bool) error
+}
+
 // RawQueryer is an optional Backend fast path: it streams query results in
 // wire-ready old-ClassAd form (collections.RawAd -- expression strings decoded
 // straight from the stored representation, no AST) so a whole-ad (unprojected)
