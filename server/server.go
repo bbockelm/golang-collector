@@ -220,35 +220,61 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 		// backend offers one (the in-memory store; see store.RawQueryer): stream
 		// stored bytes straight out without materializing each ad. Backends
 		// without it fall through to the materialized Query path below.
+		rs, rsOK := st.(store.RawStreamer)
+		prs, prsOK := st.(store.ProjectedRawStreamer)
 		rq, rawOK := st.(store.RawQueryer)
 		prq, prqOK := st.(store.ProjectedRawQueryer)
 
 		resp := message.NewMessageForStream(c.Stream)
 		n := 0
-		// sendRaw streams already-wire-form RawAds (whole-ad or projected),
-		// redacting private attributes for the public tables.
+		// sendOne relays a single already-wire-form RawAd (whole-ad or projected),
+		// redacting private attributes for the public tables. It returns false to stop
+		// the scan -- either the limit is reached, or a write to the client failed (in
+		// which case sendErr is set and the caller returns it). Shared by the streaming
+		// fast path (backend delivers each ad as it arrives) and the buffered iter.Seq
+		// path (backends that only offer RawQueryer, e.g. the in-memory store).
+		var sendErr error
+		sendOne := func(ra collections.RawAd) bool {
+			if limit > 0 && n >= limit {
+				return false
+			}
+			exprs := ra.Exprs
+			if redact {
+				exprs = redactRawExprs(exprs)
+			}
+			if err := resp.PutInt32(ctx, 1); err != nil {
+				sendErr = err
+				return false
+			}
+			if err := resp.PutClassAdRawBytes(ctx, exprs, ra.MyType, ra.TargetType); err != nil {
+				sendErr = err
+				return false
+			}
+			n++
+			return true
+		}
 		sendRaw := func(raw iter.Seq[collections.RawAd]) error {
 			for ra := range raw {
-				if limit > 0 && n >= limit {
+				if !sendOne(ra) {
 					break
 				}
-				exprs := ra.Exprs
-				if redact {
-					exprs = redactRawExprs(exprs)
-				}
-				if err := resp.PutInt32(ctx, 1); err != nil {
-					return err
-				}
-				if err := resp.PutClassAdRawBytes(ctx, exprs, ra.MyType, ra.TargetType); err != nil {
-					return err
-				}
-				n++
 			}
-			return nil
+			return sendErr
 		}
 		switch {
+		case len(projection) == 0 && rsOK:
+			// Whole-ad wire-form fast path, streamed: the backend hands us each stored
+			// ad as it arrives and we relay it straight out, without either side
+			// buffering the whole result set. A mid-stream backend failure surfaces as
+			// an error (the relayed response is torn down, not silently truncated).
+			if err := rs.QueryRawStream(ctx, t, constraint, limit, sendOne); err != nil {
+				return err
+			}
+			if sendErr != nil {
+				return sendErr
+			}
 		case len(projection) == 0 && rawOK:
-			// Whole-ad wire-form fast path: stream stored bytes straight out.
+			// Whole-ad wire-form fast path (buffered): stream stored bytes straight out.
 			raw, err := rq.QueryRaw(ctx, t, constraint, limit)
 			if err != nil {
 				return err
@@ -256,9 +282,20 @@ func queryHandler(st store.Backend, t store.AdType) cedarserver.HandlerFunc {
 			if err := sendRaw(raw); err != nil {
 				return err
 			}
+		case len(projection) > 0 && prsOK:
+			// Projected wire-form fast path, streamed: the backend applies the projection
+			// (a remote database pushes it down) and delivers each projected ad as it
+			// arrives, so only the requested attributes cross the wire and neither side
+			// holds the whole result.
+			if err := prs.QueryRawProjectStream(ctx, t, constraint, projection, limit, sendOne); err != nil {
+				return err
+			}
+			if sendErr != nil {
+				return sendErr
+			}
 		case len(projection) > 0 && prqOK:
-			// Projected wire-form fast path: the backend applies the projection (a
-			// remote database pushes it down), so only the requested attributes cross
+			// Projected wire-form fast path (buffered): the backend applies the projection
+			// (a remote database pushes it down), so only the requested attributes cross
 			// the wire -- no whole-ad fetch + local project.
 			raw, err := prq.QueryRawProject(ctx, t, constraint, projection, limit)
 			if err != nil {

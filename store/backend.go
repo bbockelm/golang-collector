@@ -97,6 +97,26 @@ type ProjectedRawQueryer interface {
 	QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error)
 }
 
+// RawStreamer is the streaming form of RawQueryer: instead of returning an iterator
+// over an already-fetched result, it delivers each matching RawAd to yield as it arrives
+// from the backend, so a relay (the collector) can forward each ad to its own client
+// without buffering the whole result set. yield returns false to stop early.
+//
+// A remote-database backend implements it (the in-memory backend's RawQueryer already
+// iterates its store lazily, so it needs no separate streamer). Unlike an iter.Seq, the
+// returned error surfaces a mid-stream backend failure -- the relay then fails its
+// response instead of silently truncating it. The server prefers this over RawQueryer
+// when the backend offers it.
+type RawStreamer interface {
+	QueryRawStream(ctx context.Context, t AdType, constraint string, limit int, yield func(collections.RawAd) bool) error
+}
+
+// ProjectedRawStreamer is RawStreamer with a server-side projection pushed down (see
+// ProjectedRawQueryer).
+type ProjectedRawStreamer interface {
+	QueryRawProjectStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) error
+}
+
 // Retrainer is an optional Backend capability: periodic maintenance of the
 // ClassAd compression dictionary (the in-memory backend's memory-footprint
 // lever). Backends that manage their own storage do not implement it.
