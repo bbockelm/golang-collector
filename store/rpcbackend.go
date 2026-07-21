@@ -496,44 +496,51 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 	})
 }
 
+// adBatchChunkSize bounds how many ads ride in one opNewAdBatch frame. The chunks are
+// pipelined (sent back-to-back without waiting for acks), so a whole table's batch costs
+// ~one round-trip regardless of ad count -- collapsing the per-ad request/ack round-trips
+// that used to dominate the write path -- while each frame stays well under the stream's
+// max message size.
+const adBatchChunkSize = 64
+
 // putBatchTx upserts all items into one table in one transaction (no internal retry;
-// withRetry owns retry/backoff/reconnect).
+// withRetry owns retry/backoff/reconnect). The ads are sent as pipelined batches instead
+// of one request/ack per ad.
 func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []keyedText) error {
+	if len(items) == 0 {
+		return nil
+	}
 	tx, err := cl.BeginTable(ctx, table)
 	if err != nil {
 		return err
 	}
-	for _, it := range items {
-		adStart := time.Now()
-		err := tx.NewClassAd(ctx, it.key, it.text)
-		Metrics.adWriteSeconds.Observe(time.Since(adStart).Seconds())
-		if err != nil {
-			// "no such transaction" means the transaction is gone (aborted underneath
-			// us -- e.g. a connection reset cleaned it up server-side), NOT that this
-			// ad was rejected. The remaining ads were never given a chance, so do not
-			// keep skipping them (that silently drops them and mislabels them as
-			// "rejected"): abort and return so withRetry replays the whole batch on a
-			// fresh transaction. Every write is an idempotent keyed upsert, so replay
-			// is safe.
-			if isNoSuchTxn(err) {
-				_ = tx.Abort(ctx)
-				return err
-			}
-			// Any other *dbrpc.ServerError means the server rejected THIS ad (e.g. an
-			// unparseable value): opNewAd returned an error without adding it, and the
-			// transaction stays open. Log the offending ad (the wire bytes are otherwise
-			// encrypted) and skip just it -- a partial commit using the transaction the
-			// good ads already sit in -- so one bad ad does not lose the batch.
-			var se *dbrpc.ServerError
-			if errors.As(err, &se) {
-				slog.Warn("collector: db rejected ad update; skipping (batch continues)",
-					"table", table, "name", AdName(it.text), "err", se, "ad", AdExcerpt(it.text))
-				continue
-			}
-			// A transport/transaction failure: abort and let withRetry retry the batch.
-			_ = tx.Abort(ctx)
-			return err
+	kvs := make([]dbrpc.AdKV, len(items))
+	for i, it := range items {
+		kvs[i] = dbrpc.AdKV{Key: it.key, Ad: it.text}
+	}
+	// A returned error is a whole-chunk failure: the transaction is gone ("no such
+	// transaction" -- e.g. a connection reset cleaned it up server-side) or the transport
+	// failed. The batch was not applied, so abort and return; withRetry replays the whole
+	// batch on a fresh transaction. Every write is an idempotent keyed upsert, so replay is
+	// safe.
+	writeStart := time.Now()
+	rejects, err := tx.NewClassAdBatchPipelined(ctx, kvs, adBatchChunkSize)
+	Metrics.batchWriteSeconds.Observe(time.Since(writeStart).Seconds())
+	if err != nil {
+		_ = tx.Abort(ctx)
+		return err
+	}
+	// Rejects are per-ad: the server could not parse those ads and left them out, but the
+	// transaction stays open and every other ad was applied. Log each offending ad (the
+	// wire bytes are otherwise encrypted) and commit the good ones -- one bad ad does not
+	// lose the batch. (This mirrors the old per-ad skip-on-ServerError behavior.)
+	for _, r := range rejects {
+		if r.Index < 0 || r.Index >= len(items) {
+			continue
 		}
+		it := items[r.Index]
+		slog.Warn("collector: db rejected ad update; skipping (batch continues)",
+			"table", table, "name", AdName(it.text), "err", r.Err, "ad", AdExcerpt(it.text))
 	}
 	commitStart := time.Now()
 	err = tx.Commit(ctx)

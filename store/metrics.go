@@ -68,11 +68,12 @@ type metrics struct {
 	// by lane ("write"/"read"). The write lane is a single connection, so a sustained
 	// value >1 there is head-of-line blocking -- ops queued behind a slow one.
 	rpcInflight *prometheus.GaugeVec
-	// adWriteSeconds is one ad's write round-trip inside a batch transaction (the
-	// per-ad NewClassAd send+ack). A batch is this many sequential round-trips, so
-	// batch_flush_seconds ~= adWrite x ads + commit; this is where a chatty write path
-	// shows up (a 2ms round-trip x 1000 ads = a 2s flush).
-	adWriteSeconds prometheus.Histogram
+	// batchWriteSeconds is the round-trip to write one table's batch of ads: a single
+	// pipelined NewClassAdBatch send (all chunks in flight at once, acks collected),
+	// NOT one round-trip per ad. So batch_flush_seconds ~= batchWrite + commit,
+	// regardless of ad count -- the pipelined batch is what replaced the old chatty
+	// per-ad write path (a 2ms round-trip x 1000 ads = 2s) with ~one round-trip.
+	batchWriteSeconds prometheus.Histogram
 	// commitSeconds is the transaction Commit round-trip (includes the server-side
 	// durability sync), separated from the per-ad writes so a slow commit is
 	// distinguishable from chatty per-ad round-trips.
@@ -137,9 +138,9 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Namespace: metricsNamespace, Name: "rpc_inflight",
 			Help: "Backend operations currently awaiting the database, by lane. Sustained >1 on the write lane (a single connection) is head-of-line blocking.",
 		}, []string{"lane"}),
-		adWriteSeconds: fa.NewHistogram(prometheus.HistogramOpts{
-			Namespace: metricsNamespace, Name: "rpc_ad_write_seconds",
-			Help:    "Round-trip to write one ad inside a batch transaction (per-ad NewClassAd send+ack). A batch is this many sequential round-trips.",
+		batchWriteSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_batch_write_seconds",
+			Help:    "Round-trip to write one table's batch of ads as a single pipelined NewClassAdBatch (all chunks in flight, acks collected) -- ~one round-trip regardless of ad count, not one per ad.",
 			Buckets: rtt,
 		}),
 		commitSeconds: fa.NewHistogram(prometheus.HistogramOpts{
