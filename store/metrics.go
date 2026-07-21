@@ -1,11 +1,27 @@
 package store
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// SlowOpThreshold: a backend operation (an ad update, or a buffered batch flush)
+// taking at least this long is logged as a slow-op WARN, so a stall surfaces in the
+// log even when the op eventually succeeds -- withRetry otherwise hides it as latency.
+// 0 disables it. Default 2s (only real stalls fire); overridable via COLLECTOR_SLOW_OP_MS.
+var SlowOpThreshold = 2 * time.Second
+
+// MaybeLogSlow emits a WARN when d reaches SlowOpThreshold. op is a short label
+// ("update", "update-pvt", "batch-flush"); attrs are extra slog key/values for context.
+func MaybeLogSlow(op string, d time.Duration, attrs ...any) {
+	if SlowOpThreshold <= 0 || d < SlowOpThreshold {
+		return
+	}
+	slog.Warn("collector: slow "+op+" (backend stall)", append([]any{"elapsed", d}, attrs...)...)
+}
 
 // MetricsRegistry holds the collector's operational (as opposed to storage-
 // footprint) metrics: how long updates take, how much time is lost to
@@ -41,16 +57,22 @@ type metrics struct {
 	// flaky/slow); adsPerBatch records how many ads each flushed batch carried.
 	updatesTotal *prometheus.CounterVec
 	batchesTotal prometheus.Counter
-	retriesTotal prometheus.Counter
+	retriesTotal *prometheus.CounterVec
 	adsPerBatch  prometheus.Histogram
 }
+
+// retryCauses is the closed set of transient-failure causes labeled onto
+// retries_total (see causeOf in rpcbackend.go). They are pre-initialized to zero so
+// the metric family is always present on /metrics (a CounterVec emits nothing until a
+// label is observed) and dashboards/alerts have a stable series from the first scrape.
+var retryCauses = []string{"no_txn", "deadline", "conn_closed", "transport", "dial"}
 
 func newMetrics(reg prometheus.Registerer) *metrics {
 	fa := promauto.With(reg)
 	// Latency buckets from ~1ms to ~30s: updates should be sub-ms to ms; anything
 	// into the hundreds of ms / seconds is the "blocking" we are hunting.
 	latency := []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
-	return &metrics{
+	m := &metrics{
 		updateSeconds: fa.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "update_seconds",
 			Help:    "Wall-clock time to apply one ad update through the backend (incl. batching/retry), by op.",
@@ -74,16 +96,20 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Namespace: metricsNamespace, Name: "batches_total",
 			Help: "Buffered batches flushed.",
 		}),
-		retriesTotal: fa.NewCounter(prometheus.CounterOpts{
+		retriesTotal: fa.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "retries_total",
-			Help: "Database operations retried after a transient failure (backoff-and-replay attempts).",
-		}),
+			Help: "Database operations retried after a transient failure (backoff-and-replay attempts), by cause.",
+		}, []string{"cause"}),
 		adsPerBatch: fa.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "ads_per_batch",
 			Help:    "Ads carried by each flushed batch (a batch touches ~all shards, so this drives lock contention).",
 			Buckets: []float64{1, 2, 4, 6, 8, 12, 16, 24, 32, 64, 128, 256, 512, 1024, 2048},
 		}),
 	}
+	for _, c := range retryCauses {
+		m.retriesTotal.WithLabelValues(c) // materialize the zero series
+	}
+	return m
 }
 
 // observeUpdate records one ad update's duration under op ("public"/"private").

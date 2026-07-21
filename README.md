@@ -192,6 +192,8 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_METRICS_ADDRESS` / `-metrics` | Serve Prometheus metrics at `/metrics`. |
 | `COLLECTOR_UPDATE_INTERVAL` | Ad expiry sweep interval. |
 | `COLLECTOR_DICT_RETRAIN_INTERVAL`, `COLLECTOR_DICT_SAMPLE_SIZE` | Compression-dictionary retraining cadence and sample size. |
+| `COLLECTOR_SLOW_OP_MS` | Log a WARN when a single ad update or batch flush blocks at least this long. Default `2000`; `0` disables. |
+| `COLLECTOR_DEBUG_PPROF` | Serve Go `pprof` endpoints under `/debug/pprof/` on the metrics listener. Default off (debugging only). |
 | `SEC_*` | Authentication/encryption policy, exactly as for the C++ collector. |
 
 ### Ad store backends
@@ -254,6 +256,29 @@ curl -s localhost:9720/metrics
 
 Reports the compressed storage footprint per ad type plus standard Go/process
 metrics, so a pool can be sized from live numbers.
+
+### Debugging stalls
+
+When updates back up — e.g. a C++ collector forwarding to `htc-collector` hits its
+write timeout — the cause is usually a slow store operation blocking the per-connection
+handler. Three layered aids surface it without leaving a profiler exposed in production:
+
+- **Operational metrics** (always on `/metrics`): `condor_collector_update_seconds`,
+  `condor_collector_batch_flush_seconds`, `condor_collector_backoff_seconds`, and
+  `condor_collector_retries_total{cause}` — the `cause` label
+  (`no_txn`/`deadline`/`conn_closed`/`transport`/`dial`) attributes retry storms against
+  the `db` backend. A rising `backoff_seconds` relative to `batch_flush_seconds` means the
+  database, not the collector, is the bottleneck.
+- **Slow-op WARN** (`COLLECTOR_SLOW_OP_MS`, default 2s): any update/flush that blocks past
+  the threshold logs a WARN with the ad type/name — so a stall shows up in the log even
+  though `withRetry` eventually succeeds and would otherwise hide it as latency. The same
+  path also rate-limits a WARN naming the transient error each retry backs off on.
+- **`kill -USR1 <pid>`**: dumps every goroutine's stack to the collector log — the
+  on-demand way to see exactly which lock/syscall/channel a handler is parked on during a
+  live stall, with no HTTP surface and no restart.
+- **`COLLECTOR_DEBUG_PPROF = True`**: when the above is not enough, exposes the standard Go
+  `pprof` endpoints under `/debug/pprof/` on the metrics listener for a full CPU/heap/block
+  profile. Off by default; enable only while investigating.
 
 ## Testing
 

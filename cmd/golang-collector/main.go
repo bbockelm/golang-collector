@@ -12,10 +12,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -188,11 +192,19 @@ func run() error {
 		return err
 	}
 
+	// Debugging aids for chasing stalls (see docs). The slow-op threshold controls the
+	// "slow update/flush" WARNs; SIGUSR1 dumps every goroutine's stack to the log
+	// on demand (no HTTP surface); pprof is served only when explicitly enabled.
+	if ms := configInt(cfg, "COLLECTOR_SLOW_OP_MS", 2000); ms >= 0 {
+		store.SlowOpThreshold = time.Duration(ms) * time.Millisecond
+	}
+	installGoroutineDumpSignal(log)
+
 	// Optional Prometheus metrics endpoint reporting the compressed storage
 	// footprint per ad type (plus Go/process metrics), so a pool can be sized from
 	// live numbers rather than a profiler.
 	if addr := metricsListenAddr(cfg, *metricsAddr); addr != "" {
-		startMetrics(ctx, addr, st, log)
+		startMetrics(ctx, addr, st, log, configBool(cfg, "COLLECTOR_DEBUG_PPROF", false))
 	}
 
 	// Background maintenance -- dictionary retraining (COLLECTOR_DICT_RETRAIN_INTERVAL,
@@ -477,7 +489,7 @@ func metricsListenAddr(cfg *config.Config, flagAddr string) string {
 // startMetrics serves the collector's Prometheus metrics at /metrics on addr
 // until ctx is cancelled. Bind failures are logged, not fatal -- metrics are
 // observability, not core function.
-func startMetrics(ctx context.Context, addr string, st store.Backend, log *logging.Logger) {
+func startMetrics(ctx context.Context, addr string, st store.Backend, log *logging.Logger, pprofOn bool) {
 	// The operational metrics (update/batch/backoff timings, counts) are always
 	// served -- they matter most for the remote-database backend, which is
 	// precisely the one with no store.Statser. The per-ad-type storage gauges are
@@ -486,6 +498,17 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 	dbd := dbDiagnoser(st)           // non-nil only for the remote-database backend
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(statser, dbd))
+	if pprofOn {
+		// Opt-in only (COLLECTOR_DEBUG_PPROF): the profiler/goroutine surface is a
+		// debugging tool, not something to leave exposed by default. Mounted on this
+		// same private mux so it shares the endpoint's binding.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		log.Info(logging.DestinationGeneral, "pprof debug endpoints enabled", "addr", addr, "path", "/debug/pprof/")
+	}
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")
@@ -496,6 +519,30 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
+	}()
+}
+
+// installGoroutineDumpSignal makes SIGUSR1 dump every goroutine's stack to the log.
+// It is the on-demand alternative to always-listening pprof: send the daemon SIGUSR1
+// during a stall and the blocked handler's stack (which lock/syscall/channel it is
+// parked on) lands in the collector log -- no HTTP surface, no restart, always
+// available. The dump is one log record so it stays greppable.
+func installGoroutineDumpSignal(log *logging.Logger) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	go func() {
+		for range ch {
+			buf := make([]byte, 1<<20)
+			for {
+				n := runtime.Stack(buf, true) // true = all goroutines
+				if n < len(buf) {
+					buf = buf[:n]
+					break
+				}
+				buf = make([]byte, 2*len(buf)) // grew past the buffer; retry larger
+			}
+			log.Info(logging.DestinationGeneral, "SIGUSR1: goroutine stack dump", "goroutines", runtime.NumGoroutine(), "stacks", string(buf))
+		}
 	}()
 }
 

@@ -103,6 +103,7 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 		uerr := st.UpdateOldText(ctx, t, text)
 		elapsed := time.Since(start)
 		store.ObserveUpdate("public", elapsed)
+		store.MaybeLogSlow("update", elapsed, "type", t.String(), "name", store.AdName(text))
 		if uerr != nil {
 			if isCanceled(uerr) {
 				// The context was cancelled (the collector is shutting down, or the
@@ -132,6 +133,7 @@ func updateHandler(st store.Backend, t store.AdType, cmd int, fwd *Forwarder) ce
 			perr := st.UpdatePvt(ctx, text, pvt)
 			elapsed := time.Since(pstart)
 			store.ObserveUpdate("private", elapsed)
+			store.MaybeLogSlow("update-pvt", elapsed, "type", t.String(), "name", store.AdName(text))
 			if perr != nil {
 				if isCanceled(perr) {
 					// Aborted (shutdown / peer gone), not rejected. elapsed at debug
