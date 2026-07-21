@@ -294,6 +294,7 @@ func (b *RPCBackend) withRetry(ctx context.Context, lane *connLane, op func(cl *
 	backoff := b.policy.Initial
 	conflicts := 0
 	var lastErr error
+	var cause string
 	for {
 		cl, err := lane.conn(ctx)
 		if err == nil {
@@ -315,19 +316,24 @@ func (b *RPCBackend) withRetry(ctx context.Context, lane *connLane, op func(cl *
 			default:
 				lane.drop(cl)
 				lastErr = opErr
+				cause = causeOf(opErr)
 			}
 		} else {
 			if ctx.Err() != nil {
 				return err
 			}
 			lastErr = err
+			cause = "dial"
 		}
 		if b.policy.MaxElapsed > 0 && time.Since(start) >= b.policy.MaxElapsed {
 			return fmt.Errorf("collector: ad database unavailable, gave up after %s: %w", b.policy.MaxElapsed, lastErr)
 		}
-		// A retry: count it, and measure the time parked in backoff (blocked, not
-		// working) -- the direct measure of how much a slow/down database stalls us.
-		Metrics.retriesTotal.Inc()
+		// A retry: count it BY CAUSE (which transient failure this was), log it
+		// rate-limited (so a silent retry storm becomes visible without spamming), and
+		// measure the time parked in backoff -- the direct measure of how much a
+		// slow/down/flaky database stalls the update path.
+		Metrics.retriesTotal.WithLabelValues(cause).Inc()
+		logTransient(cause, lastErr)
 		waitStart := time.Now()
 		select {
 		case <-ctx.Done():
@@ -395,6 +401,53 @@ func isPermanent(err error) bool {
 func isNoSuchTxn(err error) bool {
 	var se *dbrpc.ServerError
 	return errors.As(err, &se) && se.Msg == "no such transaction"
+}
+
+// causeOf buckets a transient (retryable) failure for the retries_total{cause} metric
+// and the transient-error log, so a retry storm can be attributed: a server that keeps
+// losing transactions ("no_txn"), a connection that keeps breaking ("conn_closed"),
+// operations timing out on a wedged connection ("deadline"), a failing (re)dial
+// ("dial"), or any other transport error ("transport").
+func causeOf(err error) string {
+	switch {
+	case isNoSuchTxn(err):
+		return "no_txn"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, dbrpc.ErrConnClosed):
+		return "conn_closed"
+	default:
+		return "transport"
+	}
+}
+
+// transientLog rate-limits the transient-error WARN to at most one per cause per
+// window, so a burst of retries surfaces the cause in the log without flooding it.
+var transientLog struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+const transientLogEvery = 2 * time.Second
+
+// logTransient emits a rate-limited WARN naming why a database op is being retried.
+// withRetry otherwise swallows transient failures silently (it replays them), which is
+// why a flaky database shows up as latency with "no errors in the log" -- this makes
+// the cause visible. The full, unthrottled breakdown is in retries_total{cause}.
+func logTransient(cause string, err error) {
+	now := time.Now()
+	transientLog.mu.Lock()
+	if transientLog.last == nil {
+		transientLog.last = make(map[string]time.Time)
+	}
+	if now.Sub(transientLog.last[cause]) < transientLogEvery {
+		transientLog.mu.Unlock()
+		return
+	}
+	transientLog.last[cause] = now
+	transientLog.mu.Unlock()
+	slog.Warn("collector: transient database error, retrying with backoff (rate-limited; see retries_total{cause})",
+		"cause", cause, "err", err)
 }
 
 type keyedText struct{ key, text string }

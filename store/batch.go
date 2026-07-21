@@ -190,7 +190,9 @@ func (b *BufferedBackend) flush(ctx context.Context) error {
 	Metrics.adsPerBatch.Observe(float64(len(batch)))
 	flushStart := time.Now()
 	err := b.bw.UpdateBatch(ctx, batch)
-	Metrics.batchSeconds.Observe(time.Since(flushStart).Seconds())
+	flushDur := time.Since(flushStart)
+	Metrics.batchSeconds.Observe(flushDur.Seconds())
+	MaybeLogSlow("batch-flush", flushDur, "ads", len(batch))
 	if err == nil {
 		return nil
 	}
