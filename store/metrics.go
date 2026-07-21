@@ -59,6 +59,29 @@ type metrics struct {
 	batchesTotal prometheus.Counter
 	retriesTotal *prometheus.CounterVec
 	adsPerBatch  prometheus.Histogram
+
+	// RPC-layer instruments for the remote-database backend -- where the update/query
+	// path actually spends its time once the DB itself is fast. These isolate the wire
+	// cost (per-request round-trips, queueing on a shared connection) from DB work.
+	//
+	// rpcInflight is the number of backend operations currently awaiting the database,
+	// by lane ("write"/"read"). The write lane is a single connection, so a sustained
+	// value >1 there is head-of-line blocking -- ops queued behind a slow one.
+	rpcInflight *prometheus.GaugeVec
+	// adWriteSeconds is one ad's write round-trip inside a batch transaction (the
+	// per-ad NewClassAd send+ack). A batch is this many sequential round-trips, so
+	// batch_flush_seconds ~= adWrite x ads + commit; this is where a chatty write path
+	// shows up (a 2ms round-trip x 1000 ads = a 2s flush).
+	adWriteSeconds prometheus.Histogram
+	// commitSeconds is the transaction Commit round-trip (includes the server-side
+	// durability sync), separated from the per-ad writes so a slow commit is
+	// distinguishable from chatty per-ad round-trips.
+	commitSeconds prometheus.Histogram
+	// querySeconds is one query's round-trip: request out, all matching rows streamed
+	// back and collected. queryRows is how many rows that query returned -- together
+	// they show whether a slow read is latency, row volume, or the DB.
+	querySeconds prometheus.Histogram
+	queryRows    prometheus.Histogram
 }
 
 // retryCauses is the closed set of transient-failure causes labeled onto
@@ -72,6 +95,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	// Latency buckets from ~1ms to ~30s: updates should be sub-ms to ms; anything
 	// into the hundreds of ms / seconds is the "blocking" we are hunting.
 	latency := []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
+	// Finer buckets for a single wire round-trip: a healthy localhost round-trip is
+	// tens-to-hundreds of microseconds, so start at 25µs to distinguish "fast RTT" from
+	// the millisecond-scale RTTs that turn a large batch into a multi-second flush.
+	rtt := []float64{.000025, .00005, .0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}
+	rows := []float64{1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}
 	m := &metrics{
 		updateSeconds: fa.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "update_seconds",
@@ -105,9 +133,36 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help:    "Ads carried by each flushed batch (a batch touches ~all shards, so this drives lock contention).",
 			Buckets: []float64{1, 2, 4, 6, 8, 12, 16, 24, 32, 64, 128, 256, 512, 1024, 2048},
 		}),
+		rpcInflight: fa.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Name: "rpc_inflight",
+			Help: "Backend operations currently awaiting the database, by lane. Sustained >1 on the write lane (a single connection) is head-of-line blocking.",
+		}, []string{"lane"}),
+		adWriteSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_ad_write_seconds",
+			Help:    "Round-trip to write one ad inside a batch transaction (per-ad NewClassAd send+ack). A batch is this many sequential round-trips.",
+			Buckets: rtt,
+		}),
+		commitSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_commit_seconds",
+			Help:    "Round-trip to commit a batch transaction (includes the server-side durability sync).",
+			Buckets: rtt,
+		}),
+		querySeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_query_seconds",
+			Help:    "Round-trip for one query: request out, all matching rows streamed back and collected.",
+			Buckets: rtt,
+		}),
+		queryRows: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_query_rows",
+			Help:    "Rows returned by one query (paired with rpc_query_seconds to tell latency from row volume).",
+			Buckets: rows,
+		}),
 	}
 	for _, c := range retryCauses {
 		m.retriesTotal.WithLabelValues(c) // materialize the zero series
+	}
+	for _, lane := range []string{"write", "read"} {
+		m.rpcInflight.WithLabelValues(lane) // materialize the zero series
 	}
 	return m
 }
@@ -116,6 +171,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 func (m *metrics) observeUpdate(op string, d time.Duration) {
 	m.updateSeconds.WithLabelValues(op).Observe(d.Seconds())
 	m.updatesTotal.WithLabelValues(op).Inc()
+}
+
+// observeQuery records one query round-trip: its latency always (even a failed query
+// took time), and -- only on success -- the row count, so a slow read is attributable
+// to latency versus row volume.
+func observeQuery(start time.Time, rows int, err error) {
+	Metrics.querySeconds.Observe(time.Since(start).Seconds())
+	if err == nil {
+		Metrics.queryRows.Observe(float64(rows))
+	}
 }
 
 // ObserveUpdate records one handler-observed ad update's latency (the collector's
