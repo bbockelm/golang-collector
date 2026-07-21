@@ -92,6 +92,8 @@ type connLane struct {
 	dial func(context.Context) (dbrpc.MsgConn, error)
 	ctx  context.Context
 
+	kind string // "write" or "read", for the rpc_inflight metric label
+
 	policy RetryPolicy
 
 	mu          sync.Mutex
@@ -134,17 +136,17 @@ func NewRPCBackendPool(ctx context.Context, dial func(context.Context) (dbrpc.Ms
 	if readConns < 1 {
 		readConns = 1
 	}
-	newLane := func() *connLane {
-		return &connLane{dial: dial, ctx: ctx, policy: policy}
+	newLane := func(kind string) *connLane {
+		return &connLane{dial: dial, ctx: ctx, policy: policy, kind: kind}
 	}
 	b := &RPCBackend{
-		write:           newLane(),
+		write:           newLane("write"),
 		policy:          policy,
 		now:             func() int64 { return time.Now().Unix() },
 		defaultLifetime: DefaultLifetime,
 	}
 	for i := 0; i < readConns; i++ {
-		b.reads = append(b.reads, newLane())
+		b.reads = append(b.reads, newLane("read"))
 	}
 	return b
 }
@@ -290,6 +292,11 @@ func (lane *connLane) close() error {
 //     connection is suspect -- drop it, back off, and replay (every op is
 //     idempotent-by-key, so a replay after an ambiguous failure is safe).
 func (b *RPCBackend) withRetry(ctx context.Context, lane *connLane, op func(cl *dbrpc.Client) error) error {
+	// Count this operation as in-flight on its lane for its whole lifetime (including
+	// retries): on the single write lane a sustained value >1 is head-of-line blocking.
+	Metrics.rpcInflight.WithLabelValues(lane.kind).Inc()
+	defer Metrics.rpcInflight.WithLabelValues(lane.kind).Dec()
+
 	start := time.Now()
 	backoff := b.policy.Initial
 	conflicts := 0
@@ -497,7 +504,10 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 		return err
 	}
 	for _, it := range items {
-		if err := tx.NewClassAd(ctx, it.key, it.text); err != nil {
+		adStart := time.Now()
+		err := tx.NewClassAd(ctx, it.key, it.text)
+		Metrics.adWriteSeconds.Observe(time.Since(adStart).Seconds())
+		if err != nil {
 			// "no such transaction" means the transaction is gone (aborted underneath
 			// us -- e.g. a connection reset cleaned it up server-side), NOT that this
 			// ad was rejected. The remaining ads were never given a chance, so do not
@@ -525,7 +535,10 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	commitStart := time.Now()
+	err = tx.Commit(ctx)
+	Metrics.commitSeconds.Observe(time.Since(commitStart).Seconds())
+	return err
 }
 
 // put upserts key=text in table under one retry envelope. text must already be a
@@ -602,7 +615,9 @@ func sliceSeq[T any](s []T) iter.Seq[T] {
 func (b *RPCBackend) fetchTable(ctx context.Context, t AdType, constraint string, limit int) ([]*classad.ClassAd, error) {
 	var out []*classad.ClassAd
 	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		qStart := time.Now()
 		rows, e := cl.QueryTable(ctx, t.String(), rpcConstraint(constraint), limit)
+		observeQuery(qStart, len(rows), e)
 		if e != nil {
 			return e
 		}
@@ -675,7 +690,9 @@ func (b *RPCBackend) QueryRaw(ctx context.Context, t AdType, constraint string, 
 func (b *RPCBackend) fetchRawTable(ctx context.Context, t AdType, constraint string, limit int) ([]collections.RawAd, error) {
 	var out []collections.RawAd
 	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		qStart := time.Now()
 		rows, e := cl.QueryRawTable(ctx, t.String(), rpcConstraint(constraint), limit)
+		observeQuery(qStart, len(rows), e)
 		if e != nil {
 			return e
 		}
@@ -720,7 +737,9 @@ func (b *RPCBackend) QueryRawProject(ctx context.Context, t AdType, constraint s
 func (b *RPCBackend) fetchRawTableProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) ([]collections.RawAd, error) {
 	var out []collections.RawAd
 	err := b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		qStart := time.Now()
 		rows, e := cl.QueryRawProject(ctx, t.String(), rpcConstraint(constraint), projection, limit)
+		observeQuery(qStart, len(rows), e)
 		if e != nil {
 			return e
 		}

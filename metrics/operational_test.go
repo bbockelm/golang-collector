@@ -31,6 +31,11 @@ func TestOperationalMetricsServedWithoutStatser(t *testing.T) {
 		"condor_collector_batches_total",
 		"condor_collector_retries_total",
 		"condor_collector_ads_per_batch",
+		"condor_collector_rpc_inflight",
+		"condor_collector_rpc_ad_write_seconds",
+		"condor_collector_rpc_commit_seconds",
+		"condor_collector_rpc_query_seconds",
+		"condor_collector_rpc_query_rows",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics output missing operational metric %q", want)
