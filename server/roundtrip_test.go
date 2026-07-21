@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,20 +62,31 @@ func startCollectorFwd(t *testing.T, fwd *Forwarder) (*store.Store, string, func
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			wg.Add(1)
 			go func() {
-				if err := srv.ServeConn(ctx, conn); err != nil {
+				defer wg.Done()
+				// context.Canceled is the expected shutdown path (stop() cancels ctx);
+				// don't log it -- and never log after stop() returns, or the test may
+				// have completed, turning t.Logf into a panic.
+				if err := srv.ServeConn(ctx, conn); err != nil && ctx.Err() == nil {
 					t.Logf("SERVECONN ERR: %v", err)
 				}
 			}()
 		}
 	}()
-	return st, ln.Addr().String(), func() { cancel(); ln.Close() }
+	// stop() cancels the server context, closes the listener, then waits for the
+	// accept loop and all in-flight connection goroutines to exit -- so nothing logs
+	// against the test after it returns.
+	return st, ln.Addr().String(), func() { cancel(); ln.Close(); wg.Wait() }
 }
 
 // TestUpdateWithAck verifies UPDATE_STARTD_AD_WITH_ACK: the client blocks for
