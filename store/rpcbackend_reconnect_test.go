@@ -201,8 +201,8 @@ func TestRPCBackendSingleFlightDial(t *testing.T) {
 // wedged reader would starve the write's commit response and this test would hang.
 func TestReadStallDoesNotBlockWrites(t *testing.T) {
 	dc := newDialController(t)
-	// One read lane so the wedged dial deterministically lands on it.
-	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 1)
+	// One read lane so the wedged dial deterministically lands on it; one write lane.
+	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 1, 1)
 	defer b.Close()
 	ctx := context.Background()
 
@@ -250,7 +250,7 @@ func TestReadStallDoesNotBlockWrites(t *testing.T) {
 // fix.
 func TestReadWriteUseSeparateConnections(t *testing.T) {
 	dc := newDialController(t)
-	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 2)
+	b := NewRPCBackendPool(context.Background(), dc.dial, fastPolicy(), 2, 1)
 	defer b.Close()
 	ctx := context.Background()
 
@@ -261,7 +261,7 @@ func TestReadWriteUseSeparateConnections(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	wc := b.write.client
+	wc := b.writes[0].client
 	if wc == nil {
 		t.Fatal("write lane has no connection after a write")
 	}

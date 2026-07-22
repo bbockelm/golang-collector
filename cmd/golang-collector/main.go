@@ -648,9 +648,10 @@ func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, e
 		}
 		policy := dbRetryPolicy(cfg)
 		readConns := configInt(cfg, "COLLECTOR_DB_READ_CONNS", store.DefaultReadConns)
+		writeConns := configInt(cfg, "COLLECTOR_DB_WRITE_CONNS", store.DefaultWriteConns)
 		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR",
-			"host", addr, "retry_max_elapsed", policy.MaxElapsed.String(), "read_conns", readConns)
-		return store.NewRPCBackendPool(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr)), policy, readConns), nil
+			"host", addr, "retry_max_elapsed", policy.MaxElapsed.String(), "read_conns", readConns, "write_conns", writeConns)
+		return store.NewRPCBackendPool(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr)), policy, readConns, writeConns), nil
 	default:
 		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"embedded\", or \"db\")", kind)
 	}

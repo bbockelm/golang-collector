@@ -74,9 +74,10 @@ const maxConflictRetries = 100
 // small round-robin pool of lanes, so a slow query can never stall a commit (nor,
 // beyond its own pool slot, other queries).
 type RPCBackend struct {
-	write  *connLane   // dedicated to write transactions
-	reads  []*connLane // round-robin pool for queries/streams
-	readRR atomic.Uint64
+	writes  []*connLane // round-robin pool for write transactions
+	writeRR atomic.Uint64
+	reads   []*connLane // round-robin pool for queries/streams
+	readRR  atomic.Uint64
 
 	policy RetryPolicy
 
@@ -119,39 +120,66 @@ var errBackendClosed = errors.New("collector: rpc backend is closed")
 // DefaultReadConns is the size of the read-connection pool when NewRPCBackend is used
 // (or NewRPCBackendPool is given a non-positive count). A small pool spreads
 // concurrent queries across connections so one slow consumer stalls only its slot.
-const DefaultReadConns = 4
+const DefaultReadConns = 8
 
-// NewRPCBackend builds a remote-database backend with a dedicated write connection and
-// a DefaultReadConns-sized read pool, each produced by dial (called to (re)establish a
-// connection; each call returns a fresh MsgConn -- e.g. a freshly authenticated CEDAR
-// DBSession stream wrapped with dbrpc.NewCedarConn). ctx bounds the backend's lifetime
-// (and every dial). policy governs retry/backoff; a zero policy becomes DefaultRetryPolicy.
+// DefaultWriteConns is the size of the write-connection pool. Writes still ride lanes
+// SEPARATE from reads (so a slow query can never stall a commit), but a small pool lets
+// concurrent flushes -- the background flusher, full-buffer flushes from many advertising
+// goroutines, and read-triggered flushes -- overlap their commit round-trips instead of
+// serializing on one connection, and lets independent per-table transactions commit
+// concurrently server-side. Kept small: same-table commits still serialize on the
+// server's per-collection lock, so a large pool mostly just adds connections.
+const DefaultWriteConns = 8
+
+// NewRPCBackend builds a remote-database backend with a DefaultWriteConns-sized write
+// pool and a DefaultReadConns-sized read pool, each connection produced by dial (called
+// to (re)establish a connection; each call returns a fresh MsgConn -- e.g. a freshly
+// authenticated CEDAR DBSession stream wrapped with dbrpc.NewCedarConn). ctx bounds the
+// backend's lifetime (and every dial). policy governs retry/backoff; a zero policy
+// becomes DefaultRetryPolicy.
 func NewRPCBackend(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy) *RPCBackend {
-	return NewRPCBackendPool(ctx, dial, policy, DefaultReadConns)
+	return NewRPCBackendPool(ctx, dial, policy, DefaultReadConns, DefaultWriteConns)
 }
 
-// NewRPCBackendPool is NewRPCBackend with an explicit read-pool size (clamped to at
-// least 1). One extra connection is always used for writes.
-func NewRPCBackendPool(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy, readConns int) *RPCBackend {
+// NewRPCBackendPool is NewRPCBackend with explicit read- and write-pool sizes (each
+// clamped to at least 1). Reads and writes ride disjoint pools so a slow query never
+// stalls a commit.
+func NewRPCBackendPool(ctx context.Context, dial func(context.Context) (dbrpc.MsgConn, error), policy RetryPolicy, readConns, writeConns int) *RPCBackend {
 	if policy == (RetryPolicy{}) {
 		policy = DefaultRetryPolicy
 	}
 	if readConns < 1 {
 		readConns = 1
 	}
+	if writeConns < 1 {
+		writeConns = 1
+	}
 	newLane := func(kind string) *connLane {
 		return &connLane{dial: dial, ctx: ctx, policy: policy, kind: kind}
 	}
 	b := &RPCBackend{
-		write:           newLane("write"),
 		policy:          policy,
 		now:             func() int64 { return time.Now().Unix() },
 		defaultLifetime: DefaultLifetime,
+	}
+	for i := 0; i < writeConns; i++ {
+		b.writes = append(b.writes, newLane("write"))
 	}
 	for i := 0; i < readConns; i++ {
 		b.reads = append(b.reads, newLane("read"))
 	}
 	return b
+}
+
+// writeLane picks the next write-pool lane round-robin. Each write op (a Begin...Commit
+// transaction) runs entirely on the one lane returned here; write ops are independent
+// idempotent-by-key transactions, so successive ops need not share a lane.
+func (b *RPCBackend) writeLane() *connLane {
+	if len(b.writes) == 1 {
+		return b.writes[0]
+	}
+	i := b.writeRR.Add(1) - 1
+	return b.writes[int(i%uint64(len(b.writes)))]
 }
 
 // readLane picks the next read-pool lane round-robin. A transaction (Get) or query
@@ -503,7 +531,7 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 		}
 		byTable[p.Type.String()] = append(byTable[p.Type.String()], keyedText{string(key), stampText(p.Text, b.now())})
 	}
-	return b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+	return b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 		for table, items := range byTable {
 			if err := putBatchTx(ctx, cl, table, items); err != nil {
 				return err
@@ -568,7 +596,7 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 // put upserts key=text in table under one retry envelope. text must already be a
 // complete old-ClassAd body.
 func (b *RPCBackend) put(ctx context.Context, table, key, text string) error {
-	return b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+	return b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 		tx, err := cl.BeginTable(ctx, table)
 		if err != nil {
 			return err
@@ -940,7 +968,7 @@ func (b *RPCBackend) Invalidate(ctx context.Context, t AdType, constraint string
 	}
 	if t != StartdAd {
 		var n int
-		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 			var e error
 			n, e = cl.DeleteWhereTable(ctx, t.String(), rpcConstraint(constraint))
 			return e
@@ -971,7 +999,7 @@ func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (i
 	n := 0
 	for _, k := range keys {
 		var present bool
-		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 			tx, err := cl.BeginTable(ctx, t.String())
 			if err != nil {
 				return err
@@ -993,7 +1021,7 @@ func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (i
 			n++
 		}
 		if t == StartdAd {
-			_ = b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+			_ = b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 				tx, err := cl.BeginTable(ctx, StartdPvtAd.String())
 				if err != nil {
 					return err
@@ -1078,7 +1106,7 @@ func (b *RPCBackend) Expire(ctx context.Context) (int, error) {
 	total := 0
 	for t := AnyAd + 1; t < numAdTypes; t++ {
 		var n int
-		err := b.withRetry(ctx, b.write, func(cl *dbrpc.Client) error {
+		err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 			var e error
 			n, e = cl.DeleteWhereTable(ctx, t.String(), constraint)
 			return e
@@ -1132,12 +1160,14 @@ func (b *RPCBackend) DBDiagnostics(ctx context.Context) (map[string]*dbrpc.Diagn
 	return out, firstErr
 }
 
-// Close tears down every lane (the write connection and the whole read pool),
+// Close tears down every lane (the whole write pool and the whole read pool),
 // returning the first close error encountered.
 func (b *RPCBackend) Close() error {
 	var firstErr error
-	if err := b.write.close(); err != nil {
-		firstErr = err
+	for _, w := range b.writes {
+		if err := w.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	for _, r := range b.reads {
 		if err := r.close(); err != nil && firstErr == nil {
