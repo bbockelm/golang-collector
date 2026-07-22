@@ -60,13 +60,15 @@ type BufferedBackend struct {
 	Backend // reads and non-buffered writes pass through
 	bw      BatchWriter
 	window  time.Duration
-	maxBuf  int
+	maxBuf  int // high-water mark: signal the writer to flush
+	hardCap int // absolute cap: block the producer (backpressure) when the writer falls behind
 	log     func(error)
 
-	mu   sync.Mutex
-	buf  map[dedupKey]PendingUpdate
-	stop chan struct{}
-	wg   sync.WaitGroup
+	mu       sync.Mutex
+	buf      map[dedupKey]PendingUpdate
+	flushSig chan struct{} // buffered(1); wakes the background writer at the high-water mark
+	stop     chan struct{}
+	wg       sync.WaitGroup
 }
 
 // Base returns the wrapped backend, so a caller can reach an optional capability the
@@ -117,9 +119,14 @@ func NewBufferedBackend(under Backend, window time.Duration, maxBuf int, logErr 
 		bw:      bw,
 		window:  window,
 		maxBuf:  maxBuf,
-		log:     logErr,
-		buf:     make(map[dedupKey]PendingUpdate),
-		stop:    make(chan struct{}),
+		// The writer may fall behind a burst; let the buffer grow to a multiple of the
+		// high-water mark before applying backpressure, so a slow commit does not stall the
+		// producer for anything short of a sustained overload.
+		hardCap:  maxBuf * 4,
+		log:      logErr,
+		buf:      make(map[dedupKey]PendingUpdate),
+		flushSig: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
 	}
 	if window > 0 {
 		b.wg.Add(1)
@@ -128,23 +135,36 @@ func NewBufferedBackend(under Backend, window time.Duration, maxBuf int, logErr 
 	return b, nil
 }
 
+// run is the single background writer: it drains and commits the buffer on the window
+// ticker OR whenever a producer signals the high-water mark. Committing here (not on the
+// producer's goroutine) is what lets producers keep buffering while a batch commits --
+// the writer picks up everything that accumulated during the previous commit on its next
+// loop, so commits pipeline back-to-back instead of stalling the update stream.
 func (b *BufferedBackend) run() {
 	t := time.NewTicker(b.window)
 	defer t.Stop()
 	for {
 		select {
 		case <-b.stop:
+			_ = b.flush(context.Background()) // final drain so shutdown loses nothing buffered
 			return
 		case <-t.C:
 			// The background flush is not tied to a request, so it uses a background
 			// context: the underlying backend's own retry budget bounds it. A failure
 			// here is already logged/handled by flush.
 			_ = b.flush(context.Background())
+		case <-b.flushSig:
+			_ = b.flush(context.Background())
 		}
 	}
 }
 
-// enqueue buffers p, flushing synchronously if the buffer is full.
+// enqueue buffers p. With a background writer running (window > 0) it does NOT commit on
+// the caller's goroutine: at the high-water mark it just signals the writer (so the
+// update stream keeps flowing while the previous batch commits), and only blocks -- doing
+// an inline flush as backpressure -- if the buffer has grown past hardCap because the
+// writer is not keeping up. Without a background writer (window == 0, e.g. tests) it
+// flushes inline when full, as before.
 func (b *BufferedBackend) enqueue(ctx context.Context, p PendingUpdate) error {
 	k, ok := p.dedupKey()
 	if !ok {
@@ -152,10 +172,29 @@ func (b *BufferedBackend) enqueue(ctx context.Context, p PendingUpdate) error {
 	}
 	b.mu.Lock()
 	b.buf[k] = p
-	full := len(b.buf) >= b.maxBuf
+	n := len(b.buf)
 	b.mu.Unlock()
-	if full {
+
+	if b.window <= 0 {
+		// No background writer to hand off to: commit inline when full.
+		if n >= b.maxBuf {
+			return b.flush(ctx)
+		}
+		return nil
+	}
+	if n >= b.hardCap {
+		// The writer is falling behind and the buffer is at its cap; block this producer
+		// on an inline flush to bound memory and push backpressure to the sender.
+		Metrics.backpressureTotal.Inc()
 		return b.flush(ctx)
+	}
+	if n >= b.maxBuf {
+		// Wake the writer without blocking; a coalesced pending signal is fine (the writer
+		// drains the whole buffer regardless of how many signals it represents).
+		select {
+		case b.flushSig <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }
