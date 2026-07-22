@@ -262,6 +262,15 @@ func (lane *connLane) dialShared() {
 	var cl *dbrpc.Client
 	if err == nil {
 		cl = dbrpc.NewClient(mc)
+		// Localize where each write-path round-trip spends its time (client write-lock /
+		// socket send / server wait) so a flush stall can be attributed without a server
+		// profile. Cheap: three Observe calls per unary RPC.
+		cl.Observer = func(s dbrpc.CallStats) {
+			op := dbrpc.OpName(s.Op)
+			Metrics.rpcCallPhaseSeconds.WithLabelValues(op, "write_wait").Observe(s.WriteWait.Seconds())
+			Metrics.rpcCallPhaseSeconds.WithLabelValues(op, "send").Observe(s.Send.Seconds())
+			Metrics.rpcCallPhaseSeconds.WithLabelValues(op, "wait").Observe(s.Wait.Seconds())
+		}
 		// The server does not auto-create tables on first write; ensure each AdType's
 		// table exists (idempotent). Done on every lane -- including read lanes -- so a
 		// query that reaches a fresh database before any write does not fail on a
@@ -655,7 +664,9 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	if len(items) == 0 {
 		return nil
 	}
+	beginStart := time.Now()
 	tx, err := cl.BeginTable(ctx, table)
+	Metrics.rpcBeginSeconds.Observe(time.Since(beginStart).Seconds())
 	if err != nil {
 		return err
 	}
