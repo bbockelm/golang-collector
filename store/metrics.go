@@ -59,6 +59,11 @@ type metrics struct {
 	batchesTotal prometheus.Counter
 	retriesTotal *prometheus.CounterVec
 	adsPerBatch  prometheus.Histogram
+	// backpressureTotal counts times a producer had to flush inline because the buffer
+	// hit its hard cap (the background writer could not keep up). A rising rate means the
+	// update stream is being throttled by commit throughput -- the signal that writes are
+	// no longer pipelining freely.
+	backpressureTotal prometheus.Counter
 
 	// RPC-layer instruments for the remote-database backend -- where the update/query
 	// path actually spends its time once the DB itself is fast. These isolate the wire
@@ -124,6 +129,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		batchesTotal: fa.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "batches_total",
 			Help: "Buffered batches flushed.",
+		}),
+		backpressureTotal: fa.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Name: "backpressure_total",
+			Help: "Times a producer flushed inline because the buffer hit its hard cap (the background writer fell behind).",
 		}),
 		retriesTotal: fa.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "retries_total",
