@@ -64,6 +64,10 @@ type metrics struct {
 	// update stream is being throttled by commit throughput -- the signal that writes are
 	// no longer pipelining freely.
 	backpressureTotal prometheus.Counter
+	// commitFanout records how many concurrent commit units a fanned-out UpdateBatch split
+	// into (1 = no fan-out). It shows the adaptive write parallelism engaging: values >1
+	// appear only when a flush is large enough to spread across the write pool.
+	commitFanout prometheus.Histogram
 
 	// RPC-layer instruments for the remote-database backend -- where the update/query
 	// path actually spends its time once the DB itself is fast. These isolate the wire
@@ -133,6 +137,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		backpressureTotal: fa.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "backpressure_total",
 			Help: "Times a producer flushed inline because the buffer hit its hard cap (the background writer fell behind).",
+		}),
+		commitFanout: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "commit_fanout",
+			Help:    "Concurrent commit units a fanned-out batch split into (1 = no fan-out); shows adaptive write parallelism engaging under load.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32},
 		}),
 		retriesTotal: fa.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "retries_total",
