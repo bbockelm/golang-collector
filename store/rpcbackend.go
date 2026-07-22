@@ -531,14 +531,114 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 		}
 		byTable[p.Type.String()] = append(byTable[p.Type.String()], keyedText{string(key), stampText(p.Text, b.now())})
 	}
-	return b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
-		for table, items := range byTable {
-			if err := putBatchTx(ctx, cl, table, items); err != nil {
-				return err
+	// Build the commit units. Normally one per table; a table whose batch is large is
+	// split into up to write-pool-many chunks so a heavy flush commits across several
+	// lanes concurrently instead of one table after another on one lane. Parallelism thus
+	// GROWS WITH THE BATCH SIZE: a light flush yields one small unit per table and does not
+	// fan out (so it pays no extra commits/fsyncs), while a heavy flush fans out for
+	// throughput. Because all units come from one drained snapshot over disjoint keys,
+	// splitting never reorders a key's writes.
+	units := b.buildCommitUnits(byTable)
+
+	// Light load: a single unit commits inline on one lane under one retry envelope --
+	// byte-for-byte the pre-fan-out path, so the common small flush pays no goroutine or
+	// parallelism overhead.
+	if len(units) <= 1 {
+		if len(units) == 0 {
+			return nil
+		}
+		u := units[0]
+		return b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
+			return putBatchTx(ctx, cl, u.table, u.items)
+		})
+	}
+	return b.commitUnitsConcurrent(ctx, units)
+}
+
+// commitUnit is one table's (sub-)batch committed as a single transaction on one lane.
+type commitUnit struct {
+	table string
+	items []keyedText
+}
+
+// adaptiveFanoutChunk is the per-table batch size below which a table commits as a single
+// transaction. Above it, the table is split into up to write-pool-many chunks that commit
+// concurrently. It is deliberately large so ordinary flushes stay one commit per table
+// (no extra fsyncs); only a genuinely heavy flush fans out and accepts the extra commits
+// for the throughput it needs.
+const adaptiveFanoutChunk = 256
+
+// buildCommitUnits turns the grouped-by-table batch into commit units, splitting a large
+// table into at most len(b.writes) balanced chunks (so a table never yields more
+// concurrent commits than there are lanes to run them on).
+func (b *RPCBackend) buildCommitUnits(byTable map[string][]keyedText) []commitUnit {
+	var units []commitUnit
+	for table, items := range byTable {
+		if len(items) == 0 {
+			continue
+		}
+		nChunks := 1
+		if len(b.writes) > 1 && len(items) > adaptiveFanoutChunk {
+			nChunks = (len(items) + adaptiveFanoutChunk - 1) / adaptiveFanoutChunk
+			if nChunks > len(b.writes) {
+				nChunks = len(b.writes)
 			}
 		}
-		return nil
-	})
+		if nChunks == 1 {
+			units = append(units, commitUnit{table, items})
+			continue
+		}
+		chunk := (len(items) + nChunks - 1) / nChunks
+		for start := 0; start < len(items); start += chunk {
+			end := start + chunk
+			if end > len(items) {
+				end = len(items)
+			}
+			units = append(units, commitUnit{table, items[start:end]})
+		}
+	}
+	return units
+}
+
+// commitUnitsConcurrent commits units in parallel across the write pool, bounded to the
+// number of write lanes (extra units queue for a lane). Each unit is its own retry
+// envelope on its own lane; every write is an idempotent keyed upsert, so an independent
+// replay after a transient failure is safe. On the first hard error it cancels the rest
+// (they will be replayed if the caller retries the batch) and returns that error.
+func (b *RPCBackend) commitUnitsConcurrent(ctx context.Context, units []commitUnit) error {
+	Metrics.commitFanout.Observe(float64(len(units)))
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, len(b.writes))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for _, u := range units {
+		u := u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
+				return putBatchTx(ctx, cl, u.table, u.items)
+			})
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel() // stop the rest; the batch will be replayed on retry
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // adBatchChunkSize bounds how many ads ride in one opNewAdBatch frame. The chunks are
