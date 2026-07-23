@@ -100,7 +100,7 @@ func TestCollectorPrivilegeDrop(t *testing.T) {
 	port := freePort(t)
 	collAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	addrFile := filepath.Join(logDir, ".collector_address")
-	dbPath := filepath.Join(spoolDir, "collector_sessions.db")
+	dbPath := filepath.Join(spoolDir, "sessions_collector.db")
 	sbin := filepath.Dir(mustLookPath(t, "condor_master"))
 	libexec := libexecDir(t, sbin)
 
@@ -130,9 +130,9 @@ USE_SHARED_PORT = True
 # Encrypted-at-rest session persistence: the collector reads the root-owned pool
 # signing key (as root) to key-encrypt this DB. This is what forces the root
 # re-elevation the test asserts.
-COLLECTOR_PERSIST_SESSIONS = True
+SEC_PERSIST_SESSIONS = True
 SEC_PASSWORD_DIRECTORY = %s
-COLLECTOR_SESSION_CACHE_FILE = %s
+SEC_SESSION_CACHE_FILE = %s
 SEC_DEFAULT_AUTHENTICATION = REQUIRED
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS
 SEC_DEFAULT_CRYPTO_METHODS = AES
