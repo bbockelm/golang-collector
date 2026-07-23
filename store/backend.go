@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"time"
 
@@ -117,6 +118,31 @@ type ProjectedRawStreamer interface {
 	QueryRawProjectStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) error
 }
 
+// ErrRedactionNotSupported reports that a backend cannot guarantee source-side
+// redaction of private attributes; the caller should fall back to redacting the
+// results itself. Returned by wrappers (BufferedBackend) whose method set cannot
+// mirror the wrapped backend's capabilities statically.
+var ErrRedactionNotSupported = errors.New("collector: backend does not support source-side redaction")
+
+// RedactedRawQueryer is an optional Backend capability: QueryRawRedacted is
+// QueryRaw with the backend GUARANTEEING that no private (secret) attribute
+// appears in any yielded ad. The in-memory store strips them at the source --
+// its intern table flags each attribute name as private once, when the name is
+// first interned, and the redacting de-intern skips flagged ids with a single
+// bool check, never rendering the private value at all. When a backend offers
+// this, the server serves a redacted (public) query without scanning each ad's
+// attribute names itself; backends without it fall back to the server's per-ad
+// redaction pass (redactRawExprs).
+type RedactedRawQueryer interface {
+	QueryRawRedacted(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error)
+}
+
+// RedactedProjectedRawQueryer is RedactedRawQueryer with a projection applied to
+// the already-redacted ads (see ProjectedRawQueryer).
+type RedactedProjectedRawQueryer interface {
+	QueryRawProjectRedacted(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error)
+}
+
 // Retrainer is an optional Backend capability: periodic maintenance of the
 // ClassAd compression dictionary (the in-memory backend's memory-footprint
 // lever). Backends that manage their own storage do not implement it.
@@ -135,9 +161,11 @@ type Statser interface {
 
 // The in-memory Store is the default backend and implements every capability.
 var (
-	_ Backend             = (*Store)(nil)
-	_ RawQueryer          = (*Store)(nil)
-	_ ProjectedRawQueryer = (*Store)(nil)
-	_ Retrainer           = (*Store)(nil)
-	_ Statser             = (*Store)(nil)
+	_ Backend                     = (*Store)(nil)
+	_ RawQueryer                  = (*Store)(nil)
+	_ ProjectedRawQueryer         = (*Store)(nil)
+	_ RedactedRawQueryer          = (*Store)(nil)
+	_ RedactedProjectedRawQueryer = (*Store)(nil)
+	_ Retrainer                   = (*Store)(nil)
+	_ Statser                     = (*Store)(nil)
 )

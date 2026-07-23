@@ -150,6 +150,9 @@ USE_SHARED_PORT = FALSE
 ENABLE_IPV6 = FALSE
 NETWORK_INTERFACE = 127.0.0.1
 DAEMON_LIST = COLLECTOR
+# No UDP command socket: sandboxed benchmark environments may deny the UDP bind
+# (it is not exercised by these TCP-only query benchmarks anyway).
+WANT_UDP_COMMAND_SOCKET = FALSE
 # Plaintext + unauthenticated, to match the Go client's plaintext handshake.
 SEC_DEFAULT_AUTHENTICATION = OPTIONAL
 SEC_DEFAULT_ENCRYPTION = NEVER

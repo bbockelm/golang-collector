@@ -197,6 +197,19 @@ func copyAttrLines(text string, attrs ...string) string {
 // dictionary over the real ad population is what unlocks the collection's
 // compression, so the collector should call this once enough ads have arrived
 // and periodically thereafter (see StartAutoRetrain).
+// RefreshHotSets recomputes each table's hot-attribute set from recorded query
+// demand (collections.RefreshHotSet): attributes that queries keep reading --
+// e.g. a monitoring projection -- are front-loaded in future writes' hot
+// headers, which is what lets the projected read path serve an ad from its hot
+// header alone. Re-advertising daemons converge the stored population.
+func (s *Store) RefreshHotSets(sampleMax, topN int) {
+	for _, col := range s.cols {
+		if col != nil {
+			col.RefreshHotSet(sampleMax, topN)
+		}
+	}
+}
+
 func (s *Store) RetrainDict(sampleMax int) {
 	for _, col := range s.cols {
 		if col != nil {
@@ -209,13 +222,19 @@ func (s *Store) RetrainDict(sampleMax int) {
 // a background goroutine, and returns a stop function (which blocks until the
 // goroutines exit). Without this the collection stays on the identity codec and
 // stores ads uncompressed; a dictionary trained over the real ad population
-// compresses a pool of similar ads several-fold. hotTopN is 0 here because the
-// collector front-loads a fixed hot-attribute set rather than auto-tuning it.
+// compresses a pool of similar ads several-fold. The same pass refreshes each
+// table's hot set from recorded query demand (autoRetrainHotTopN), so the
+// attributes monitoring keeps projecting migrate into future writes' hot
+// headers and the projected read path stays on its hot fast path.
+// autoRetrainHotTopN caps how many demand-ranked attributes the periodic hot-set
+// refresh front-loads (plus the always-hot match defaults and their closure).
+const autoRetrainHotTopN = 32
+
 func (s *Store) StartAutoRetrain(interval time.Duration, sampleMax int) func() {
 	stops := make([]func(), 0, len(s.cols))
 	for _, col := range s.cols {
 		if col != nil {
-			stops = append(stops, col.StartAutoRetrain(interval, sampleMax, 0))
+			stops = append(stops, col.StartAutoRetrain(interval, sampleMax, autoRetrainHotTopN))
 		}
 	}
 	return func() {
@@ -323,26 +342,51 @@ func (s *Store) QueryRaw(ctx context.Context, t AdType, constraint string, limit
 	return s.queryRaw(t, q), nil
 }
 
-// QueryRawProject makes Store a store.ProjectedRawQueryer: it runs QueryRaw and
-// trims each ad to the projected attributes locally (the in-memory store has no
-// wire to push a projection across, so the win is only skipping the private-attr
-// scan of unprojected columns upstream -- correctness is the point here).
+// QueryRawProject makes Store a store.ProjectedRawQueryer: the projection is
+// pushed into the collection's wire walk (resolved to interned ids once per
+// query), so a non-projected attribute costs an id comparison and a TLV length
+// hop instead of being rendered to text and then discarded.
 func (s *Store) QueryRawProject(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
-	raw, err := s.QueryRaw(ctx, t, constraint, limit)
+	q, err := parseConstraint(constraint)
 	if err != nil {
 		return nil, err
 	}
-	return projectRawSeq(raw, projection), nil
+	return s.queryRawProjected(t, q, projection, false), nil
 }
 
-func (s *Store) queryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+// QueryRawRedacted makes Store a store.RedactedRawQueryer: QueryRaw with private
+// attributes stripped inside the collection as each ad is de-interned (a per-id
+// flag check -- see wire.NewInternTableWithPrivacy), so no private value is ever
+// rendered and the caller needs no redaction pass of its own.
+func (s *Store) QueryRawRedacted(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	q, err := parseConstraint(constraint)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryRawOpt(t, q, true), nil
+}
+
+// QueryRawProjectRedacted makes Store a store.RedactedProjectedRawQueryer:
+// QueryRawProject with private attributes stripped inside the same wire walk.
+func (s *Store) QueryRawProjectRedacted(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	q, err := parseConstraint(constraint)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryRawProjected(t, q, projection, true), nil
+}
+
+// queryRawProjected routes a projected raw query to the collection-level in-walk
+// projection. chaseRefs is always false here: HTCondor's query protocol returns
+// exactly the requested attributes.
+func (s *Store) queryRawProjected(t AdType, q *vm.Query, projection []string, redact bool) iter.Seq[collections.RawAd] {
 	if t == AnyAd {
 		return func(yield func(collections.RawAd) bool) {
 			for at := AnyAd + 1; at < numAdTypes; at++ {
 				if at == StartdPvtAd {
 					continue // private ads are never returned by an ANY query
 				}
-				for ra := range s.queryOneRaw(at, q) {
+				for ra := range s.queryOneRawProjected(at, q, projection, redact) {
 					if !yield(ra) {
 						return
 					}
@@ -350,18 +394,57 @@ func (s *Store) queryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
 			}
 		}
 	}
-	return s.queryOneRaw(t, q)
+	return s.queryOneRawProjected(t, q, projection, redact)
 }
 
-func (s *Store) queryOneRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+func (s *Store) queryOneRawProjected(t AdType, q *vm.Query, projection []string, redact bool) iter.Seq[collections.RawAd] {
 	col := s.cols[t]
 	if col == nil {
 		return func(func(collections.RawAd) bool) {}
 	}
 	if q == nil {
-		return col.ScanRaw()
+		return col.ScanRawProjected(projection, false, redact)
 	}
-	return col.QueryRaw(q)
+	return col.QueryRawProjected(q, projection, false, redact)
+}
+
+func (s *Store) queryRaw(t AdType, q *vm.Query) iter.Seq[collections.RawAd] {
+	return s.queryRawOpt(t, q, false)
+}
+
+func (s *Store) queryRawOpt(t AdType, q *vm.Query, redact bool) iter.Seq[collections.RawAd] {
+	if t == AnyAd {
+		return func(yield func(collections.RawAd) bool) {
+			for at := AnyAd + 1; at < numAdTypes; at++ {
+				if at == StartdPvtAd {
+					continue // private ads are never returned by an ANY query
+				}
+				for ra := range s.queryOneRaw(at, q, redact) {
+					if !yield(ra) {
+						return
+					}
+				}
+			}
+		}
+	}
+	return s.queryOneRaw(t, q, redact)
+}
+
+func (s *Store) queryOneRaw(t AdType, q *vm.Query, redact bool) iter.Seq[collections.RawAd] {
+	col := s.cols[t]
+	if col == nil {
+		return func(func(collections.RawAd) bool) {}
+	}
+	switch {
+	case q == nil && redact:
+		return col.ScanRawRedacted()
+	case q == nil:
+		return col.ScanRaw()
+	case redact:
+		return col.QueryRawRedacted(q)
+	default:
+		return col.QueryRaw(q)
+	}
 }
 
 // Invalidate removes ads from table t. If a constraint q is given, every ad it

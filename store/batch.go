@@ -340,6 +340,35 @@ func (b *BufferedBackend) QueryRaw(ctx context.Context, t AdType, constraint str
 	return rq.QueryRaw(ctx, t, constraint, limit)
 }
 
+// QueryRawRedacted flushes, then serves a source-redacted raw query. The buffer
+// itself cannot strip private attributes, so this only delegates; when the
+// underlying backend lacks the capability it returns ErrRedactionNotSupported
+// and the caller redacts results itself (its type assertion on the wrapper
+// necessarily succeeds, so the capability is probed at call time).
+func (b *BufferedBackend) QueryRawRedacted(ctx context.Context, t AdType, constraint string, limit int) (iter.Seq[collections.RawAd], error) {
+	if err := b.flush(ctx); err != nil {
+		return nil, err
+	}
+	rq, ok := b.Backend.(RedactedRawQueryer)
+	if !ok {
+		return nil, ErrRedactionNotSupported
+	}
+	return rq.QueryRawRedacted(ctx, t, constraint, limit)
+}
+
+// QueryRawProjectRedacted is QueryRawRedacted with a projection (see
+// QueryRawProject); it delegates or reports ErrRedactionNotSupported.
+func (b *BufferedBackend) QueryRawProjectRedacted(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error) {
+	if err := b.flush(ctx); err != nil {
+		return nil, err
+	}
+	prq, ok := b.Backend.(RedactedProjectedRawQueryer)
+	if !ok {
+		return nil, ErrRedactionNotSupported
+	}
+	return prq.QueryRawProjectRedacted(ctx, t, constraint, projection, limit)
+}
+
 // QueryRawProject flushes, then serves a projected raw query. If the underlying
 // backend can push the projection down (a remote database), it delegates. If not,
 // it falls back to a whole-ad QueryRaw and trims the projection locally -- so a
