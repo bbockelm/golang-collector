@@ -557,9 +557,12 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 			return nil
 		}
 		u := units[0]
-		return b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
+		unitStart := time.Now()
+		err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 			return putBatchTx(ctx, cl, u.table, u.items)
 		})
+		Metrics.unitSeconds.Observe(time.Since(unitStart).Seconds())
+		return err
 	}
 	return b.commitUnitsConcurrent(ctx, units)
 }
@@ -578,32 +581,62 @@ type commitUnit struct {
 const adaptiveFanoutChunk = 256
 
 // buildCommitUnits turns the grouped-by-table batch into commit units, splitting a large
-// table into at most len(b.writes) balanced chunks (so a table never yields more
-// concurrent commits than there are lanes to run them on).
+// table into balanced chunks -- bounded so the WHOLE batch fits one wave of the write
+// pool. The per-table cap alone was not enough: several split tables plus a few singles
+// could total more units than lanes, and the excess queued behind the pool semaphore for
+// a second serial wave (an unmeasured 1-3s stall on a heavy flush). Shrinking the
+// most-split table first keeps chunks balanced; every table keeps at least one unit (a
+// unit never spans tables), so a flush touching more tables than lanes still waves --
+// that much is inherent in per-table transactions.
 func (b *RPCBackend) buildCommitUnits(byTable map[string][]keyedText) []commitUnit {
-	var units []commitUnit
+	lanes := len(b.writes)
+	type tableSplit struct {
+		table  string
+		items  []keyedText
+		chunks int
+	}
+	splits := make([]tableSplit, 0, len(byTable))
+	total := 0
 	for table, items := range byTable {
 		if len(items) == 0 {
 			continue
 		}
-		nChunks := 1
-		if len(b.writes) > 1 && len(items) > adaptiveFanoutChunk {
-			nChunks = (len(items) + adaptiveFanoutChunk - 1) / adaptiveFanoutChunk
-			if nChunks > len(b.writes) {
-				nChunks = len(b.writes)
+		chunks := 1
+		if lanes > 1 && len(items) > adaptiveFanoutChunk {
+			chunks = (len(items) + adaptiveFanoutChunk - 1) / adaptiveFanoutChunk
+			if chunks > lanes {
+				chunks = lanes
 			}
 		}
-		if nChunks == 1 {
-			units = append(units, commitUnit{table, items})
+		splits = append(splits, tableSplit{table, items, chunks})
+		total += chunks
+	}
+	for total > lanes {
+		maxI := -1
+		for i := range splits {
+			if splits[i].chunks > 1 && (maxI < 0 || splits[i].chunks > splits[maxI].chunks) {
+				maxI = i
+			}
+		}
+		if maxI < 0 {
+			break // every table already at one unit
+		}
+		splits[maxI].chunks--
+		total--
+	}
+	var units []commitUnit
+	for _, s := range splits {
+		if s.chunks == 1 {
+			units = append(units, commitUnit{s.table, s.items})
 			continue
 		}
-		chunk := (len(items) + nChunks - 1) / nChunks
-		for start := 0; start < len(items); start += chunk {
+		chunk := (len(s.items) + s.chunks - 1) / s.chunks
+		for start := 0; start < len(s.items); start += chunk {
 			end := start + chunk
-			if end > len(items) {
-				end = len(items)
+			if end > len(s.items) {
+				end = len(s.items)
 			}
-			units = append(units, commitUnit{table, items[start:end]})
+			units = append(units, commitUnit{s.table, s.items[start:end]})
 		}
 	}
 	return units
@@ -627,15 +660,22 @@ func (b *RPCBackend) commitUnitsConcurrent(ctx context.Context, units []commitUn
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			semStart := time.Now()
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
 				return
 			}
+			// Semaphore wait is the "second wave" serialization on an over-fanned flush;
+			// buildCommitUnits bounds units to one wave, so nonzero time here means either
+			// more touched tables than lanes or a regression in that bound.
+			Metrics.semWaitSeconds.Observe(time.Since(semStart).Seconds())
+			unitStart := time.Now()
 			err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
 				return putBatchTx(ctx, cl, u.table, u.items)
 			})
+			Metrics.unitSeconds.Observe(time.Since(unitStart).Seconds())
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
