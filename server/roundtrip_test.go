@@ -349,12 +349,14 @@ func TestRoundTripAdvertiseQuery(t *testing.T) {
 	if err := col.Advertise(ctx, inv, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_STARTD_ADS}); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	got, err = col.QueryAds(ctx, "Machine", "")
-	if err != nil {
-		t.Fatalf("query after invalidate: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("after invalidate returned %d ads, want 1", len(got))
+	// INVALIDATE_STARTD_ADS is fire-and-forget (no ack), like UPDATE above, so the
+	// server may not have applied the invalidation when the query races in; poll
+	// until only the survivor remains.
+	if !waitFor(5*time.Second, func() bool {
+		got, err = col.QueryAds(ctx, "Machine", "")
+		return err == nil && len(got) == 1
+	}) {
+		t.Fatalf("after invalidate returned %d ads (err=%v), want 1", len(got), err)
 	}
 	if name, _ := got[0].EvaluateAttrString("Name"); name != "slot1@a" {
 		t.Errorf("survivor is %q, want slot1@a", name)
