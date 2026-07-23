@@ -3,13 +3,13 @@ module github.com/bbockelm/golang-collector
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.16.4
-	github.com/PelicanPlatform/classad/collections v0.16.4
-	github.com/PelicanPlatform/classad/db v0.16.4
-	github.com/PelicanPlatform/classad/dbrpc v0.16.4
+	github.com/PelicanPlatform/classad v0.16.5
+	github.com/PelicanPlatform/classad/collections v0.16.5
+	github.com/PelicanPlatform/classad/db v0.16.5
+	github.com/PelicanPlatform/classad/dbrpc v0.16.5
 	github.com/bbockelm/cedar v0.6.5
 	github.com/bbockelm/golang-ccb v0.4.0
-	github.com/bbockelm/golang-htcondor v0.8.2
+	github.com/bbockelm/golang-htcondor v0.9.0
 	github.com/prometheus/client_golang v1.13.0
 )
 
@@ -22,6 +22,7 @@ require (
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/glebarez/go-sqlite v1.21.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
