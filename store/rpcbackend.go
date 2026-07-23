@@ -112,6 +112,7 @@ var (
 	_ ProjectedRawQueryer  = (*RPCBackend)(nil)
 	_ RawStreamer          = (*RPCBackend)(nil)
 	_ ProjectedRawStreamer = (*RPCBackend)(nil)
+	_ WireRowStreamer      = (*RPCBackend)(nil)
 	_ BatchWriter          = (*RPCBackend)(nil)
 )
 
@@ -1295,4 +1296,56 @@ func rpcConstraint(constraint string) string {
 		return "true"
 	}
 	return constraint
+}
+
+// QueryRawWireStream makes RPCBackend a store.WireRowStreamer: matching ads
+// stream from the database as batched wire-form rows (dbrpc opQueryRawWire) --
+// subset-assembled and, when redact is set, private-stripped at the source --
+// for rendering at the collector's client edge. An older database without the
+// op fails before any row is delivered, and the caller falls back to the text
+// row streams.
+func (b *RPCBackend) QueryRawWireStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, redact bool, yield func(row []byte) bool) error {
+	if t == AnyAd {
+		if _, err := parseConstraint(constraint); err != nil {
+			return err
+		}
+		for at := AnyAd + 1; at < numAdTypes; at++ {
+			if at == StartdPvtAd {
+				continue
+			}
+			stopped, err := b.streamWireTable(ctx, at, constraint, projection, limit, redact, yield)
+			if err != nil {
+				return err
+			}
+			if stopped {
+				return nil
+			}
+		}
+		return nil
+	}
+	if _, err := parseConstraint(constraint); err != nil {
+		return err
+	}
+	_, err := b.streamWireTable(ctx, t, constraint, projection, limit, redact, yield)
+	return err
+}
+
+func (b *RPCBackend) streamWireTable(ctx context.Context, t AdType, constraint string, projection []string, limit int, redact bool, yield func(row []byte) bool) (stopped bool, err error) {
+	delivered := false
+	wrap := func(row []byte) bool {
+		delivered = true
+		if !yield(row) {
+			stopped = true
+			return false
+		}
+		return true
+	}
+	err = b.withRetry(ctx, b.readLane(), func(cl *dbrpc.Client) error {
+		e := cl.QueryRawWireStream(ctx, t.String(), rpcConstraint(constraint), projection, limit, redact, wrap)
+		if e != nil && delivered {
+			return &errNoReplay{e} // rows already relayed; a replay would duplicate them
+		}
+		return e
+	})
+	return stopped, err
 }
