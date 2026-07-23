@@ -323,6 +323,56 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 		return sendErr
 	}
 
+	// Wire-row relay, the preferred path when the backend offers it: rows arrive
+	// as self-contained wire-form subset ads -- projection and redaction already
+	// applied at the source, many rows per transport frame -- and the ONLY
+	// old-ClassAd render happens right here, at the client edge. A failure before
+	// any row was relayed (an older database without the op, a wrapped backend
+	// without the capability) falls through to the text paths below; a mid-stream
+	// failure cannot (rows already went out) and fails the query.
+	if wrs, ok := st.(store.WireRowStreamer); ok {
+		var rbuf []byte
+		var roffs []int
+		var rexprs [][]byte
+		relayed := false
+		werr := wrs.QueryRawWireStream(ctx, t, constraint, projection, limit, redact, func(row []byte) bool {
+			if limit > 0 && n >= limit {
+				return false
+			}
+			var mt, tt string
+			var rok bool
+			rbuf, roffs, mt, tt, rok = collections.RenderRawAdInline(row, rbuf, roffs)
+			if !rok {
+				return true // malformed row: skip it, keep the stream
+			}
+			rexprs = rexprs[:0]
+			for i := 0; i+1 < len(roffs); i++ {
+				rexprs = append(rexprs, rbuf[roffs[i]:roffs[i+1]])
+			}
+			out := typeAttrs.with(rexprs, mt, tt)
+			if err := resp.PutInt32(ctx, 1); err != nil {
+				sendErr = err
+				return false
+			}
+			if err := resp.PutClassAdRawBytes(ctx, out, "", ""); err != nil {
+				sendErr = err
+				return false
+			}
+			relayed = true
+			n++
+			return true
+		})
+		switch {
+		case sendErr != nil:
+			return sendErr
+		case werr == nil:
+			return nil
+		case relayed:
+			return werr // rows already sent: a fallback would duplicate them
+		}
+		// else: failed before anything was relayed -- fall through to the text paths.
+	}
+
 	if len(projection) == 0 {
 		// Redaction pushdown: a backend that can guarantee no-private-attributes in
 		// its raw results (source-side stripping, an O(1) per-attribute flag check)

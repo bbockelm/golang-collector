@@ -143,6 +143,23 @@ type RedactedProjectedRawQueryer interface {
 	QueryRawProjectRedacted(ctx context.Context, t AdType, constraint string, projection []string, limit int) (iter.Seq[collections.RawAd], error)
 }
 
+// ErrWireRowsNotSupported reports that a backend cannot stream wire-form rows;
+// the caller falls back to the text row streams. Returned by wrappers whose
+// method set cannot mirror the wrapped backend's capabilities statically.
+var ErrWireRowsNotSupported = errors.New("collector: backend does not stream wire-form rows")
+
+// WireRowStreamer is an optional Backend capability: stream matching ads as
+// self-contained WIRE-FORM ROWS -- collections inline subset ads assembled by
+// slice copies at the source (projection and, when redact is set, private-
+// attribute stripping applied there), with the old-ClassAd render deferred to
+// the caller's client edge (collections.RenderRawAdInline). This is the fast
+// relay for a remote-database backend: many rows batch per transport frame and
+// nothing is rendered or re-parsed in the middle. The row slice passed to
+// yield is valid only until yield returns.
+type WireRowStreamer interface {
+	QueryRawWireStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, redact bool, yield func(row []byte) bool) error
+}
+
 // Retrainer is an optional Backend capability: periodic maintenance of the
 // ClassAd compression dictionary (the in-memory backend's memory-footprint
 // lever). Backends that manage their own storage do not implement it.

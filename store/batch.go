@@ -446,6 +446,21 @@ func (b *BufferedBackend) QueryRawProjectStream(ctx context.Context, t AdType, c
 	return nil
 }
 
+// QueryRawWireStream flushes, then delegates the wire-form row stream; the
+// buffer itself cannot assemble rows, so a wrapped backend without the
+// capability reports ErrWireRowsNotSupported (probed at call time) and the
+// caller falls back to the text row streams.
+func (b *BufferedBackend) QueryRawWireStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, redact bool, yield func(row []byte) bool) error {
+	if err := b.flush(ctx); err != nil {
+		return err
+	}
+	ws, ok := b.Backend.(WireRowStreamer)
+	if !ok {
+		return ErrWireRowsNotSupported
+	}
+	return ws.QueryRawWireStream(ctx, t, constraint, projection, limit, redact, yield)
+}
+
 func (b *BufferedBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
 	if err := b.flush(ctx); err != nil {
 		return nil, false
