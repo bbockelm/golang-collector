@@ -33,7 +33,6 @@ import (
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
-	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	collector "github.com/bbockelm/golang-collector"
 	"github.com/bbockelm/golang-collector/metrics"
@@ -93,7 +92,7 @@ func run() error {
 
 	// Bootstrap logging and condor_master integration (drops privileges to the
 	// condor user when started as root).
-	d, err := daemon.New(daemon.Options{Subsys: "COLLECTOR", Config: cfg})
+	d, err := daemon.New(daemon.Options{Subsys: "COLLECTOR", LocalName: *localName, Config: cfg})
 	if err != nil {
 		return err
 	}
@@ -212,77 +211,10 @@ func run() error {
 	// intervals passed to collector.New above.
 	defer c.StartBackground(ctx)()
 
-	// Optional encrypted-at-rest persistence of the CEDAR security session cache
-	// (COLLECTOR_PERSIST_SESSIONS), so clients resume sessions across a restart
-	// instead of re-authenticating in a thundering herd. The database is encrypted
-	// with the pool signing key, read as root (see maybeEnableSessionPersistence).
-	closeSessions, err := maybeEnableSessionPersistence(d, cfg)
-	if err != nil {
-		return err
-	}
-	if closeSessions != nil {
-		defer closeSessions()
-	}
-
 	log.Info(logging.DestinationGeneral, "golang-collector starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
 	return d.Serve(ctx, ln, srv.Serve)
-}
-
-// maybeEnableSessionPersistence turns on encrypted persistence of the CEDAR
-// session cache when COLLECTOR_PERSIST_SESSIONS is set. It is a no-op (returns a
-// nil closer) otherwise.
-//
-// The session database is encrypted at rest with the pool signing key(s) from
-// SEC_PASSWORD_DIRECTORY: htcondor.LoadSigningKeys reads those root-owned 0600
-// files as root (re-elevating from the dropped-to condor account), and the
-// signing key wraps the database's data-encryption key. This is why persistence
-// requires a signing key -- without one the store cannot be encrypted, which is a
-// fatal misconfiguration rather than a silent fallback to plaintext.
-//
-// The store is opened AFTER daemon.New (which drops privileges), so the database
-// file is created owned by the condor account, not root. daemon.Serve drives the
-// periodic snapshot + final snapshot; the returned closer must be deferred so the
-// database is closed after Serve returns.
-func maybeEnableSessionPersistence(d *daemon.Daemon, cfg *config.Config) (func(), error) {
-	if !configBool(cfg, "COLLECTOR_PERSIST_SESSIONS", false) {
-		return nil, nil
-	}
-
-	dbPath := configString(cfg, "COLLECTOR_SESSION_CACHE_FILE")
-	if dbPath == "" {
-		spool, ok := cfg.Get("SPOOL")
-		if !ok || spool == "" {
-			return nil, fmt.Errorf("COLLECTOR_PERSIST_SESSIONS is set but neither COLLECTOR_SESSION_CACHE_FILE nor SPOOL is configured")
-		}
-		dbPath = filepath.Join(spool, "collector_sessions.db")
-	}
-
-	// Load the pool signing keys as root (SEC_PASSWORD_DIRECTORY is root-owned
-	// 0600); these key-encrypt the session database.
-	rawKeys, err := htcondor.LoadSigningKeys(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("session persistence: loading pool signing keys: %w", err)
-	}
-	if len(rawKeys) == 0 {
-		return nil, fmt.Errorf("session persistence: COLLECTOR_PERSIST_SESSIONS is set but no signing keys are available (set SEC_PASSWORD_DIRECTORY); the session cache cannot be encrypted without one")
-	}
-	keys := make([]sqlite.SigningKey, 0, len(rawKeys))
-	for id, material := range rawKeys {
-		keys = append(keys, sqlite.SigningKey{ID: id, Material: material})
-	}
-
-	store, err := sqlite.Open(dbPath, keys, d.Slog())
-	if err != nil {
-		return nil, fmt.Errorf("session persistence: opening %s: %w", dbPath, err)
-	}
-	if err := d.EnableSessionPersistence(store, configSeconds(cfg, "COLLECTOR_SESSION_SNAPSHOT_INTERVAL", 0)); err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("session persistence: %w", err)
-	}
-	d.Logger().Info(logging.DestinationGeneral, "session persistence enabled", "path", dbPath, "signing_keys", len(keys))
-	return func() { _ = store.Close() }, nil
 }
 
 // viewHosts returns the CONDOR_VIEW_HOST collector addresses to forward to,
