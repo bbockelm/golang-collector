@@ -48,12 +48,12 @@ github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751/go.mod h1:LOuy
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190717042225-c3de453c63f4/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d/go.mod h1:rBZYJk541a8SKzHPHnH3zbiI+7dagKZ0cgpgrD7Fyho=
-github.com/bbockelm/cedar v0.6.3 h1:cxfoN/r5g/LpQmlYXvEqJ6kYgbF1icitiVwA9wcMPvw=
-github.com/bbockelm/cedar v0.6.3/go.mod h1:C4u6CKJoweg3LZniOi7Yh8avQv1KZjHs9k1vTGa1+2w=
+github.com/bbockelm/cedar v0.6.4 h1:tkks0lAEJSX21FZD4GgfZH+cqlj/+f/u8+H/kzjdk08=
+github.com/bbockelm/cedar v0.6.4/go.mod h1:C4u6CKJoweg3LZniOi7Yh8avQv1KZjHs9k1vTGa1+2w=
 github.com/bbockelm/golang-ccb v0.4.0 h1:VGLpXbu1J4KNKomLHXR608bI4mX4B7jFF46t4BLRM6M=
 github.com/bbockelm/golang-ccb v0.4.0/go.mod h1:zakGaHshZ+aTmdwjjW44YF6x2ZDMPobtl+z6ix+ZF98=
-github.com/bbockelm/golang-htcondor v0.8.1 h1:c70ZCs1d3HZixmufBTcz+ES5NOmxLj1HbiYyHC/Q4nY=
-github.com/bbockelm/golang-htcondor v0.8.1/go.mod h1:lWcfrrN/DGhZW6fAh9+8ncPlHasHF8oAc4nWG0ysvZw=
+github.com/bbockelm/golang-htcondor v0.8.2 h1:TzYtxXsMm4ZO3jMQZPnfqgmOoDLAyvviAlTdC9X1nuI=
+github.com/bbockelm/golang-htcondor v0.8.2/go.mod h1:asZBZfz5woHx/i8C6Ngf7VI/1dDT03r37YQLgN0jCnE=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=

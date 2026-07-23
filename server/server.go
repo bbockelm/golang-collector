@@ -281,6 +281,11 @@ func multiQueryHandler(st store.Backend) cedarserver.HandlerFunc {
 func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, t store.AdType, constraint string, projection []string, limit int, redact bool) error {
 	n := 0
 	var sendErr error
+	// srcRedacted: the backend guaranteed no private attribute reaches sendOne (it
+	// stripped them at the source via its intern table's per-id private flags), so
+	// the per-ad redaction scan below is skipped.
+	srcRedacted := false
+	var typeAttrs rawTypeAttrs // cached MyType/TargetType prefix, reused across ads
 	// sendOne relays one already-wire-form RawAd, returning false to stop the scan (limit
 	// reached, or a client write failed -- then sendErr is set).
 	sendOne := func(ra collections.RawAd) bool {
@@ -288,7 +293,7 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 			return false
 		}
 		exprs := ra.Exprs
-		if redact {
+		if redact && !srcRedacted {
 			exprs = redactRawExprs(exprs)
 		}
 		// Convey MyType/TargetType exactly as a C++ collector does: as ordinary ATTRIBUTES
@@ -297,7 +302,7 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 		// end of the ad"). rawAdFromOldText lifts these out of Exprs into RawAd fields;
 		// without re-adding them as attributes the C++ negotiator sees typeless ads in a
 		// multi-query and buckets "0 submitter, 0 startd", matching nothing.
-		exprs = withRawTypeAttrs(exprs, ra.MyType, ra.TargetType)
+		exprs = typeAttrs.with(exprs, ra.MyType, ra.TargetType)
 		if err := resp.PutInt32(ctx, 1); err != nil {
 			sendErr = err
 			return false
@@ -319,6 +324,23 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 	}
 
 	if len(projection) == 0 {
+		// Redaction pushdown: a backend that can guarantee no-private-attributes in
+		// its raw results (source-side stripping, an O(1) per-attribute flag check)
+		// spares this relay its own per-ad attribute scan. Probed at call time --
+		// a wrapper (BufferedBackend) always has the method but reports
+		// ErrRedactionNotSupported when what it wraps cannot deliver the guarantee.
+		if redact {
+			if rrq, ok := st.(store.RedactedRawQueryer); ok {
+				raw, err := rrq.QueryRawRedacted(ctx, t, constraint, limit)
+				if err == nil {
+					srcRedacted = true
+					return sendRaw(raw)
+				}
+				if !errors.Is(err, store.ErrRedactionNotSupported) {
+					return err
+				}
+			}
+		}
 		if rs, ok := st.(store.RawStreamer); ok {
 			if err := rs.QueryRawStream(ctx, t, constraint, limit, sendOne); err != nil {
 				return err
@@ -333,6 +355,18 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 			return sendRaw(raw)
 		}
 	} else {
+		if redact {
+			if prq, ok := st.(store.RedactedProjectedRawQueryer); ok {
+				raw, err := prq.QueryRawProjectRedacted(ctx, t, constraint, projection, limit)
+				if err == nil {
+					srcRedacted = true
+					return sendRaw(raw)
+				}
+				if !errors.Is(err, store.ErrRedactionNotSupported) {
+					return err
+				}
+			}
+		}
 		if prs, ok := st.(store.ProjectedRawStreamer); ok {
 			if err := prs.QueryRawProjectStream(ctx, t, constraint, projection, limit, sendOne); err != nil {
 				return err
@@ -367,6 +401,42 @@ func relayMatches(ctx context.Context, resp *message.Message, st store.Backend, 
 		n++
 	}
 	return nil
+}
+
+// rawTypeAttrs is withRawTypeAttrs with per-response caching: every ad of one
+// response nearly always carries the same MyType/TargetType ("Machine"/"Job"),
+// so the rendered attribute lines are rebuilt only when the value changes and
+// one prefix slice is reused across ads -- zero allocations per ad after the
+// first (the old per-ad path was ~5 allocations per ad, a dominant GC source on
+// large responses). The returned slice aliases the reused scratch, valid until
+// the next with call -- the same contract as RawAd.Exprs itself.
+type rawTypeAttrs struct {
+	scratch      [][]byte
+	mtVal, ttVal string
+	mt, tt       []byte
+}
+
+func (r *rawTypeAttrs) with(exprs [][]byte, myType, targetType string) [][]byte {
+	if myType == "" && targetType == "" {
+		return exprs
+	}
+	r.scratch = r.scratch[:0]
+	if myType != "" {
+		if myType != r.mtVal || r.mt == nil {
+			r.mtVal = myType
+			r.mt = []byte(`MyType = "` + myType + `"`)
+		}
+		r.scratch = append(r.scratch, r.mt)
+	}
+	if targetType != "" {
+		if targetType != r.ttVal || r.tt == nil {
+			r.ttVal = targetType
+			r.tt = []byte(`TargetType = "` + targetType + `"`)
+		}
+		r.scratch = append(r.scratch, r.tt)
+	}
+	r.scratch = append(r.scratch, exprs...)
+	return r.scratch
 }
 
 // withRawTypeAttrs prepends MyType/TargetType as attribute lines to a RawAd's expressions

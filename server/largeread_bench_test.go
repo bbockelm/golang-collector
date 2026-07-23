@@ -284,3 +284,69 @@ func runDrainScenario(b *testing.B, addr string, conc int, query *classad.ClassA
 		b.ReportMetric(float64(totalAds)/secs, "ads/sec")
 	}
 }
+
+// BenchmarkLargeAdReadProjected is BenchmarkLargeAdRead with a realistic
+// condor_status-style projection in the query (~12 of ~460 attributes), the
+// shape a real `condor_status`/`-totals` sends. Same DRAIN client; the response
+// is ~50x smaller than the whole-ad scan, so this isolates the server's
+// projected-serve cost plus per-query connection/handshake overhead.
+func BenchmarkLargeAdReadProjected(b *testing.B) {
+	const n = 2000
+	ads := loadLargeMachineAds(b, n)
+	query := mustAd(b, `[MyType="Query"; TargetType="Machine"; Requirements = true; `+
+		`Projection = "Name Machine OpSys Arch State Activity LoadAvg Memory Cpus EnteredCurrentActivity MyCurrentTime TotalSlots"]`)
+
+	projNames := []string{
+		"Name", "Machine", "OpSys", "Arch", "State", "Activity",
+		"LoadAvg", "Memory", "Cpus", "EnteredCurrentActivity", "MyCurrentTime", "TotalSlots",
+	}
+	backends := []struct {
+		name  string
+		start func(testing.TB) (string, func())
+	}{
+		// go-inprocess converges the hot set the way a long-running collector does
+		// (projected query records demand -> maintenance refreshes the hot set ->
+		// daemons re-advertise), so the projected reads run the hot fast path.
+		{"go-inprocess", func(tb testing.TB) (string, func()) {
+			st := store.New()
+			ctx := context.Background()
+			for _, ad := range ads {
+				if err := st.Update(ctx, store.StartdAd, ad); err != nil {
+					tb.Fatal(err)
+				}
+			}
+			if seq, err := st.QueryRawProjectRedacted(ctx, store.StartdAd, "", projNames, 0); err == nil {
+				for range seq {
+				}
+			}
+			st.RefreshHotSets(2000, 32)
+			for _, ad := range ads {
+				if err := st.Update(ctx, store.StartdAd, ad); err != nil {
+					tb.Fatal(err)
+				}
+			}
+			return serveStore(tb, st)
+		}},
+		{"go-sub", func(tb testing.TB) (string, func()) {
+			addr, stop := startSubprocessGoCollector(tb)
+			prepopulateLarge(tb, addr, plaintextSec(), ads)
+			return addr, stop
+		}},
+		{"cpp", func(tb testing.TB) (string, func()) {
+			addr, stop := startCppCollector(tb)
+			prepopulateLarge(tb, addr, plaintextSec(), ads)
+			return addr, stop
+		}},
+	}
+	for _, be := range backends {
+		b.Run(be.name, func(b *testing.B) {
+			addr, stop := be.start(b)
+			defer stop()
+			for _, conc := range []int{1, 10} {
+				b.Run(fmt.Sprintf("conc=%03d/read-projected", conc), func(b *testing.B) {
+					runDrainScenario(b, addr, conc, query)
+				})
+			}
+		})
+	}
+}
