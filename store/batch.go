@@ -76,10 +76,12 @@ type BufferedBackend struct {
 func (b *BufferedBackend) Base() Backend { return b.Backend }
 
 var (
-	_ Backend             = (*BufferedBackend)(nil)
-	_ RawQueryer          = (*BufferedBackend)(nil)
-	_ ProjectedRawQueryer = (*BufferedBackend)(nil)
-	_ DurableUpdater      = (*BufferedBackend)(nil)
+	_ Backend              = (*BufferedBackend)(nil)
+	_ RawQueryer           = (*BufferedBackend)(nil)
+	_ ProjectedRawQueryer  = (*BufferedBackend)(nil)
+	_ RawStreamer          = (*BufferedBackend)(nil)
+	_ ProjectedRawStreamer = (*BufferedBackend)(nil)
+	_ DurableUpdater       = (*BufferedBackend)(nil)
 )
 
 // DurableUpdater is an optional Backend capability: apply one ad update and return
@@ -391,6 +393,57 @@ func (b *BufferedBackend) QueryRawProject(ctx context.Context, t AdType, constra
 		return nil, err
 	}
 	return projectRawSeq(raw, projection), nil
+}
+
+// QueryRawStream flushes, then streams the raw query. A backend that streams
+// natively (the remote-database backends) delegates -- the relay forwards each
+// ad as it arrives instead of buffering the whole result set, which the wrapper
+// was silently hiding (the server prefers RawStreamer, but the wrapper's method
+// set did not include it, downgrading the DB-backed collector to fetch-then-
+// relay). A backend without a native stream is adapted from its iterator, so
+// the wrapper is safe to expose unconditionally.
+func (b *BufferedBackend) QueryRawStream(ctx context.Context, t AdType, constraint string, limit int, yield func(collections.RawAd) bool) error {
+	if err := b.flush(ctx); err != nil {
+		return err
+	}
+	if rs, ok := b.Backend.(RawStreamer); ok {
+		return rs.QueryRawStream(ctx, t, constraint, limit, yield)
+	}
+	rq, ok := b.Backend.(RawQueryer)
+	if !ok {
+		return fmt.Errorf("collector: backend %T has no raw query", b.Backend)
+	}
+	raw, err := rq.QueryRaw(ctx, t, constraint, limit)
+	if err != nil {
+		return err
+	}
+	for ra := range raw {
+		if !yield(ra) {
+			break
+		}
+	}
+	return nil
+}
+
+// QueryRawProjectStream is QueryRawStream with a projection (see
+// QueryRawProject for the fallback ladder).
+func (b *BufferedBackend) QueryRawProjectStream(ctx context.Context, t AdType, constraint string, projection []string, limit int, yield func(collections.RawAd) bool) error {
+	if err := b.flush(ctx); err != nil {
+		return err
+	}
+	if prs, ok := b.Backend.(ProjectedRawStreamer); ok {
+		return prs.QueryRawProjectStream(ctx, t, constraint, projection, limit, yield)
+	}
+	raw, err := b.QueryRawProject(ctx, t, constraint, projection, limit)
+	if err != nil {
+		return err
+	}
+	for ra := range raw {
+		if !yield(ra) {
+			break
+		}
+	}
+	return nil
 }
 
 func (b *BufferedBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) (*classad.ClassAd, bool) {
