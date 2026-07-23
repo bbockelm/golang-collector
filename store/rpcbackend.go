@@ -698,6 +698,17 @@ func (b *RPCBackend) commitUnitsConcurrent(ctx context.Context, units []commitUn
 // max message size.
 const adBatchChunkSize = 64
 
+// abortDetached best-effort aborts tx even when the operation's context is already
+// cancelled -- exactly the case that orphans a server-side transaction: the plain
+// tx.Abort(ctx) would be dropped client-side (callCtx refuses a done context), leaving
+// the txn holding its buffered ad writes on the server heap until the idle reaper
+// finds it. Bounded so a dead server cannot stall the caller.
+func abortDetached(ctx context.Context, tx *dbrpc.Tx) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = tx.Abort(actx)
+}
+
 // putBatchTx upserts all items into one table in one transaction (no internal retry;
 // withRetry owns retry/backoff/reconnect). The ads are sent as pipelined batches instead
 // of one request/ack per ad.
@@ -711,20 +722,28 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	if err != nil {
 		return err
 	}
+	// Whatever path exits without a commit must abort, or the server-side transaction
+	// (and every buffered ad in it) outlives this call. Detached: a context cancellation
+	// mid-flight -- a read-triggered flush's deadline firing -- is the common abandoner.
+	committed := false
+	defer func() {
+		if !committed {
+			abortDetached(ctx, tx)
+		}
+	}()
 	kvs := make([]dbrpc.AdKV, len(items))
 	for i, it := range items {
 		kvs[i] = dbrpc.AdKV{Key: it.key, Ad: it.text}
 	}
 	// A returned error is a whole-chunk failure: the transaction is gone ("no such
 	// transaction" -- e.g. a connection reset cleaned it up server-side) or the transport
-	// failed. The batch was not applied, so abort and return; withRetry replays the whole
-	// batch on a fresh transaction. Every write is an idempotent keyed upsert, so replay is
-	// safe.
+	// failed. The batch was not applied, so abort (the deferred detached abort) and
+	// return; withRetry replays the whole batch on a fresh transaction. Every write is an
+	// idempotent keyed upsert, so replay is safe.
 	writeStart := time.Now()
 	rejects, err := tx.NewClassAdBatchPipelined(ctx, kvs, adBatchChunkSize)
 	Metrics.batchWriteSeconds.Observe(time.Since(writeStart).Seconds())
 	if err != nil {
-		_ = tx.Abort(ctx)
 		return err
 	}
 	// Rejects are per-ad: the server could not parse those ads and left them out, but the
@@ -742,6 +761,12 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	commitStart := time.Now()
 	err = tx.Commit(ctx)
 	Metrics.commitSeconds.Observe(time.Since(commitStart).Seconds())
+	if err == nil {
+		committed = true
+	}
+	// On a commit error the txn was consumed server-side (win or lose), so the deferred
+	// abort is a harmless "no such transaction" -- except when the commit never reached
+	// the server (context cancelled first), the exact case the abort must cover.
 	return err
 }
 
@@ -754,7 +779,7 @@ func (b *RPCBackend) put(ctx context.Context, table, key, text string) error {
 			return err
 		}
 		if err := tx.NewClassAd(ctx, key, text); err != nil {
-			_ = tx.Abort(ctx)
+			abortDetached(ctx, tx)
 			return err
 		}
 		return tx.Commit(ctx)
@@ -1084,7 +1109,7 @@ func (b *RPCBackend) Get(ctx context.Context, t AdType, keyAd *classad.ClassAd) 
 		if err != nil {
 			return err
 		}
-		defer func() { _ = tx.Abort(ctx) }()
+		defer abortDetached(ctx, tx)
 		text, present, err := tx.LookupClassAd(ctx, string(key))
 		if err != nil {
 			return err
@@ -1158,7 +1183,7 @@ func (b *RPCBackend) deleteKeys(ctx context.Context, t AdType, keys []string) (i
 			}
 			_, present, err = tx.LookupClassAd(ctx, k)
 			if err != nil {
-				_ = tx.Abort(ctx)
+				abortDetached(ctx, tx)
 				return err
 			}
 			if present {
