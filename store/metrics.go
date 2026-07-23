@@ -104,6 +104,14 @@ type metrics struct {
 	//   phase="wait"       -- request left promptly, server+return path was slow (server).
 	// Labeled by op (begin/commit/batch); begin's three phases sum to rpcBeginSeconds.
 	rpcCallPhaseSeconds *prometheus.HistogramVec
+	// semWaitSeconds is time a commit unit queued for a write-pool slot. buildCommitUnits
+	// bounds a flush's units to one wave, so sustained nonzero time here means a flush
+	// touched more tables than there are lanes (inherent) or the bound regressed.
+	semWaitSeconds prometheus.Histogram
+	// unitSeconds is one commit unit end-to-end (lane acquire + begin + batch + commit,
+	// including retries). batch_flush ~= sem wait + max(unit) over the fanned-out units,
+	// so together with semWaitSeconds this fully accounts a slow flush.
+	unitSeconds prometheus.Histogram
 }
 
 // retryCauses is the closed set of transient-failure causes labeled onto
@@ -188,6 +196,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help:    "Per-RPC round-trip time split by phase to localize a stall: write_wait (client single-writer lock), send (conn.WriteMsg; TCP backpressure = server not reading), wait (server + return). Labeled by op.",
 			Buckets: latency,
 		}, []string{"op", "phase"}),
+		semWaitSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "sem_wait_seconds",
+			Help:    "Time a commit unit queued for a write-pool slot (a second 'wave'); units are bounded to one wave, so sustained nonzero means more touched tables than lanes.",
+			Buckets: latency,
+		}),
+		unitSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_unit_seconds",
+			Help:    "One commit unit end-to-end (lane acquire + begin + batch + commit, incl. retries); batch_flush ~= sem_wait + max over the flush's units.",
+			Buckets: latency,
+		}),
 		querySeconds: fa.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "rpc_query_seconds",
 			Help:    "Round-trip for one query: request out, all matching rows streamed back and collected.",

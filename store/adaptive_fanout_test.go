@@ -65,6 +65,56 @@ func TestBuildCommitUnits(t *testing.T) {
 			t.Fatalf("single-lane -> %d units, want 1 (no fan-out)", len(units))
 		}
 	}
+	// Heavy multi-table batch: the TOTAL is bounded by the pool, so the whole flush fits
+	// one semaphore wave. Two tables wanting 8 chunks each plus four singles used to yield
+	// 20 units over 8 lanes -> a second serial wave; now the split tables shrink to fit.
+	{
+		byTable := map[string][]keyedText{}
+		for _, tbl := range []string{"Startd", "StartdPvt"} {
+			_, items := mk(tbl, 5000)
+			byTable[tbl] = items
+		}
+		for _, tbl := range []string{"Master", "Schedd", "Submitter", "Negotiator"} {
+			_, items := mk(tbl, 10)
+			byTable[tbl] = items
+		}
+		units := b.buildCommitUnits(byTable)
+		if len(units) > 8 {
+			t.Fatalf("multi-table batch -> %d units over 8 lanes (second wave), want <= 8", len(units))
+		}
+		perTable := map[string]int{}
+		seen := map[string]bool{}
+		for _, u := range units {
+			perTable[u.table]++
+			for _, it := range u.items {
+				if seen[it.key] {
+					t.Fatalf("item %q appears in two units", it.key)
+				}
+				seen[it.key] = true
+			}
+		}
+		for tbl := range byTable {
+			if perTable[tbl] == 0 {
+				t.Errorf("table %q lost its unit in the shrink", tbl)
+			}
+		}
+		if len(seen) != 5000*2+10*4 {
+			t.Fatalf("units cover %d items, want %d", len(seen), 5000*2+10*4)
+		}
+	}
+	// More tables than lanes: every table still gets its unit (a unit never spans
+	// tables), so the total may exceed the pool -- waves there are inherent.
+	{
+		byTable := map[string][]keyedText{}
+		for i := 0; i < 10; i++ {
+			tbl, items := mk(fmt.Sprintf("T%d", i), 5)
+			byTable[tbl] = items
+		}
+		units := b.buildCommitUnits(byTable)
+		if len(units) != 10 {
+			t.Fatalf("10 small tables -> %d units, want 10 (one each)", len(units))
+		}
+	}
 }
 
 // TestRPCBackendAdaptiveFanoutCommits drives a large batch through UpdateBatch against a
