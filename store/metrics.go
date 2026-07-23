@@ -92,6 +92,18 @@ type metrics struct {
 	// they show whether a slow read is latency, row volume, or the DB.
 	querySeconds prometheus.Histogram
 	queryRows    prometheus.Histogram
+	// rpcBeginSeconds is the BeginTable round-trip -- the previously-unmeasured gap in a
+	// flush (batch_flush = begin + batch_write + commit, and only the latter two were
+	// timed). If a stall lives here, rpcCallPhaseSeconds{op="begin"} says which phase.
+	rpcBeginSeconds prometheus.Histogram
+	// rpcCallPhaseSeconds decomposes every write-path RPC round-trip into where the time
+	// goes, so a stall is localized to client / comms / server without a server profile:
+	//   phase="write_wait" -- blocked on the single-writer lock behind another send (client),
+	//   phase="send"       -- in conn.WriteMsg; spikes here are TCP backpressure because the
+	//                         server stopped reading the socket (comms / server-read stall),
+	//   phase="wait"       -- request left promptly, server+return path was slow (server).
+	// Labeled by op (begin/commit/batch); begin's three phases sum to rpcBeginSeconds.
+	rpcCallPhaseSeconds *prometheus.HistogramVec
 }
 
 // retryCauses is the closed set of transient-failure causes labeled onto
@@ -166,6 +178,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help:    "Round-trip to commit a batch transaction (includes the server-side durability sync).",
 			Buckets: rtt,
 		}),
+		rpcBeginSeconds: fa.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_begin_seconds",
+			Help:    "BeginTable round-trip -- the previously-untimed gap in a flush; if this is where the stall lives, rpc_call_phase_seconds{op=\"begin\"} says which phase (client write-lock / socket send / server wait).",
+			Buckets: latency, // spans µs-healthy to the multi-second stalls we are hunting
+		}),
+		rpcCallPhaseSeconds: fa.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "rpc_call_phase_seconds",
+			Help:    "Per-RPC round-trip time split by phase to localize a stall: write_wait (client single-writer lock), send (conn.WriteMsg; TCP backpressure = server not reading), wait (server + return). Labeled by op.",
+			Buckets: latency,
+		}, []string{"op", "phase"}),
 		querySeconds: fa.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "rpc_query_seconds",
 			Help:    "Round-trip for one query: request out, all matching rows streamed back and collected.",
