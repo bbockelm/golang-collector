@@ -183,12 +183,14 @@ func TestRPCBackendSingleFlightDial(t *testing.T) {
 	wg.Wait()
 
 	// Without single-flight, each op would dial on nearly every retry round -- ~50 ops
-	// x ~14 rounds over the 500ms budget ~= hundreds of dials. Single-flight collapses
-	// that to roughly budget/backoff windows (a few dozen); the gate leaks a couple of
-	// extra dials per window under scheduler contention, so bound generously (ops*3)
-	// while still catching a real storm by an order of magnitude.
+	// x ~14 rounds over the 500ms budget ~= hundreds of dials (~700 observed). Single-
+	// flight collapses that to roughly budget/backoff windows (a few dozen); the gate
+	// leaks a couple of extra dials per window under scheduler contention, and on a
+	// busy machine the leakage lands right around ops*3 (151-169 observed on loaded
+	// CI/dev hosts vs the old 150 bound). Bound at ops*4, which still catches a real
+	// storm by several-fold.
 	dials := dc.attempts.Load()
-	if int(dials) >= ops*3 {
+	if int(dials) >= ops*4 {
 		t.Fatalf("dial attempts = %d for %d concurrent ops; single-flight should make it far fewer (a reconnect storm otherwise)", dials, ops)
 	}
 	t.Logf("single-flight: %d dial attempts served %d concurrent operations", dials, ops)
