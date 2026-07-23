@@ -9,7 +9,7 @@ require (
 	github.com/PelicanPlatform/classad/dbrpc v0.16.5
 	github.com/bbockelm/cedar v0.6.5
 	github.com/bbockelm/golang-ccb v0.4.0
-	github.com/bbockelm/golang-htcondor v0.9.0
+	github.com/bbockelm/golang-htcondor v0.9.1
 	github.com/prometheus/client_golang v1.13.0
 )
 
