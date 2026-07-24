@@ -560,7 +560,7 @@ func (b *RPCBackend) UpdateBatch(ctx context.Context, batch []PendingUpdate) err
 		u := units[0]
 		unitStart := time.Now()
 		err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
-			return putBatchTx(ctx, cl, u.table, u.items)
+			return b.putBatchTx(ctx, cl, u.table, u.items, true)
 		})
 		Metrics.unitSeconds.Observe(time.Since(unitStart).Seconds())
 		return err
@@ -674,7 +674,7 @@ func (b *RPCBackend) commitUnitsConcurrent(ctx context.Context, units []commitUn
 			Metrics.semWaitSeconds.Observe(time.Since(semStart).Seconds())
 			unitStart := time.Now()
 			err := b.withRetry(ctx, b.writeLane(), func(cl *dbrpc.Client) error {
-				return putBatchTx(ctx, cl, u.table, u.items)
+				return b.putBatchTx(ctx, cl, u.table, u.items, true)
 			})
 			Metrics.unitSeconds.Observe(time.Since(unitStart).Seconds())
 			if err != nil {
@@ -712,7 +712,10 @@ func abortDetached(ctx context.Context, tx *dbrpc.Tx) {
 // putBatchTx upserts all items into one table in one transaction (no internal retry;
 // withRetry owns retry/backoff/reconnect). The ads are sent as pipelined batches instead
 // of one request/ack per ad.
-func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []keyedText) error {
+// resolve controls conflict handling: true (the flush path) resolves a commit conflict by
+// update sequence (see resolveConflicts); false (the resolution re-commit itself) absorbs
+// a fresh conflict without re-resolving, bounding resolution to one round.
+func (b *RPCBackend) putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []keyedText, resolve bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -769,16 +772,18 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 		// overlapping flushes). Count it, by table (which pool is churning) -- this is the
 		// stall's first-class signal, invisible to retries_total (transient failures only).
 		Metrics.conflictsTotal.WithLabelValues(table).Inc()
-		// Then ACCEPT the partial commit instead of replaying the whole batch. The DB
-		// already committed every non-conflicted key (opCommit's contract) and returned
-		// only the conflicted ones; the old behavior bubbled the error to withRetry, which
-		// re-ran the ENTIRE begin+batch+commit -- repeatedly for a still-churning key --
-		// stalling a flush for seconds with no backoff. For idempotent last-writer ad
-		// upserts a conflicted key is benign: a concurrent (typically fresher) writer
-		// already set it, and the losing daemon re-advertises within an update cycle. So
-		// treat it as a successful flush and move on. (The versioned/LWW upsert by
-		// UpdateSequenceNumber makes conflicts impossible and supersedes this entirely.)
-		committed = true // the batch committed (minus dropped conflicts); do not abort/replay
+		// Accept the partial commit instead of replaying the whole batch: the DB already
+		// committed every non-conflicted key (opCommit's contract) and returned only the
+		// conflicted ones. The old behavior bubbled the error to withRetry, which re-ran
+		// the ENTIRE begin+batch+commit -- repeatedly for a still-churning key -- stalling
+		// a flush for seconds with no backoff.
+		committed = true // the batch committed (minus the conflicts); do not abort/replay
+		// Resolve the conflicted keys by update sequence: re-commit ours only where it is
+		// strictly newer than the concurrent winner, else leave the winner. Not a plain
+		// drop (that is last-commit-wins and can keep a staler ad); not a full replay.
+		if resolve {
+			b.resolveConflicts(ctx, table, err, items)
+		}
 		return nil
 	}
 	// On a commit error the txn was consumed server-side (win or lose), so the deferred

@@ -16,4 +16,9 @@ const (
 	attrClassAdLifetime = "ClassAdLifetime"
 	attrRequirements    = "Requirements"
 	attrAbsent          = "Absent"
+	// Update ordering: a daemon bumps UpdateSequenceNumber each publish and jumps
+	// DaemonStartTime on restart (so it dominates a wrapped sequence). Used to resolve a
+	// write-write conflict in favor of the newer ad (see seqversion.go).
+	attrUpdateSequenceNumber = "UpdateSequenceNumber"
+	attrDaemonStartTime      = "DaemonStartTime"
 )
