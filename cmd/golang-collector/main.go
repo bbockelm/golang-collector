@@ -574,16 +574,25 @@ func buildBaseBackend(cfg *config.Config, log *logging.Logger) (store.Backend, e
 		}
 		return b, nil
 	case "db", "database", "remote":
-		addr, ok := cfg.Get("COLLECTOR_DB_HOST")
-		if !ok || strings.TrimSpace(addr) == "" {
-			return nil, fmt.Errorf("collector: COLLECTOR_STORE=%s requires COLLECTOR_DB_HOST (the external database daemon's address)", kind)
+		resolve, source, err := dbAddrResolver(cfg)
+		if err != nil {
+			return nil, err
+		}
+		// Surface a startup misconfiguration up front rather than as an endless reconnect
+		// loop, but tolerate a transient absence (the database may not have started yet --
+		// withRetry backs off and the resolver re-reads on the next dial).
+		if addr, rerr := resolve(); rerr != nil {
+			log.Warn(logging.DestinationGeneral, "collector ad store: database address not resolvable yet; will retry on connect",
+				"source", source, "err", rerr.Error())
+		} else {
+			log.Info(logging.DestinationGeneral, "collector ad store: resolved database address", "source", source, "address", addr)
 		}
 		policy := dbRetryPolicy(cfg)
 		readConns := configInt(cfg, "COLLECTOR_DB_READ_CONNS", store.DefaultReadConns)
 		writeConns := configInt(cfg, "COLLECTOR_DB_WRITE_CONNS", store.DefaultWriteConns)
 		log.Info(logging.DestinationGeneral, "collector ad store: external database over CEDAR",
-			"host", addr, "retry_max_elapsed", policy.MaxElapsed.String(), "read_conns", readConns, "write_conns", writeConns)
-		return store.NewRPCBackendPool(context.Background(), dbrpcDial(cfg, strings.TrimSpace(addr)), policy, readConns, writeConns), nil
+			"source", source, "retry_max_elapsed", policy.MaxElapsed.String(), "read_conns", readConns, "write_conns", writeConns)
+		return store.NewRPCBackendPool(context.Background(), dbrpcDial(cfg, resolve), policy, readConns, writeConns), nil
 	default:
 		return nil, fmt.Errorf("collector: unknown COLLECTOR_STORE %q (want \"memory\", \"embedded\", or \"db\")", kind)
 	}
@@ -599,8 +608,16 @@ const dbSessionCommand = 74000
 // authenticates (PREFERRED) so it maps to a privileged identity that can write
 // and read private ads -- it applies per-client redaction itself. The returned
 // MsgConn's Close also closes the CEDAR connection.
-func dbrpcDial(cfg *config.Config, addr string) func(context.Context) (dbrpc.MsgConn, error) {
+// dbrpcDial returns a dial function for the RPC backend. resolve yields the database's
+// current address and is called on EVERY (re)connect, so a database restart -- which
+// changes its shared-port address -- is picked up on the next reconnect without a
+// collector restart or reconfigure (see dbAddrResolver).
+func dbrpcDial(cfg *config.Config, resolve func() (string, error)) func(context.Context) (dbrpc.MsgConn, error) {
 	return func(ctx context.Context) (dbrpc.MsgConn, error) {
+		addr, err := resolve()
+		if err != nil {
+			return nil, fmt.Errorf("connect to ad database: %w", err)
+		}
 		sec, err := htcondor.GetSecurityConfig(cfg, dbSessionCommand, "CLIENT")
 		if err != nil {
 			return nil, fmt.Errorf("building db-session security config: %w", err)
@@ -617,6 +634,55 @@ func dbrpcDial(cfg *config.Config, addr string) func(context.Context) (dbrpc.Msg
 		}
 		return &closingMsgConn{MsgConn: dbrpc.NewCedarConn(ctx, cl.GetStream()), also: cl.Close}, nil
 	}
+}
+
+// dbAddrResolver builds the address resolver for the remote-database backend, plus a
+// human-readable description for the startup log. Precedence:
+//   - COLLECTOR_DB_HOST, if set, is a STATIC override (the address never changes).
+//   - Otherwise the address is read from htcondordb's address file on every dial, so a
+//     restarted database (new shared-port address) is reconnected automatically. The path
+//     is COLLECTOR_DB_ADDRESS_FILE, defaulting to $(LOG)/.htcondordb_address (htcondordb's
+//     own default), matching how htcondordb-cli locates the daemon.
+//
+// The file is re-read per dial; the path is resolved once here.
+func dbAddrResolver(cfg *config.Config) (func() (string, error), string, error) {
+	if host, ok := cfg.Get("COLLECTOR_DB_HOST"); ok && strings.TrimSpace(host) != "" {
+		h := strings.TrimSpace(host)
+		return func() (string, error) { return h, nil }, "COLLECTOR_DB_HOST", nil
+	}
+	path := dbAddressFilePath(cfg)
+	if path == "" {
+		return nil, "", fmt.Errorf("collector: the external database backend needs COLLECTOR_DB_HOST " +
+			"or a resolvable address file (set COLLECTOR_DB_ADDRESS_FILE, or LOG so $(LOG)/.htcondordb_address can be found)")
+	}
+	return func() (string, error) { return readDBAddressFile(path) }, "address file " + path, nil
+}
+
+// dbAddressFilePath resolves the path to htcondordb's address file: COLLECTOR_DB_ADDRESS_FILE
+// if set, else $(LOG)/.htcondordb_address. Empty when neither is available.
+func dbAddressFilePath(cfg *config.Config) string {
+	if p, ok := cfg.Get("COLLECTOR_DB_ADDRESS_FILE"); ok && strings.TrimSpace(p) != "" {
+		return strings.TrimSpace(p)
+	}
+	if logDir, ok := cfg.Get("LOG"); ok && strings.TrimSpace(logDir) != "" {
+		return filepath.Join(strings.TrimSpace(logDir), ".htcondordb_address")
+	}
+	return ""
+}
+
+// readDBAddressFile returns the first non-empty line of an HTCondor address file (a sinful
+// string, possibly angle-bracket wrapped -- ConnectAndAuthenticate parses either form).
+func readDBAddressFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading db address file %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf("db address file %s is empty", path)
 }
 
 // closingMsgConn augments a dbrpc MsgConn's Close to also tear down the CEDAR
