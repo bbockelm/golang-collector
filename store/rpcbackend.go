@@ -763,6 +763,23 @@ func putBatchTx(ctx context.Context, cl *dbrpc.Client, table string, items []key
 	Metrics.commitSeconds.Observe(time.Since(commitStart).Seconds())
 	if err == nil {
 		committed = true
+	} else if isConflict(err) {
+		// A write-write MVCC conflict: a key in this batch was modified by a concurrent
+		// committer since this txn's snapshot (typically a hot ad re-advertised across two
+		// overlapping flushes). Count it, by table (which pool is churning) -- this is the
+		// stall's first-class signal, invisible to retries_total (transient failures only).
+		Metrics.conflictsTotal.WithLabelValues(table).Inc()
+		// Then ACCEPT the partial commit instead of replaying the whole batch. The DB
+		// already committed every non-conflicted key (opCommit's contract) and returned
+		// only the conflicted ones; the old behavior bubbled the error to withRetry, which
+		// re-ran the ENTIRE begin+batch+commit -- repeatedly for a still-churning key --
+		// stalling a flush for seconds with no backoff. For idempotent last-writer ad
+		// upserts a conflicted key is benign: a concurrent (typically fresher) writer
+		// already set it, and the losing daemon re-advertises within an update cycle. So
+		// treat it as a successful flush and move on. (The versioned/LWW upsert by
+		// UpdateSequenceNumber makes conflicts impossible and supersedes this entirely.)
+		committed = true // the batch committed (minus dropped conflicts); do not abort/replay
+		return nil
 	}
 	// On a commit error the txn was consumed server-side (win or lose), so the deferred
 	// abort is a harmless "no such transaction" -- except when the commit never reached

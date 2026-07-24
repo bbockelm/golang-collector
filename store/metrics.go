@@ -58,7 +58,10 @@ type metrics struct {
 	updatesTotal *prometheus.CounterVec
 	batchesTotal prometheus.Counter
 	retriesTotal *prometheus.CounterVec
-	adsPerBatch  prometheus.Histogram
+	// conflictsTotal counts write-write MVCC conflicts on the batch-commit path, by table
+	// (each triggers a full-batch replay; invisible to retriesTotal). See putBatchTx.
+	conflictsTotal *prometheus.CounterVec
+	adsPerBatch    prometheus.Histogram
 	// backpressureTotal counts times a producer had to flush inline because the buffer
 	// hit its hard cap (the background writer could not keep up). A rising rate means the
 	// update stream is being throttled by commit throughput -- the signal that writes are
@@ -167,6 +170,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Namespace: metricsNamespace, Name: "retries_total",
 			Help: "Database operations retried after a transient failure (backoff-and-replay attempts), by cause.",
 		}, []string{"cause"}),
+		conflictsTotal: fa.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Name: "conflicts_total",
+			Help: "Write-write MVCC conflicts on the batch-commit path, by table. Each triggers an immediate full-batch replay (a hot re-advertising key across overlapping flushes can stall a flush for seconds); NOT counted in retries_total, which is transient failures only.",
+		}, []string{"table"}),
 		adsPerBatch: fa.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "ads_per_batch",
 			Help:    "Ads carried by each flushed batch (a batch touches ~all shards, so this drives lock contention).",
