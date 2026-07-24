@@ -641,8 +641,8 @@ func dbrpcDial(cfg *config.Config, resolve func() (string, error)) func(context.
 //   - COLLECTOR_DB_HOST, if set, is a STATIC override (the address never changes).
 //   - Otherwise the address is read from htcondordb's address file on every dial, so a
 //     restarted database (new shared-port address) is reconnected automatically. The path
-//     is COLLECTOR_DB_ADDRESS_FILE, defaulting to $(LOG)/.htcondordb_address (htcondordb's
-//     own default), matching how htcondordb-cli locates the daemon.
+//     is COLLECTOR_DB_ADDRESS_FILE, else htcondordb's own address file (dbAddressFilePath),
+//     matching how htcondordb-cli locates the daemon.
 //
 // The file is re-read per dial; the path is resolved once here.
 func dbAddrResolver(cfg *config.Config) (func() (string, error), string, error) {
@@ -655,34 +655,20 @@ func dbAddrResolver(cfg *config.Config) (func() (string, error), string, error) 
 		return nil, "", fmt.Errorf("collector: the external database backend needs COLLECTOR_DB_HOST " +
 			"or a resolvable address file (set COLLECTOR_DB_ADDRESS_FILE, or LOG so $(LOG)/.htcondordb_address can be found)")
 	}
-	return func() (string, error) { return readDBAddressFile(path) }, "address file " + path, nil
+	// FileAddressResolver re-reads path on every dial (see the reconnect note above);
+	// the first-non-empty-line / bracket-tolerant parsing lives in golang-htcondor.
+	return htcondor.FileAddressResolver(path), "address file " + path, nil
 }
 
-// dbAddressFilePath resolves the path to htcondordb's address file: COLLECTOR_DB_ADDRESS_FILE
-// if set, else $(LOG)/.htcondordb_address. Empty when neither is available.
+// dbAddressFilePath resolves the path to htcondordb's address file. COLLECTOR_DB_ADDRESS_FILE
+// is the collector-specific override; otherwise it defers to htcondordb's own convention via
+// htcondor.AddressFilePath -- HTCONDORDB_ADDRESS_FILE if the operator set it, else
+// $(LOG)/.htcondordb_address. Empty when none of those resolve.
 func dbAddressFilePath(cfg *config.Config) string {
 	if p, ok := cfg.Get("COLLECTOR_DB_ADDRESS_FILE"); ok && strings.TrimSpace(p) != "" {
 		return strings.TrimSpace(p)
 	}
-	if logDir, ok := cfg.Get("LOG"); ok && strings.TrimSpace(logDir) != "" {
-		return filepath.Join(strings.TrimSpace(logDir), ".htcondordb_address")
-	}
-	return ""
-}
-
-// readDBAddressFile returns the first non-empty line of an HTCondor address file (a sinful
-// string, possibly angle-bracket wrapped -- ConnectAndAuthenticate parses either form).
-func readDBAddressFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading db address file %s: %w", path, err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			return s, nil
-		}
-	}
-	return "", fmt.Errorf("db address file %s is empty", path)
+	return htcondor.AddressFilePath(cfg, "HTCONDORDB")
 }
 
 // closingMsgConn augments a dbrpc MsgConn's Close to also tear down the CEDAR
