@@ -276,10 +276,19 @@ Smaller cycle-side C++ features, each independent:
   iterates a bracket-aware `COLLECTOR_HOST` list and fails over on error (context
   cancellation is terminal); the htcondor client already races the list for
   public queries.
-- **`USE_GLOBAL_JOB_PRIOS` — DEFERRED.** The meatiest item (submitter-ad fan-out
-  per `JobPrioArray`, `want_globaljobprio` in the submitter sort, `JOBPRIO_MIN/MAX`
-  in the NEGOTIATE header, matchmaker.cpp:817, :3455-3477). Touches the submitter
-  loop + header; left rather than risk half-breaking the spin.
+- **`USE_GLOBAL_JOB_PRIOS` — ✅ DONE.** `negotiator/cycle/globaljobprio.go`,
+  gated on `Config.WantGlobalJobPrio` (default off, so the submitter set, the
+  sort, and the header stay byte-identical when off — the differential
+  invariant). `fanOutJobPrios` expands each submitter ad into one round per
+  `JobPrioArray` entry (a shallow `copyAd` sharing the immutable attr exprs,
+  stamped with `JobPrio`; no array ⇒ a single `INT_MIN` round, matchmaker.cpp:3455-3472).
+  `sortSubmitters` gains the secondary job-priority key (higher job prio sorts
+  first, :357-365), so a submitter's high-prio round precedes another's low-prio
+  round at equal user priority (gt#3218). After the phase-3 sort,
+  `consolidateJobPrios` merges each non-interleaved same-`(name,schedd)` run back
+  into one round spanning `[JOBPRIO_MIN, JOBPRIO_MAX]` (:2353-2432). `headerFor`
+  sends that band on the NEGOTIATE header (schedd.cpp:8980); a submitter with no
+  `JobPrioArray` gets no band (negotiated in full, :4074).
 - **`STARTD_AD_REEVAL_EXPR` — ✅ DONE.** A `ReevalSource` decorator
   (`negotiator/source/reeval.go`) around the AdSource: a machine ad flagged
   `WantAdRevaluate` is replaced by a newer snapshot's version only when the

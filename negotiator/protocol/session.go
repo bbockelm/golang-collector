@@ -51,6 +51,8 @@ const (
 	attrMatchClaimedPSlot = "MatchClaimedPSlots"
 	attrMatchCaps         = "MatchCaps"
 	attrNegotiatorJobCons = "NegotiatorJobConstraint"
+	attrJobPrioMin        = "JOBPRIO_MIN" // USE_GLOBAL_JOB_PRIOS band (schedd.cpp:8980)
+	attrJobPrioMax        = "JOBPRIO_MAX"
 	matchCapsDiag3        = "MatchDiag3"
 )
 
@@ -158,6 +160,10 @@ func (s *session) buildHeaderAd() *classad.ClassAd {
 	_ = ad.Set(attrMatchCaps, matchCapsDiag3)
 	if s.hdr.JobConstraint != "" {
 		_ = ad.Set(attrNegotiatorJobCons, s.hdr.JobConstraint)
+	}
+	if s.hdr.HasJobPrio {
+		_ = ad.Set(attrJobPrioMin, s.hdr.JobPrioMin)
+		_ = ad.Set(attrJobPrioMax, s.hdr.JobPrioMax)
 	}
 	return ad
 }

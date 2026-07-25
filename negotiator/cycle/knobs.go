@@ -58,6 +58,7 @@ func ConfigFromKnobs(get accountant.KnobGetter) Config {
 		cfg.JobConstraint = strings.TrimSpace(v)
 	}
 	cfg.MatchExprs = matchExprsFromKnobs(get)
+	cfg.WantGlobalJobPrio = knobBool(get, "USE_GLOBAL_JOB_PRIOS", false)
 	cfg.InformStartd = knobBool(get, "NEGOTIATOR_INFORM_STARTD", false)
 	cfg.DisableAccountingAds = !knobBool(get, "NEGOTIATOR_ADVERTISE_ACCOUNTING", true)
 	cfg.Group = accountant.GroupConfigFromKnobs(get)

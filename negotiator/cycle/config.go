@@ -73,6 +73,15 @@ type Config struct {
 	// NEGOTIATE header and folded into the significant-attribute computation.
 	JobConstraint string
 
+	// WantGlobalJobPrio is USE_GLOBAL_JOB_PRIOS (default false, matchmaker.cpp:817).
+	// When set, a schedd advertises a JobPrioArray on its submitter ad and the
+	// negotiator fans that submitter out into one negotiation round per distinct
+	// job priority, interleaving high-priority jobs across equal-user-priority
+	// submitters (gt#3218). Each round's NEGOTIATE header carries JOBPRIO_MIN /
+	// JOBPRIO_MAX so the schedd offers only jobs in that band. Default off leaves
+	// the submitter set, the sort, and the header byte-identical.
+	WantGlobalJobPrio bool
+
 	// MatchExprs is NEGOTIATOR_MATCH_EXPRS: expressions the negotiator injects
 	// as NegotiatorMatchExpr<name> into every match ad sent to the schedd
 	// (matchmaker.cpp:728-746, :5268-5274). Empty leaves match ads unchanged.

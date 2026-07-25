@@ -176,9 +176,18 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		}
 	}
 
+	// USE_GLOBAL_JOB_PRIOS: fan each submitter out into one ad per job priority
+	// (globaljobprio.go) before accounting and wrapping see it, so every downstream
+	// pass negotiates the fanned-out rounds. Off, submitters is snap.Submitters
+	// unchanged. Never mutate snap itself -- the source may cache/reuse it.
+	submitters := snap.Submitters
+	if c.cfg.WantGlobalJobPrio {
+		submitters = fanOutJobPrios(submitters)
+	}
+
 	trimSnap := &negotiator.PoolSnapshot{
 		Slots:      trimmed,
-		Submitters: snap.Submitters,
+		Submitters: submitters,
 		ClaimIDs:   snap.ClaimIDs,
 		Taken:      snap.Taken,
 	}
@@ -190,7 +199,7 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		minSlotWeight:  minSlotWeight,
 		untrimmedTotal: untrimmedTotal,
 		stats:          stats,
-		subs:           make(map[*classad.ClassAd]*subState, len(snap.Submitters)),
+		subs:           make(map[*classad.ClassAd]*subState, len(submitters)),
 		limits:         c.newConcurrencyTracker(),
 	}
 	defer c.drainWorkers(st)
@@ -202,7 +211,7 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 	}
 	groups := accountant.BreadthFirst(tree)
 
-	subs := c.wrapSubmitters(st, snap.Submitters)
+	subs := c.wrapSubmitters(st, submitters)
 
 	if len(groups) <= 1 {
 		// Traditional flat pool: optional floor round, then the full round.
@@ -224,7 +233,7 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 			totalQuota = float64(effectivePoolsize)
 		}
 		usage := c.acct.GetWeightedResourcesUsed
-		accountant.PrepareForMatchmaking(tree, snap.Submitters, totalQuota, c.cfg.Group, usage)
+		accountant.PrepareForMatchmaking(tree, submitters, totalQuota, c.cfg.Group, usage)
 
 		cb := func(g *negotiator.GroupNode, allocation float64) error {
 			gsubs := c.wrapSubmitters(st, g.Submitters)
@@ -319,6 +328,15 @@ func (c *Cycle) wrapSubmitters(st *runState, ads []*classad.ClassAd) []*subState
 		}
 		st.stats.IdleJobs += sub.idleJobs
 		sub.lastHeard, _ = ad.EvaluateAttrInt("LastHeardFrom")
+		if c.cfg.WantGlobalJobPrio {
+			// The fanned-out round's single JobPrio seeds its consolidation band;
+			// a submitter ad without a JobPrioArray is negotiated once, unranged.
+			jp, _ := ad.EvaluateAttrInt(attrJobPrio)
+			sub.jobPrio = int(jp)
+			sub.jobPrioMin = int(jp)
+			sub.jobPrioMax = int(jp)
+			_, sub.hasJobPrioArray = ad.Lookup(attrJobPrioArray)
+		}
 		st.subs[ad] = sub
 		out = append(out, sub)
 	}
