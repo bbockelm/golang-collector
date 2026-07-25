@@ -111,6 +111,12 @@ type runState struct {
 	// shared between the floor round and the main round.
 	subs map[*classad.ClassAd]*subState
 
+	// idleCounted dedups the NumIdleJobs stat by submitter name under
+	// USE_GLOBAL_JOB_PRIOS: fanOutJobPrios yields one subState per job priority,
+	// all carrying the same IdleJobs, and the C++ counts a submitter's idle jobs
+	// once (matchmaker.cpp:2772-2774). Unused (nil) when the knob is off.
+	idleCounted map[string]struct{}
+
 	// limits is the per-cycle concurrency-limit usage view the matchmaker gate
 	// reads and the commit path increments (roadmap #3).
 	limits *concurrencyTracker
@@ -201,6 +207,9 @@ func (c *Cycle) Run(ctx context.Context) (*negotiator.CycleStats, error) {
 		stats:          stats,
 		subs:           make(map[*classad.ClassAd]*subState, len(submitters)),
 		limits:         c.newConcurrencyTracker(),
+	}
+	if c.cfg.WantGlobalJobPrio {
+		st.idleCounted = make(map[string]struct{}, len(submitters))
 	}
 	defer c.drainWorkers(st)
 
@@ -326,7 +335,16 @@ func (c *Cycle) wrapSubmitters(st *runState, ads []*classad.ClassAd) []*subState
 		if v, ok := ad.EvaluateAttrInt("IdleJobs"); ok && v > 0 {
 			sub.idleJobs = int(v)
 		}
-		st.stats.IdleJobs += sub.idleJobs
+		// NumIdleJobs is counted once per submitter. Off, that is one ad per name
+		// so the plain accumulation is exact; under USE_GLOBAL_JOB_PRIOS a
+		// submitter is fanned out into many same-name subStates, so dedup by name
+		// (matchmaker.cpp:2772-2774) instead of counting each fanned-out round.
+		if st.idleCounted == nil {
+			st.stats.IdleJobs += sub.idleJobs
+		} else if _, counted := st.idleCounted[name]; !counted {
+			st.idleCounted[name] = struct{}{}
+			st.stats.IdleJobs += sub.idleJobs
+		}
 		sub.lastHeard, _ = ad.EvaluateAttrInt("LastHeardFrom")
 		if c.cfg.WantGlobalJobPrio {
 			// The fanned-out round's single JobPrio seeds its consolidation band;

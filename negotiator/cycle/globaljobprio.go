@@ -2,7 +2,6 @@ package cycle
 
 import (
 	"math"
-	"strconv"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -36,29 +35,51 @@ const (
 func fanOutJobPrios(ads []*classad.ClassAd) []*classad.ClassAd {
 	out := make([]*classad.ClassAd, 0, len(ads))
 	for _, ad := range ads {
-		arr, ok := ad.EvaluateAttrString(attrJobPrioArray)
-		if !ok || strings.TrimSpace(arr) == "" {
-			// No array: a single round at the worst priority (INT_MIN).
+		arr, present := ad.EvaluateAttrString(attrJobPrioArray)
+		if !present {
+			// Array absent: a single round at the worst priority (INT_MIN), so
+			// the schedd still negotiates (matchmaker.cpp:3459-3463).
 			cp := copyAd(ad)
 			cp.InsertAttr(attrJobPrio, math.MinInt32)
 			out = append(out, cp)
 			continue
 		}
+		// Array present: one round per token, high-to-low as the schedd wrote it
+		// (schedd.cpp:1268-1281). Empty tokens are skipped, matching the C++
+		// StringTokenIterator, so a present-but-empty array yields no rounds and
+		// drops the submitter -- exactly as the C++ does.
 		for _, tok := range strings.Split(arr, ",") {
 			tok = strings.TrimSpace(tok)
 			if tok == "" {
 				continue
 			}
-			prio, err := strconv.Atoi(tok)
-			if err != nil {
-				continue
-			}
 			cp := copyAd(ad)
-			cp.InsertAttr(attrJobPrio, int64(prio))
+			cp.InsertAttr(attrJobPrio, int64(atoiC(tok)))
 			out = append(out, cp)
 		}
 	}
 	return out
+}
+
+// atoiC mimics C atoi (the C++ fan-out parses each token with atoi): an optional
+// leading sign and the leading run of digits, 0 when there are none. A malformed
+// token thus becomes a JobPrio-0 round rather than being dropped, matching the
+// C++ round set exactly.
+func atoiC(s string) int {
+	i, neg := 0, false
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		neg = s[i] == '-'
+		i++
+	}
+	v := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		v = v*10 + int(s[i]-'0')
+		i++
+	}
+	if neg {
+		return -v
+	}
+	return v
 }
 
 // consolidateJobPrios collapses each maximal run of adjacent subStates for the

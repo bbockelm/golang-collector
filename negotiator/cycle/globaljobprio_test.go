@@ -61,6 +61,85 @@ func TestFanOutJobPrios(t *testing.T) {
 	}
 }
 
+// TestFanOutJobPriosEdgeCases pins the C++ atoi + StringTokenIterator semantics:
+// a present-but-empty array drops the submitter (zero rounds), a malformed token
+// becomes a JobPrio-0 round, and empty tokens between commas are skipped.
+func TestFanOutJobPriosEdgeCases(t *testing.T) {
+	t.Run("present empty array drops submitter", func(t *testing.T) {
+		ad := gjpSubmitterAd("alice", "<a>", "x") // placeholder to force the attr...
+		ad.InsertAttrString(attrJobPrioArray, "") // ...then set it empty
+		if out := fanOutJobPrios([]*classad.ClassAd{ad}); len(out) != 0 {
+			t.Fatalf("present-empty array: got %d rounds, want 0 (submitter dropped)", len(out))
+		}
+	})
+
+	t.Run("malformed token becomes zero", func(t *testing.T) {
+		ad := gjpSubmitterAd("alice", "<a>", "5,abc,3")
+		out := fanOutJobPrios([]*classad.ClassAd{ad})
+		got := make([]int64, len(out))
+		for i, a := range out {
+			got[i], _ = a.EvaluateAttrInt(attrJobPrio)
+		}
+		want := []int64{5, 0, 3} // atoi("abc") == 0
+		if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("empty tokens skipped", func(t *testing.T) {
+		ad := gjpSubmitterAd("alice", "<a>", "5,,3,") // double + trailing comma
+		if out := fanOutJobPrios([]*classad.ClassAd{ad}); len(out) != 2 {
+			t.Fatalf("got %d rounds, want 2 (empty tokens skipped)", len(out))
+		}
+	})
+}
+
+func TestAtoiC(t *testing.T) {
+	cases := map[string]int{"5": 5, "-3": -3, "+7": 7, "abc": 0, "5x": 5, "": 0, "-": 0, "10a2": 10}
+	for in, want := range cases {
+		if got := atoiC(in); got != want {
+			t.Errorf("atoiC(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// TestFanOutIdleJobsDedup verifies NumIdleJobs counts a fanned-out submitter's
+// idle jobs once (by name), not once per job-priority round.
+func TestFanOutIdleJobsDedup(t *testing.T) {
+	newState := func(gjp bool) *runState {
+		st := &runState{
+			stats: &negotiator.CycleStats{},
+			subs:  make(map[*classad.ClassAd]*subState),
+		}
+		if gjp {
+			st.idleCounted = make(map[string]struct{})
+		}
+		return st
+	}
+
+	t.Run("on: deduped by name", func(t *testing.T) {
+		c := &Cycle{cfg: Config{WantGlobalJobPrio: true}}
+		ad := gjpSubmitterAd("alice", "<a>", "5,3,1") // IdleJobs=5, 3 rounds
+		st := newState(true)
+		c.wrapSubmitters(st, fanOutJobPrios([]*classad.ClassAd{ad}))
+		if st.stats.IdleJobs != 5 {
+			t.Errorf("IdleJobs = %d, want 5 (deduped, not 15)", st.stats.IdleJobs)
+		}
+	})
+
+	t.Run("off: plain accumulation unchanged", func(t *testing.T) {
+		// Off path with two same-name ads still sums, byte-identical to before.
+		c := &Cycle{cfg: Config{WantGlobalJobPrio: false}}
+		a1 := gjpSubmitterAd("alice", "<a1>", "")
+		a2 := gjpSubmitterAd("alice", "<a2>", "")
+		st := newState(false)
+		c.wrapSubmitters(st, []*classad.ClassAd{a1, a2})
+		if st.stats.IdleJobs != 10 {
+			t.Errorf("IdleJobs = %d, want 10 (off path sums per ad)", st.stats.IdleJobs)
+		}
+	})
+}
+
 // sub is a compact subState builder for the consolidation/sort tests.
 func gjpSub(name, addr string, prio int, hasArray bool, origIdx int) *subState {
 	return &subState{
