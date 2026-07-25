@@ -88,12 +88,14 @@ ClaimId="remote-claim-big"`)
 Name="alice@pool.test"
 ScheddName="ap1.pool.test"
 ScheddIpAddr="<10.0.0.21:9618>"
+SubmitterTag=""
 IdleJobs=5
 RunningJobs=0`)
 	seed(store.SubmitterAd, `MyType="Submitter"
 Name="bob@pool.test"
 ScheddName="ap1.pool.test"
 ScheddIpAddr="<10.0.0.21:9618>"
+SubmitterTag=""
 IdleJobs=0
 RunningJobs=0`)
 }
