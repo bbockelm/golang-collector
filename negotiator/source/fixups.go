@@ -28,6 +28,7 @@ const (
 	attrRunningJobs  = "RunningJobs"                       // ATTR_RUNNING_JOBS
 	attrIdleJobs     = "IdleJobs"                          // ATTR_IDLE_JOBS
 	attrSkipMatch    = "SkipMatchmaking"                   // ATTR_SKIP_MATCHMAKING
+	attrSubmitterTag = "SubmitterTag"                      // ATTR_SUBMITTER_TAG
 	attrClaimID      = "ClaimId"                           // ATTR_CLAIM_ID
 	attrCapability   = "Capability"                        // ATTR_CAPABILITY
 	attrClaimIDList  = "ClaimIdList"                       // ATTR_CLAIM_ID_LIST
@@ -118,6 +119,14 @@ func KeepSubmitter(ad *classad.ClassAd) bool {
 		return false
 	}
 	if addr, ok := ad.EvaluateAttrString(attrScheddIPAddr); !ok || addr == "" {
+		return false
+	}
+	// A submitter ad must carry SubmitterTag (used for flocking levels). The C++
+	// negotiator refuses to negotiate a submitter whose ad lacks it
+	// (matchmaker.cpp:3996); every schedd since 7.5.4 sets it (often ""), so this
+	// only rejects a malformed/ancient ad. An empty value is still present and
+	// passes -- the requirement is presence, not a non-empty tag.
+	if _, ok := ad.EvaluateAttrString(attrSubmitterTag); !ok {
 		return false
 	}
 	if skip, ok := ad.EvaluateAttrBool(attrSkipMatch); ok && skip {

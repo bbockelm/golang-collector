@@ -280,6 +280,22 @@ Smaller cycle-side C++ features, each independent:
   per `JobPrioArray`, `want_globaljobprio` in the submitter sort, `JOBPRIO_MIN/MAX`
   in the NEGOTIATE header, matchmaker.cpp:817, :3455-3477). Touches the submitter
   loop + header; left rather than risk half-breaking the spin.
-- `STARTD_AD_REEVAL_EXPR` and flocking `SubmitterTag` handling remain unported.
+- **`STARTD_AD_REEVAL_EXPR` — ✅ DONE.** A `ReevalSource` decorator
+  (`negotiator/source/reeval.go`) around the AdSource: a machine ad flagged
+  `WantAdRevaluate` is replaced by a newer snapshot's version only when the
+  configured expression holds -- default `target.UpdateSequenceNumber >
+  my.UpdateSequenceNumber` (stashed ad = my, new ad = target) -- otherwise the
+  stashed ad is reused for this cycle, letting a startd suppress a stale /
+  lower-sequence re-advertisement (matchmaker.cpp:3304-3345). Copy-on-write
+  (no-reeval snapshots pass through untouched), a bounded per-machine stash, and
+  wired into both the standalone daemon and the embedded collector. Covered by
+  `reeval_test.go`. Not ported: the per-*match* `reeval(offer)` + rotate-to-end
+  round-robin (matchmaker.cpp:4478) -- that is p-slot-consumption territory
+  (roadmap #6), and is a no-op without an in-cycle mutable p-slot model.
+- **Flocking `SubmitterTag` requirement — ✅ DONE.** `KeepSubmitter` now rejects a
+  submitter ad missing `SubmitterTag` (matchmaker.cpp:3996; every schedd since
+  7.5.4 sets it, often ""), matching the C++ refusal to negotiate an ad without
+  it. The tag was already threaded end-to-end (read in the cycle, keyed in the
+  session cache, echoed on the NEGOTIATE ad); this closes the validation gap.
 
 **Where:** `negotiator/cycle`, `negotiator/source`, `negotiator/protocol`.

@@ -103,6 +103,7 @@ MyType = "Submitter"
 Name = "carol@pool.test"
 ScheddName = "ap9.pool.test"
 ScheddIpAddr = "<10.0.0.99:9618>"
+SubmitterTag = ""
 IdleJobs = 2
 RunningJobs = 1`
 

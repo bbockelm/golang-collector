@@ -138,6 +138,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// STARTD_AD_REEVAL_EXPR: let a startd suppress a stale / lower-sequence machine
+	// ad it re-advertised (per-ad WantAdRevaluate opt-in); a zero-cost passthrough on
+	// pools that don't use the feature.
+	adSrc := source.NewReevalSource(src, configString(cfg, "STARTD_AD_REEVAL_EXPR"))
 
 	// Accountant state: ACCOUNTANT_DATABASE_FILE, defaulting to
 	// $(SPOOL)/GoAccountant.log — the Go-native transaction-log format, NOT
@@ -183,7 +187,7 @@ func run() error {
 	}
 
 	neg, err := negotiator.New(negotiator.Config{
-		Source:           src,
+		Source:           adSrc,
 		Accountant:       acct,
 		Cycle:            cyc,
 		NegotiatorName:   cycleCfg.NegotiatorName,

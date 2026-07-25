@@ -315,6 +315,9 @@ func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *co
 	if err != nil {
 		return fmt.Errorf("embedded negotiator: %w", err)
 	}
+	// STARTD_AD_REEVAL_EXPR: honor a startd's WantAdRevaluate request to keep a
+	// stale/lower-sequence machine ad; passthrough when unused.
+	adSrc := source.NewReevalSource(src, configString(cfg, "STARTD_AD_REEVAL_EXPR"))
 
 	acctCfg := accountant.ConfigFromKnobs(cfg.Get)
 	acctCfg.LogFile = accountantLogFile(cfg)
@@ -348,7 +351,7 @@ func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *co
 	}
 
 	neg, err := negotiator.New(negotiator.Config{
-		Source:         src,
+		Source:         adSrc,
 		Accountant:     acct,
 		Cycle:          cyc,
 		NegotiatorName: cycleCfg.NegotiatorName,
