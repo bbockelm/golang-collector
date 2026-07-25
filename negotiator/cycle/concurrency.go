@@ -47,6 +47,15 @@ type subState struct {
 	lastHeard  int64
 	origIdx    int // snapshot order; the final sort tiebreak
 
+	// USE_GLOBAL_JOB_PRIOS only (globaljobprio.go): the job priority this fanned-out
+	// round negotiates (secondary sort key), the [min,max] band it covers after
+	// consolidation (the JOBPRIO_MIN/MAX header limit), and whether the submitter ad
+	// carried a JobPrioArray (a round without one is never ranged or consolidated).
+	jobPrio         int
+	jobPrioMin      int
+	jobPrioMax      int
+	hasJobPrioArray bool
+
 	timeUsed   time.Duration // cumulative negotiation time this cycle
 	starvation float64       // stamped by calculatePieLeft each spin
 
@@ -242,13 +251,22 @@ func (c *Cycle) headerFor(st *runState, sub *subState) *negotiator.NegotiateHead
 	if orig, ok := sub.ad.EvaluateAttrString("OriginalName"); ok && orig != "" {
 		owner = orig
 	}
-	return &negotiator.NegotiateHeader{
+	h := &negotiator.NegotiateHeader{
 		Owner:            owner,
 		AutoClusterAttrs: st.sigAttrs,
 		SubmitterTag:     sub.tag,
 		NegotiatorName:   c.cfg.NegotiatorName,
 		JobConstraint:    c.cfg.JobConstraint,
 	}
+	// USE_GLOBAL_JOB_PRIOS: limit this round to the consolidated priority band.
+	// A submitter ad without a JobPrioArray gets no band (negotiated in full),
+	// matching the C++ guard on JOBPRIO_MIN presence (matchmaker.cpp:4074).
+	if c.cfg.WantGlobalJobPrio && sub.hasJobPrioArray {
+		h.HasJobPrio = true
+		h.JobPrioMin = sub.jobPrioMin
+		h.JobPrioMax = sub.jobPrioMax
+	}
+	return h
 }
 
 // sendMatch delivers PERMISSION_AND_AD: synchronously in compat mode

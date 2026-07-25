@@ -130,6 +130,12 @@ func (c *Cycle) negotiateWithGroup(ctx context.Context, st *runState, ri roundIn
 		if spin == 1 {
 			p3 := c.now()
 			c.sortSubmitters(subs, env)
+			// USE_GLOBAL_JOB_PRIOS: now that the fanned-out rounds are sorted,
+			// merge each non-interleaved same-submitter run back into one ranged
+			// round (matchmaker.cpp:2552, consolidate after the phase-3 sort).
+			if c.cfg.WantGlobalJobPrio {
+				subs = consolidateJobPrios(subs)
+			}
 			st.stats.Phase3Duration += c.now().Sub(p3)
 		}
 
@@ -310,6 +316,13 @@ func (c *Cycle) sortSubmitters(subs []*subState, env *spinEnv) {
 		pa, pb := c.getPrio(env, a.name), c.getPrio(env, b.name)
 		if pa != pb {
 			return pa < pb
+		}
+		// Secondary key: job priority, when USE_GLOBAL_JOB_PRIOS is set
+		// (matchmaker.cpp:357-365). Higher job prio is "better" and sorts first,
+		// so a submitter's high-priority fanned-out round precedes another
+		// submitter's low-priority round at the same user priority.
+		if c.cfg.WantGlobalJobPrio && a.jobPrio != b.jobPrio {
+			return a.jobPrio > b.jobPrio
 		}
 		if a.starvation != b.starvation {
 			return a.starvation < b.starvation

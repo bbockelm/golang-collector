@@ -233,6 +233,14 @@ type NegotiateHeader struct {
 	SubmitterTag     string
 	NegotiatorName   string
 	JobConstraint    string // NEGOTIATOR_JOB_CONSTRAINT, optional
+
+	// HasJobPrio gates the USE_GLOBAL_JOB_PRIOS band: when set, JobPrioMin and
+	// JobPrioMax are sent as JOBPRIO_MIN / JOBPRIO_MAX so the schedd offers only
+	// jobs in that priority range (matchmaker.cpp:4074-4082). Unset leaves the
+	// header unchanged.
+	HasJobPrio bool
+	JobPrioMin int
+	JobPrioMax int
 }
 
 // SessionFactory mints ScheddSessions, hiding the socket cache and the
