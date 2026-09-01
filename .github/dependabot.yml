@@ -1,8 +1,9 @@
-# Managed by Dependabot: keep GitHub Actions current (including SHA-pinned actions,
-# whose pins are bumped when the action cuts a new release). Grouped into a single
-# weekly PR to keep the noise down.
 version: 2
+
 updates:
+  # Managed by Dependabot: keep GitHub Actions current (including SHA-pinned actions,
+  # whose pins are bumped when the action cuts a new release). Grouped into a single
+  # weekly PR to keep the noise down.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -13,3 +14,20 @@ updates:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  # Go modules. This repo is a single module rooted at "/" (go.work is local-only
+  # and gitignored, so the committed go.mod is what CI builds). If another module
+  # is ever added, list its directory here too: a shared dependency bumped in one
+  # module leaves the others' go.mod/go.sum stale.
+  #
+  # Minor and patch bumps are grouped into one weekly PR to cut noise; majors come
+  # as individual PRs so they get reviewed on their own.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"
