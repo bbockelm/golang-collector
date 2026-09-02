@@ -123,6 +123,45 @@ func TestInvalidate(t *testing.T) {
 	}
 }
 
+// TestInvalidateTargetScopedConstraint is the regression for forwarded startd
+// invalidations being dropped: a real startd sends
+// `Requirements = TARGET.Name == "<name>"` (condor_startd ResMgr::final_update),
+// and the collector must remove the named ad. A collector constraint is evaluated
+// against one candidate ad with no match target, so a TARGET reference must
+// resolve against that ad -- exactly as unscoped and MY references already do, and
+// as the C++ collector does. Before the fix, TARGET.* resolved to undefined and
+// nothing was invalidated, so the ad lingered forever.
+func TestInvalidateTargetScopedConstraint(t *testing.T) {
+	// A realistic slot ad: it carries Name, SlotID and MyAddress, as a live startd
+	// advertises (the attributes that make its stored hash key non-trivial).
+	const ad = `[Name="slot1@host"; SlotID=1; MyAddress="<1.2.3.4:5>"; State="Unclaimed"; MyType="Machine"]`
+
+	for _, tc := range []struct {
+		name       string
+		constraint string
+	}{
+		{"unscoped", `Name == "slot1@host"`},
+		{"my", `MY.Name == "slot1@host"`},
+		{"target", `TARGET.Name == "slot1@host"`}, // the shape a real startd sends
+		{"target-compound", `TARGET.State == "Unclaimed" && TARGET.Name == "slot1@host"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New()
+			s.Update(context.Background(), StartdAd, mustAd(t, ad))
+			n, err := s.Invalidate(context.Background(), StartdAd, tc.constraint, nil)
+			if err != nil {
+				t.Fatalf("Invalidate(%q): %v", tc.constraint, err)
+			}
+			if n != 1 {
+				t.Fatalf("Invalidate(%q) removed %d, want 1", tc.constraint, n)
+			}
+			if got := mustLen(t, s, StartdAd); got != 0 {
+				t.Fatalf("after Invalidate(%q) Len=%d, want 0", tc.constraint, got)
+			}
+		})
+	}
+}
+
 func TestExpire(t *testing.T) {
 	s := New()
 	now := int64(1000)
