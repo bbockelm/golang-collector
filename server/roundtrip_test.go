@@ -268,6 +268,47 @@ func TestViewForwarding(t *testing.T) {
 	}
 }
 
+// TestViewForwardingTargetScopedInvalidate is the regression for the production
+// bug: a startd's invalidation, forwarded from the C++ collector to the Go view
+// collector, left the ad in place forever. A real startd sends an invalidate ad
+// shaped like `[MyType="Query"; TargetType="Machine"; Name="<n>";
+// MyAddress="<a>"; Requirements = TARGET.Name == "<n>"]` (condor_startd
+// ResMgr::final_update). The Go collector evaluated the TARGET-scoped Requirements
+// with no match target, so it matched nothing and the ad was never removed --
+// while condor_status kept showing it. The earlier forwarding test used an
+// UNSCOPED `Name == ...` constraint, so it missed this.
+func TestViewForwardingTargetScopedInvalidate(t *testing.T) {
+	viewStore, viewAddr, stopView := startCollector(t)
+	defer stopView()
+
+	fwd := NewForwarder([]string{viewAddr}, plaintextSec())
+	_, primaryAddr, stopPrimary := startCollectorFwd(t, fwd)
+	defer stopPrimary()
+
+	ctx, cancel := context.WithTimeout(htcondor.WithSecurityConfig(context.Background(), plaintextSec()), 10*time.Second)
+	defer cancel()
+
+	col := htcondor.NewCollector(primaryAddr)
+	// A realistic slot ad: Name + SlotID + MyAddress, as a live startd advertises.
+	ad := mustAd(t, `[MyType="Machine"; Name="slot1@oconnor.example"; SlotID=1; MyAddress="<1.2.3.4:5>"; State="Unclaimed"; Cpus=8]`)
+	if err := col.Advertise(ctx, ad, &htcondor.AdvertiseOptions{Command: commands.UPDATE_STARTD_AD}); err != nil {
+		t.Fatalf("advertise to primary: %v", err)
+	}
+	if !waitFor(2*time.Second, func() bool { return mustLen(t, viewStore, store.StartdAd) == 1 }) {
+		t.Fatalf("update not forwarded to view collector (view has %d ads)", mustLen(t, viewStore, store.StartdAd))
+	}
+
+	// The exact invalidate ad a startd sends: a TARGET-scoped Requirements, plus
+	// Name + MyAddress (which the C++ collector also uses for an O(1) hash-key drop).
+	inv := mustAd(t, `[MyType="Query"; TargetType="Machine"; Name="slot1@oconnor.example"; MyAddress="<1.2.3.4:5>"; Requirements = TARGET.Name == "slot1@oconnor.example"]`)
+	if err := col.Advertise(ctx, inv, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_STARTD_ADS}); err != nil {
+		t.Fatalf("invalidate on primary: %v", err)
+	}
+	if !waitFor(2*time.Second, func() bool { return mustLen(t, viewStore, store.StartdAd) == 0 }) {
+		t.Fatalf("TARGET-scoped invalidation not applied: view collector still has %d ads", mustLen(t, viewStore, store.StartdAd))
+	}
+}
+
 // waitFor polls cond until it is true or the timeout elapses.
 func waitFor(timeout time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(timeout)
