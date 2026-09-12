@@ -12,8 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Track the minimum Go version named in go.mod.
-        go-version: ['1.25']
+        # First entry is the floor named in go.mod (1.26, the oldest
+        # release upstream still supports); testing there is what keeps
+        # that floor honest. Last entry is the newest release, which is
+        # what builds and ships.
+        go-version: ['1.26', '1.27']
     steps:
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,7 +94,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.25'
+        go-version: '1.27'
         cache: true
 
     - name: Install HTCondor
@@ -148,7 +151,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.25'
+        go-version: '1.27'
         cache: true
 
     - name: Run golangci-lint
@@ -166,7 +169,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.25'
+        go-version: '1.27'
         cache: true
 
     - name: Build

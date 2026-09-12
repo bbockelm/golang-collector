@@ -1,6 +1,6 @@
 module github.com/bbockelm/golang-collector
 
-go 1.25.7
+go 1.26.0
 
 require (
 	github.com/PelicanPlatform/classad v0.29.6
