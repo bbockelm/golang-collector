@@ -3,19 +3,19 @@ module github.com/bbockelm/golang-collector
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.11
+	github.com/PelicanPlatform/classad v0.29.14
 	github.com/PelicanPlatform/classad/collections v0.29.11
 	github.com/PelicanPlatform/classad/db v0.29.11
 	github.com/PelicanPlatform/classad/dbrpc v0.29.11
-	github.com/bbockelm/cedar v0.7.4
+	github.com/bbockelm/cedar v0.7.6
 	github.com/bbockelm/golang-ccb v0.4.0
-	github.com/bbockelm/golang-htcondor v0.13.1
+	github.com/bbockelm/golang-htcondor v0.20.0
 	github.com/prometheus/client_golang v1.24.1
 )
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.26.0 // indirect
-	github.com/bbockelm/gosssd v0.0.1 // indirect
+	github.com/bbockelm/gosssd v0.0.4 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.25.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

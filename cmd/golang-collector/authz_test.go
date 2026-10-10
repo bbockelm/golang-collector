@@ -25,7 +25,7 @@ import (
 )
 
 // These tests drive the collector exactly as the daemon builds it
-// (newCollector + serveCommands) over loopback, with IDTOKENS so each client
+// (newCollector + daemon.Authz.Serve) over loopback, with IDTOKENS so each client
 // authenticates as a distinct identity, and check that the ALLOW_/DENY_
 // policy decides which identities may run which command.
 
@@ -38,7 +38,7 @@ type authzCollector struct {
 	keyDir  string
 	cache   *security.SessionCache
 	srv     *cedarserver.Server
-	az      *collectorAuthz
+	az      *daemon.Authz
 	st      store.Backend
 	records chan slog.Record
 }
@@ -70,7 +70,9 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 	for k, v := range knobs {
 		cfg.Set(k, v)
 	}
-	az, err := newCollectorAuthz(cfg)
+	opts := authzOptions()
+	opts.Subsys = "COLLECTOR"
+	az, err := daemon.NewAuthz(cfg, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +90,7 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = serveCommands(c.Server(), az, logger)(ctx, ln)
+		_ = az.Serve(c.Server(), logger)(ctx, ln)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -299,9 +301,7 @@ func TestAuthzAdvertiseStartd(t *testing.T) {
 		"ALLOW_ADVERTISE_STARTD": "startd@pool",
 	})
 
-	if err := ac.advertise(t, ac.as(t, "intruder@pool"), commands.UPDATE_STARTD_AD, "slot1@intruder"); err != nil {
-		t.Fatalf("sending the update: %v", err) // fire-and-forget: the refusal is not reported to the sender
-	}
+	expectDenied(t, ac.advertise(t, ac.as(t, "intruder@pool"), commands.UPDATE_STARTD_AD, "slot1@intruder"))
 	ac.expectDenial(t, "UPDATE_STARTD_AD", "ADVERTISE_STARTD", "intruder@pool", "ALLOW_ADVERTISE_STARTD", "")
 
 	if err := ac.advertise(t, ac.as(t, "intruder@pool"), commands.UPDATE_STARTD_AD_WITH_ACK, "slot2@intruder"); err == nil {
@@ -309,7 +309,7 @@ func TestAuthzAdvertiseStartd(t *testing.T) {
 	}
 	ac.expectDenial(t, "UPDATE_STARTD_AD_WITH_ACK", "ADVERTISE_STARTD", "intruder@pool", "ALLOW_ADVERTISE_STARTD", "")
 
-	_ = ac.advertise(t, ac.as(t, ""), commands.UPDATE_STARTD_AD, "slot3@anonymous")
+	expectDenied(t, ac.advertise(t, ac.as(t, ""), commands.UPDATE_STARTD_AD, "slot3@anonymous"))
 	ac.expectDenial(t, "UPDATE_STARTD_AD", "ADVERTISE_STARTD", "unauthenticated@unmapped", "ALLOW_ADVERTISE_STARTD", "")
 
 	if err := ac.advertise(t, ac.as(t, "startd@pool"), commands.UPDATE_STARTD_AD_WITH_ACK, "slot1@startd"); err != nil {
@@ -426,15 +426,15 @@ func TestAuthzLevelsMatchCpp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	negAd := mustParse(t, `[MyType="Negotiator"; Name="neg@pool"; MyAddress="<127.0.0.1:2>"]`)
-	advNeg := func(who string) {
+	advNeg := func(who string) error {
 		c := htcondor.WithSecurityConfig(ctx, ac.as(t, who))
-		if err := htcondor.NewCollector(ac.addr).Advertise(c, negAd, &htcondor.AdvertiseOptions{Command: commands.UPDATE_NEGOTIATOR_AD}); err != nil {
-			t.Fatalf("sending UPDATE_NEGOTIATOR_AD as %s: %v", who, err)
-		}
+		return htcondor.NewCollector(ac.addr).Advertise(c, negAd, &htcondor.AdvertiseOptions{Command: commands.UPDATE_NEGOTIATOR_AD})
 	}
-	advNeg("daemon@pool")
+	expectDenied(t, advNeg("daemon@pool"))
 	ac.expectDenial(t, "UPDATE_NEGOTIATOR_AD", "NEGOTIATOR", "daemon@pool", "ALLOW_NEGOTIATOR", "")
-	advNeg("negotiator@pool")
+	if err := advNeg("negotiator@pool"); err != nil {
+		t.Fatalf("UPDATE_NEGOTIATOR_AD as negotiator@pool: %v", err)
+	}
 	ac.waitStored(t, store.NegotiatorAd, "neg@pool")
 }
 
@@ -581,7 +581,7 @@ func TestAuthzReload(t *testing.T) {
 		cfg.Set(k, v)
 	}
 	cfg.Set("ALLOW_ADVERTISE_STARTD", "startd@pool")
-	if err := ac.az.reload(cfg); err != nil {
+	if err := ac.az.Reload(cfg); err != nil {
 		t.Fatal(err)
 	}
 	if err := ac.advertise(t, ac.as(t, "startd@pool"), commands.UPDATE_STARTD_AD_WITH_ACK, "slot1@startd"); err != nil {
@@ -592,15 +592,27 @@ func TestAuthzReload(t *testing.T) {
 // TestLogDenialIgnoresOtherErrors: only authorization refusals are logged as
 // denials.
 func TestLogDenialIgnoresOtherErrors(t *testing.T) {
-	az, err := newCollectorAuthz(config.NewEmpty())
+	az, err := daemon.NewAuthz(config.NewEmpty(), daemon.AuthzOptions{Subsys: "COLLECTOR"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	records := make(chan slog.Record, 4)
-	az.logDenial(slog.New(&recordHandler{ch: records}), nil, "127.0.0.1:1",
-		errors.New("cedar/server: command 0 (UPDATE_STARTD_AD) refused: session (authenticated=false encrypted=false) does not meet the command's security level"))
+	if az.LogDenial(slog.New(&recordHandler{ch: records}), nil, "127.0.0.1:1",
+		errors.New("cedar/server: command 0 (UPDATE_STARTD_AD) refused: session (authenticated=false encrypted=false) does not meet the command's security level")) {
+		t.Error("LogDenial reported a security-level refusal as a denial")
+	}
 	if len(records) != 0 {
 		t.Errorf("logged %d records for a security-level refusal, want 0", len(records))
+	}
+}
+
+// expectDenied checks err is the collector's DENIED answer to a refused
+// command.
+func expectDenied(t *testing.T, err error) {
+	t.Helper()
+	var ae *security.AuthorizationError
+	if !errors.As(err, &ae) || ae.ReturnCode != "DENIED" {
+		t.Errorf("refused command returned %v, want an AuthorizationError DENIED", err)
 	}
 }
 

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,5 +169,93 @@ func sendAckUpdate(t *testing.T, ctx context.Context, strm *stream.Stream, ad *c
 	}
 	if ok != 1 {
 		t.Fatalf("ack = %d, want 1", ok)
+	}
+}
+
+// TestAckUpdatePrivateAd: a startd sends its private ad after the public one
+// on UPDATE_STARTD_AD_WITH_ACK too. As in the C++ collector
+// (receive_update_expect_ack), the public ad is stored and the private ad is
+// not -- the private table keeps what the last UPDATE_STARTD_AD stored -- and
+// the private ad is consumed, so a follow-on update on the same connection is
+// read intact even when the private ad spans more than one frame.
+func TestAckUpdatePrivateAd(t *testing.T) {
+	st, addr, stop := startCollector(t)
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const pub = `[MyType="Machine"; Name="slot1@ack"; MyAddress="<1.2.3.4:5>"; Cpus=%d]`
+	key := mustAd(t, fmt.Sprintf(pub, 8))
+	sec := plaintextSec()
+	sec.Command = commands.UPDATE_STARTD_AD
+	cl, err := client.ConnectAndAuthenticate(ctx, addr, sec)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	m := message.NewMessageForStream(cl.GetStream())
+	for _, ad := range []string{fmt.Sprintf(pub, 8), `[MyType="Machine"; Name="slot1@ack"; MyAddress="<1.2.3.4:5>"; PvtTag="OLD"]`} {
+		if err := m.PutClassAd(ctx, mustAd(t, ad)); err != nil {
+			t.Fatalf("put ad: %v", err)
+		}
+	}
+	if err := m.FinishMessage(ctx); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	_ = cl.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := st.Get(ctx, store.StartdPvtAd, key); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("UPDATE_STARTD_AD did not store the private ad")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	sec = plaintextSec()
+	sec.Command = commands.UPDATE_STARTD_AD_WITH_ACK
+	cl, err = client.ConnectAndAuthenticate(ctx, addr, sec)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	strm := cl.GetStream()
+	m = message.NewMessageForStream(strm)
+	if err := m.PutClassAd(ctx, mustAd(t, fmt.Sprintf(pub, 16))); err != nil {
+		t.Fatalf("put public ad: %v", err)
+	}
+	// Larger than a frame, so it does not end with the public ad's frame.
+	pvt := fmt.Sprintf(`[MyType="Machine"; Name="slot1@ack"; MyAddress="<1.2.3.4:5>"; PvtTag="NEW"; Filler=%q]`,
+		strings.Repeat("x", 3*message.TargetFrameSize))
+	if err := m.PutClassAd(ctx, mustAd(t, pvt)); err != nil {
+		t.Fatalf("put private ad: %v", err)
+	}
+	if err := m.FinishMessage(ctx); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	ack, err := message.NewMessageFromStream(strm).GetInt32(ctx)
+	if err != nil || ack != 1 {
+		t.Fatalf("ack = %d, %v; want 1", ack, err)
+	}
+	next := benchAd(3)
+	sendAckUpdate(t, ctx, strm, next, false)
+
+	got, ok := st.Get(ctx, store.StartdAd, key)
+	if !ok {
+		t.Fatal("WITH_ACK public ad not stored")
+	}
+	if cpus, _ := got.EvaluateAttrInt("Cpus"); cpus != 16 {
+		t.Errorf("public ad Cpus = %d, want 16 (the WITH_ACK update)", cpus)
+	}
+	if _, ok := st.Get(ctx, store.StartdAd, next); !ok {
+		t.Error("the follow-on WITH_ACK update was not stored")
+	}
+	p, ok := st.Get(ctx, store.StartdPvtAd, key)
+	if !ok {
+		t.Fatal("WITH_ACK removed the private ad UPDATE_STARTD_AD stored")
+	}
+	if tag, _ := p.EvaluateAttrString("PvtTag"); tag != "OLD" {
+		t.Errorf("private ad PvtTag = %q, want OLD (WITH_ACK does not store its private ad)", tag)
 	}
 }

@@ -32,6 +32,7 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 
+	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
 )
@@ -47,11 +48,15 @@ type Config struct {
 	Security *security.SecurityConfig
 
 	// SecurityForLevel, if set, gives a distinct CEDAR security policy per HTCondor
-	// authorization level ("READ", "ADVERTISE", "NEGOTIATOR"; see server.CommandLevel),
-	// so the collector negotiates each command at its own level -- monitoring
-	// (READ) can be permissive enough for an unauthenticated condor_status while
-	// publishing (ADVERTISE) still requires authentication. A level absent from the
-	// map falls back to Security. Optional.
+	// authorization level (DCpermission name: "READ", "DAEMON",
+	// "ADVERTISE_STARTD", ...), and the Collector's own command server negotiates
+	// each command under the policy of the level it is registered at, as
+	// DaemonCore does -- monitoring (READ) can be permissive enough for an
+	// unauthenticated condor_status while publishing (ADVERTISE_*) still requires
+	// authentication. This covers commands later registered on Server() (DC_*,
+	// CCB, negotiator) too. A command whose level is absent from the map
+	// falls back to Security. Each policy shares Security's post-authentication
+	// policy. Optional.
 	SecurityForLevel map[string]*security.SecurityConfig
 
 	// Backend is the ad store. Optional; nil selects the default in-memory store
@@ -130,13 +135,7 @@ func New(cfg Config) (*Collector, error) {
 		c.srv.Authorizer = cfg.Authorizer
 	}
 	if cfg.SecurityForLevel != nil {
-		// Negotiate each command at its HTCondor authorization level: map the
-		// command to its level (server.CommandLevel) and hand cedar that level's
-		// policy. A level absent from the map returns nil, so cedar falls back to
-		// the default Security config.
-		c.srv.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
-			return cfg.SecurityForLevel[server.CommandLevel(command)]
-		}
+		seclevel.Install(c.srv, cfg.SecurityForLevel)
 	}
 	c.RegisterOn(c.srv)
 	return c, nil

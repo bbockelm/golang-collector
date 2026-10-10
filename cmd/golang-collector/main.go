@@ -29,11 +29,13 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
+	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	collector "github.com/bbockelm/golang-collector"
+	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/metrics"
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
@@ -99,36 +101,6 @@ func run() error {
 	// Route cedar's security/server slog output into CollectorLog.
 	slog.SetDefault(d.Slog())
 
-	// Server-side security policy from the HTCondor configuration (SEC_* knobs),
-	// per authorization level -- exactly like the C++ collector, which serves
-	// QUERY_*_ADS at READ (monitoring is public, so condor_status works without
-	// daemon credentials) but UPDATE_*/INVALIDATE_* at ADVERTISE (only
-	// authenticated daemons may publish). The collector maps each command to its
-	// level (server.CommandLevel) and negotiates using the matching policy.
-	secForLevel := map[string]*security.SecurityConfig{}
-	for _, lvl := range []struct {
-		name string
-		cmd  int
-	}{
-		{server.LevelRead, commands.QUERY_ANY_ADS},
-		{server.LevelAdvertise, commands.UPDATE_STARTD_AD},
-		{server.LevelNegotiator, commands.QUERY_STARTD_PVT_ADS},
-	} {
-		s, err := htcondor.GetServerSecurityConfig(d.Config(), lvl.cmd, lvl.name)
-		if err != nil {
-			return fmt.Errorf("building %s security config: %w", lvl.name, err)
-		}
-		// FS peers authenticate as user@UID_DOMAIN, as in C++; the
-		// GetServerSecurityConfig helper does not set it.
-		if v, ok := cfg.Get("UID_DOMAIN"); ok {
-			s.UIDDomain = v
-		}
-		secForLevel[lvl.name] = s
-	}
-	// READ is the permissive baseline; it also backstops any command not mapped to
-	// a level (e.g. the DC_* defaults), so tools like condor_ping/condor_who work.
-	sec := secForLevel[server.LevelRead]
-
 	// The collector core -- store, protocol handlers, CONDOR_VIEW_HOST forwarding,
 	// and background dictionary retraining + ad expiry -- exactly as the embeddable
 	// collector library provides it. This daemon wraps it with the condor_master
@@ -140,26 +112,12 @@ func run() error {
 	}
 	// ALLOW_<level>/DENY_<level> authorization for every command on the
 	// command socket (collector protocol, DC_* defaults, embedded CCB and
-	// negotiator), rebuilt on reconfig like the C++ daemons' IpVerify.
-	az, err := newCollectorAuthz(d.Config())
+	// negotiator), with the holes DaemonCore punches for condor_master's
+	// sessions, rebuilt on reconfig like the C++ daemons' IpVerify.
+	az, err := d.NewAuthz(authzOptions())
 	if err != nil {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
-	d.OnReconfig(func(newCfg *config.Config) {
-		if err := az.reload(newCfg); err != nil {
-			log.Error(logging.DestinationSecurity, "reloading authorization policy failed; keeping the previous one", "err", err.Error())
-		}
-	})
-	c, err := newCollector(cfg, sec, secForLevel, backend, az, d.Slog())
-	if err != nil {
-		return err
-	}
-	// Final expiry sweep + backend flush/close at shutdown (runs after the
-	// background loops stop, since it is deferred first).
-	defer func() { _ = c.Close() }()
-	st, srv := c.Store(), c.Server()
-	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
-	d.RegisterDefaultCommands(srv)
 
 	// Command-socket listener: the shared-port endpoint inherited from
 	// condor_master if present, otherwise a plain TCP bind on the collector's
@@ -173,13 +131,26 @@ func run() error {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
-	// Behind a shared port, require the id an FS client reports in its channel
-	// binding to be ours, as C++ checks it against its own command sinful.
-	if sock := d.SharedPortName(); sock != "" {
-		for _, s := range secForLevel {
-			s.SharedPortID = sock
-		}
+
+	// Server-side security policy per authorization level; see
+	// securityForLevels. Built after Listener, so behind a shared port each
+	// policy names our sock id.
+	secForLevel, err := securityForLevels(d)
+	if err != nil {
+		return fmt.Errorf("building security config: %w", err)
 	}
+	// READ is the permissive baseline for a command registered at no level.
+	sec := secForLevel[string(authz.PermRead)]
+	c, err := newCollector(cfg, sec, secForLevel, backend, az, d.Slog())
+	if err != nil {
+		return err
+	}
+	// Final expiry sweep + backend flush/close at shutdown (runs after the
+	// background loops stop, since it is deferred first).
+	defer func() { _ = c.Close() }()
+	st, srv := c.Store(), c.Server()
+	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
+	d.RegisterDefaultCommands(srv)
 
 	// Publish our command address so the rest of the pool (and tools like
 	// condor_status) can find us, exactly like the C++ collector's
@@ -228,14 +199,34 @@ func run() error {
 	log.Info(logging.DestinationGeneral, "golang-collector starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
-	return d.Serve(ctx, ln, serveCommands(srv, az, d.Slog()))
+	return d.Serve(ctx, ln, az.Serve(srv, d.Slog()))
+}
+
+// authzOptions configures the collector's ALLOW_/DENY_ policy: DaemonCore's
+// holes for condor_master's sessions (the default), and the collector
+// commands' names for denial logs.
+func authzOptions() daemon.AuthzOptions {
+	return daemon.AuthzOptions{CommandNames: server.CommandNames()}
+}
+
+// securityForLevels builds the server-side security policy of every
+// authorization level from the HTCondor configuration (SEC_* knobs). As in the
+// C++ collector, each command negotiates under the SEC_<level>_* policy of the
+// level it is registered at (collector.Config.SecurityForLevel): QUERY_*_ADS
+// under READ's (monitoring is public, so condor_status works without daemon
+// credentials), UPDATE_STARTD_AD under ADVERTISE_STARTD's, falling back to
+// DAEMON's, and DC_RECONFIG under ADMINISTRATOR's. Call it after d.Listener.
+func securityForLevels(d *daemon.Daemon) (map[string]*security.SecurityConfig, error) {
+	return seclevel.Build(d.Config(), func(secContext string) (*security.SecurityConfig, error) {
+		return d.ServerSecurityConfig(commands.DC_NOP, secContext)
+	})
 }
 
 // newCollector builds the collector core: the store, protocol handlers,
 // CONDOR_VIEW_HOST forwarding and background maintenance settings, with the
 // per-level security policy and the ALLOW_/DENY_ authorization policy (az)
 // enforced on every command its server dispatches.
-func newCollector(cfg *config.Config, sec *security.SecurityConfig, secForLevel map[string]*security.SecurityConfig, backend store.Backend, az *collectorAuthz, logger *slog.Logger) (*collector.Collector, error) {
+func newCollector(cfg *config.Config, sec *security.SecurityConfig, secForLevel map[string]*security.SecurityConfig, backend store.Backend, az *daemon.Authz, logger *slog.Logger) (*collector.Collector, error) {
 	return collector.New(collector.Config{
 		Security:            sec,
 		SecurityForLevel:    secForLevel,

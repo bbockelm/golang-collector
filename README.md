@@ -198,7 +198,7 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_DICT_RETRAIN_INTERVAL`, `COLLECTOR_DICT_SAMPLE_SIZE` | Compression-dictionary retraining cadence and sample size. |
 | `COLLECTOR_SLOW_OP_MS` | Log a WARN when a single ad update or batch flush blocks at least this long. Default `2000`; `0` disables. |
 | `COLLECTOR_DEBUG_PPROF` | Serve Go `pprof` endpoints under `/debug/pprof/` on the metrics listener. Default off (debugging only). |
-| `SEC_*` | Authentication/encryption policy, exactly as for the C++ collector. |
+| `SEC_*` | Authentication/encryption policy, exactly as for the C++ collector: each command negotiates under the `SEC_<level>_*` settings of the level it is authorized at below, an `ADVERTISE_*` level falling back to `SEC_DAEMON_*` and every level to `SEC_DEFAULT_*`. |
 | `ALLOW_*` / `DENY_*` | Authorization of every command, at the C++ collector's levels: queries at `READ`; startd, schedd/submitter and master ad updates and invalidations at `ADVERTISE_STARTD`, `ADVERTISE_SCHEDD` and `ADVERTISE_MASTER`; private-ad queries and negotiator/accounting ads at `NEGOTIATOR`; other ad types at `DAEMON`; the embedded CCB and negotiator commands at their own levels. Denials are logged as `PERMISSION DENIED` with the command, level, peer, identity and the deciding `ALLOW_`/`DENY_` knob. Reloaded on `condor_reconfig`. |
 
 ### Ad store backends
