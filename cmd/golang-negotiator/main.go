@@ -29,6 +29,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
 	"github.com/bbockelm/golang-collector/negotiator/cycle"
@@ -78,31 +79,6 @@ func run() error {
 	// Route cedar's security/server slog output into NegotiatorLog.
 	slog.SetDefault(d.Slog())
 
-	// Server-side security policy from the HTCondor configuration (SEC_* knobs)
-	// for our own command socket (userprio + RESCHEDULE).
-	sec, err := htcondor.GetServerSecurityConfig(d.Config(), commands.GET_PRIORITY, "DAEMON")
-	if err != nil {
-		return fmt.Errorf("building security config: %w", err)
-	}
-	// FS peers authenticate as user@UID_DOMAIN, as in C++; the
-	// GetServerSecurityConfig helper does not set it.
-	if v, ok := cfg.Get("UID_DOMAIN"); ok {
-		sec.UIDDomain = v
-	}
-	srv := cedarserver.New(sec)
-
-	// Per-command ALLOW_/DENY_ authorization (getters READ, setters
-	// ADMINISTRATOR, SET_PRIORITYFACTOR WRITE, RESCHEDULE DAEMON), exactly
-	// like the C++ negotiator's Register_Command levels.
-	policy, err := authz.NewPolicy(d.Config(), "NEGOTIATOR")
-	if err != nil {
-		return fmt.Errorf("building authorization policy: %w", err)
-	}
-	srv.Authorizer = policy.Authorize
-
-	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
-	d.RegisterDefaultCommands(srv)
-
 	// Command-socket listener: the shared-port endpoint inherited from
 	// condor_master if present, otherwise a plain TCP bind.
 	ln, err := d.Listener(func() (net.Listener, error) {
@@ -113,9 +89,14 @@ func run() error {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
-	// Behind a shared port, require the id an FS client reports in its channel
-	// binding to be ours, as C++ checks it against its own command sinful.
-	sec.SharedPortID = d.SharedPortName()
+
+	// Our command socket's server: security, authorization and the DC_*
+	// commands. Built after Listener, so behind a shared port each security
+	// policy names our sock id.
+	srv, az, err := newCommandServer(d)
+	if err != nil {
+		return err
+	}
 
 	// Publish our command address (NEGOTIATOR_ADDRESS_FILE, default
 	// $(LOG)/.negotiator_address) so condor_userprio and friends can find us
@@ -205,7 +186,7 @@ func run() error {
 		MinInterval:      configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
 		UpdateInterval:   configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
 		CycleStatsLength: configInt(cfg, "NEGOTIATOR_CYCLE_STATS_LENGTH", 3),
-		Authorizer:       policy.Authorize,
+		Authorizer:       az.Authorize,
 		Logger:           d.Slog(),
 	})
 	if err != nil {
@@ -224,7 +205,37 @@ func run() error {
 		"listen", ln.Addr().String(), "collector", collectorHost,
 		"accountant_db", acctCfg.LogFile, "under_master", d.UnderMaster())
 
-	return d.Serve(ctx, ln, srv.Serve)
+	return d.Serve(ctx, ln, az.Serve(srv, d.Slog()))
+}
+
+// newCommandServer builds the command server for the negotiator's own socket
+// (userprio + RESCHEDULE, registered by the caller, and the DC_* commands).
+// Each command negotiates under the SEC_<level>_* policy of the level it is
+// registered at, as in the C++ negotiator, and is authorized by the
+// ALLOW_<level>/DENY_<level> policy (getters READ, setters ADMINISTRATOR,
+// SET_PRIORITYFACTOR WRITE, RESCHEDULE DAEMON, like the C++ negotiator's
+// Register_Command levels) with the holes DaemonCore punches for
+// condor_master's sessions, rebuilt on reconfig. Serve it with the returned
+// Authz's Serve, which logs each denial. Call it after d.Listener.
+func newCommandServer(d *daemon.Daemon) (*cedarserver.Server, *daemon.Authz, error) {
+	secForLevel, err := seclevel.Build(d.Config(), func(secContext string) (*security.SecurityConfig, error) {
+		return d.ServerSecurityConfig(commands.DC_NOP, secContext)
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("building security config: %w", err)
+	}
+	srv := cedarserver.New(secForLevel[string(authz.PermRead)])
+	seclevel.Install(srv, secForLevel)
+
+	az, err := d.NewAuthz(daemon.AuthzOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("building authorization policy: %w", err)
+	}
+	srv.Authorizer = az.Authorize
+
+	// DC_NOP / DC_CONFIG_VAL / etc. so condor_who, condor_ping and condor_config_val work.
+	d.RegisterDefaultCommands(srv)
+	return srv, az, nil
 }
 
 // negotiatorAddr is this negotiator's externally reachable command address: the

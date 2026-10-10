@@ -70,7 +70,7 @@ func TestCommandPermsMatchCpp(t *testing.T) {
 	for _, tbl := range []map[int]store.AdType{updateCommands, queryCommands, invalidateCommands} {
 		for cmd := range tbl {
 			if _, ok := want[cmd]; !ok {
-				t.Errorf("command %d (%s) has no expected level", cmd, CommandName(cmd))
+				t.Errorf("command %d (%s) has no expected level", cmd, commands.GetCommandName(cmd))
 			}
 		}
 	}
@@ -78,10 +78,10 @@ func TestCommandPermsMatchCpp(t *testing.T) {
 	cs := New(store.New(), plaintextSec(), nil)
 	for cmd, perm := range want {
 		if got := CommandPerm(cmd); got != perm {
-			t.Errorf("CommandPerm(%s) = %s, want %s", CommandName(cmd), got, perm)
+			t.Errorf("CommandPerm(%s) = %s, want %s", commands.GetCommandName(cmd), got, perm)
 		}
 		if got := cs.CommandPerms(cmd); len(got) != 1 || got[0] != perm {
-			t.Errorf("%s registered at %v, want [%s]", CommandName(cmd), got, perm)
+			t.Errorf("%s registered at %v, want [%s]", commands.GetCommandName(cmd), got, perm)
 		}
 	}
 }

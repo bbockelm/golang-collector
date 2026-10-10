@@ -4,46 +4,10 @@ package server
 
 import (
 	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/watch"
 	"github.com/bbockelm/golang-htcondor/authz"
 
 	"github.com/bbockelm/golang-collector/store"
 )
-
-// HTCondor DCpermission authorization levels the collector serves commands at.
-const (
-	LevelRead       = "READ"       // public monitoring: QUERY_*_ADS
-	LevelAdvertise  = "ADVERTISE"  // publishing ads: UPDATE_*/INVALIDATE_*
-	LevelNegotiator = "NEGOTIATOR" // private/claim ads: the *_PVT_ADS queries
-)
-
-// CommandLevel returns the security level a collector command is negotiated at:
-// ordinary QUERY_*_ADS at READ (monitoring is public, so condor_status works
-// without daemon credentials), the private-ad queries at NEGOTIATOR (claim ids
-// are secret), and updates and invalidations at ADVERTISE (only authenticated
-// daemons may publish or expire ads). Unknown commands default to READ (the
-// least-privileged, read-only level). Callers use it to select the per-command
-// security policy to negotiate; authorization uses the finer CommandPerm.
-func CommandLevel(cmd int) string {
-	switch cmd {
-	case commands.QUERY_STARTD_PVT_ADS, commands.QUERY_MULTIPLE_PVT_ADS:
-		return LevelNegotiator
-	case commands.UPDATE_STARTD_AD_WITH_ACK:
-		return LevelAdvertise
-	case commands.QUERY_MULTIPLE_ADS, watch.WatchAds:
-		return LevelRead
-	}
-	if _, ok := updateCommands[cmd]; ok {
-		return LevelAdvertise
-	}
-	if _, ok := invalidateCommands[cmd]; ok {
-		return LevelAdvertise
-	}
-	if _, ok := queryCommands[cmd]; ok {
-		return LevelRead
-	}
-	return LevelRead
-}
 
 // CommandPerm returns the HTCondor authorization level (DCpermission) a
 // collector command is registered at, the level an identity must hold in the
@@ -58,13 +22,14 @@ func CommandPerm(cmd int) string {
 	return string(authz.PermRead)
 }
 
-// CommandName returns the name of a collector command, or cedar's name for
-// any other command, or "" if neither knows it.
-func CommandName(cmd int) string {
-	if c, ok := collectorCommands[cmd]; ok {
-		return c.name
+// CommandNames returns the name of every collector command, by number, for
+// naming the commands in denial logs (daemon.AuthzOptions.CommandNames).
+func CommandNames() map[int]string {
+	names := make(map[int]string, len(collectorCommands))
+	for cmd, c := range collectorCommands {
+		names[cmd] = c.name
 	}
-	return commands.GetCommandName(cmd)
+	return names
 }
 
 // commandInfo is a collector command's name and authorization level.

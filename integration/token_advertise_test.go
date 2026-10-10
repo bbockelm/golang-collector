@@ -1,12 +1,14 @@
 // Per-authorization-level security against a standalone htc-collector, exercised
 // with the real C++ client tools. This is the deployment story that motivated
 // per-level negotiation: monitoring (READ) is public so condor_status works with
-// no credentials, while publishing (ADVERTISE) requires an authenticated,
-// encrypted session -- here an HTCondor IDTOKEN -- and an identity the
-// ALLOW_ADVERTISE_STARTD list admits. We assert all four arms:
+// no credentials, while publishing (ADVERTISE_STARTD, which takes the
+// SEC_DAEMON_* policy when no SEC_ADVERTISE_STARTD_* is set, as in C++)
+// requires an authenticated, encrypted session -- here an HTCondor IDTOKEN --
+// and an identity the ALLOW_ADVERTISE_STARTD list admits. We assert all four
+// arms:
 //
 //   - condor_status (READ) succeeds unauthenticated and sees the pool;
-//   - condor_advertise (ADVERTISE) with a valid IDTOKEN + encryption succeeds;
+//   - condor_advertise (ADVERTISE_STARTD) with a valid IDTOKEN + encryption succeeds;
 //   - condor_advertise WITHOUT a token is refused;
 //   - condor_advertise with a valid IDTOKEN for an identity outside
 //     ALLOW_ADVERTISE_STARTD is refused, and the collector logs the denial.
@@ -90,8 +92,8 @@ TRUST_DOMAIN = %s
 	}
 	writeFile(t, filepath.Join(intruderTokenDir, "intruder.token"), out)
 
-	// --- Collector: READ permissive (unauthenticated condor_status), ADVERTISE
-	// requires IDTOKENS auth + encryption + integrity.
+	// --- Collector: READ permissive (unauthenticated condor_status), DAEMON --
+	// and so ADVERTISE_STARTD -- requires IDTOKENS auth + encryption + integrity.
 	port := freePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	collDir := filepath.Join(tmp, "coll")
@@ -112,11 +114,11 @@ SEC_TOKEN_POOL_SIGNING_KEY_FILE = %s
 TRUST_DOMAIN = %s
 SEC_DEFAULT_AUTHENTICATION = OPTIONAL
 SEC_READ_AUTHENTICATION = OPTIONAL
-SEC_ADVERTISE_AUTHENTICATION = REQUIRED
-SEC_ADVERTISE_ENCRYPTION = REQUIRED
-SEC_ADVERTISE_INTEGRITY = REQUIRED
+SEC_DAEMON_AUTHENTICATION = REQUIRED
+SEC_DAEMON_ENCRYPTION = REQUIRED
+SEC_DAEMON_INTEGRITY = REQUIRED
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
-SEC_ADVERTISE_AUTHENTICATION_METHODS = IDTOKENS
+SEC_DAEMON_AUTHENTICATION_METHODS = IDTOKENS
 SEC_DEFAULT_CRYPTO_METHODS = AES
 ALLOW_READ = *
 ALLOW_ADVERTISE_STARTD = advertise@%s
@@ -177,7 +179,7 @@ SEC_DEFAULT_CRYPTO_METHODS = AES
 	}
 	t.Log("condor_status (unauthenticated READ) sees the token-advertised ad")
 
-	// Arm 3: advertise WITHOUT a token must be refused (ADVERTISE requires auth).
+	// Arm 3: advertise WITHOUT a token must be refused (ADVERTISE_STARTD requires auth).
 	emptyTokens := filepath.Join(tmp, "empty.d")
 	if err := os.MkdirAll(emptyTokens, 0o700); err != nil {
 		t.Fatal(err)

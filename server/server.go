@@ -44,8 +44,9 @@ func Register(cs *cedarserver.Server, st store.Backend, fwd *Forwarder) {
 	// the level of the same command in the C++ collector: QUERY_*_ADS at READ,
 	// private-ad queries at NEGOTIATOR, each UPDATE_*/INVALIDATE_* at its ad type's
 	// ADVERTISE_*, NEGOTIATOR or DAEMON level. When the server has an Authorizer,
-	// cedar checks the peer against that level before dispatching every command.
-	// The security policy to negotiate is chosen separately (CommandLevel).
+	// cedar checks the peer against that level before dispatching every command,
+	// and a server with per-level security policies negotiates the command
+	// under that level's (see collector.Config.SecurityForLevel).
 	for cmd, t := range updateCommands {
 		cs.Handle(cmd, updateHandler(st, t, cmd, fwd), CommandPerm(cmd))
 	}
@@ -186,6 +187,15 @@ func ackUpdateHandler(st store.Backend, t store.AdType, fwd *Forwarder) cedarser
 		text, err := msg.GetClassAdRaw(ctx)
 		if err != nil {
 			return err
+		}
+		// A startd sends its private ad after the public one, in the same
+		// message (Resource::update_with_ack). The C++ collector does not store
+		// it on this command -- receive_update_expect_ack calls collect()
+		// without the socket the private ad would be read from -- so the
+		// private table keeps what the last UPDATE_STARTD_AD stored. Read it
+		// anyway, so the next command on this connection starts aligned.
+		if t == store.StartdAd {
+			_, _ = msg.GetClassAdRaw(ctx)
 		}
 		if err := store.DurableUpdate(ctx, st, t, text); err != nil {
 			return err
