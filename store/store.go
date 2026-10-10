@@ -11,6 +11,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // DefaultLifetime is the ad lifetime (seconds) used for expiration when an ad
@@ -278,11 +279,18 @@ func parseConstraint(constraint string) (*vm.Query, error) {
 	if s == "" || strings.EqualFold(s, "true") {
 		return nil, nil
 	}
-	q, err := vm.Parse(s)
+	expr, err := parser.ParseExpr(s)
 	if err != nil {
 		return nil, fmt.Errorf("collector: constraint %q: %w", constraint, err)
 	}
-	return q, nil
+	// A collector constraint is evaluated against a single candidate ad; HTCondor
+	// resolves TARGET against that ad (e.g. a startd invalidate's
+	// `Requirements = TARGET.Name == "<name>"`). The scan has no match target, so
+	// rewrite TARGET references to unscoped ones -- otherwise they resolve to
+	// undefined and the constraint (notably a forwarded invalidation) matches
+	// nothing. See demoteTargetToSelf.
+	demoteTargetToSelf(expr)
+	return vm.Compile(expr), nil
 }
 
 // Query yields every ad in table t matching constraint (a ClassAd expression, or
