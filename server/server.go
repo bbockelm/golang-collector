@@ -40,30 +40,31 @@ func New(st store.Backend, sec *security.SecurityConfig, fwd *Forwarder) *cedars
 // collectors. It registers only the collector protocol; DC_* default commands (NOP,
 // CONFIG_VAL, ...) are the host's responsibility.
 func Register(cs *cedarserver.Server, st store.Backend, fwd *Forwarder) {
-	// Every command is registered at its HTCondor authorization level (CommandLevel):
-	// QUERY_*_ADS at READ, UPDATE_*/INVALIDATE_* at ADVERTISE, private-ad queries at
-	// NEGOTIATOR. The cedar server uses these both to authorize a session per command
-	// and (via SecurityConfigForCommand) to negotiate each command at its own level --
-	// so monitoring (READ) can be permissive while publishing (ADVERTISE) requires auth.
+	// Every command is registered at its HTCondor authorization level (CommandPerm),
+	// the level of the same command in the C++ collector: QUERY_*_ADS at READ,
+	// private-ad queries at NEGOTIATOR, each UPDATE_*/INVALIDATE_* at its ad type's
+	// ADVERTISE_*, NEGOTIATOR or DAEMON level. When the server has an Authorizer,
+	// cedar checks the peer against that level before dispatching every command.
+	// The security policy to negotiate is chosen separately (CommandLevel).
 	for cmd, t := range updateCommands {
-		cs.Handle(cmd, updateHandler(st, t, cmd, fwd), CommandLevel(cmd))
+		cs.Handle(cmd, updateHandler(st, t, cmd, fwd), CommandPerm(cmd))
 	}
 	// UPDATE_STARTD_AD_WITH_ACK: the sender blocks for a one-int acknowledgment
 	// that the ad was stored.
-	cs.Handle(commands.UPDATE_STARTD_AD_WITH_ACK, ackUpdateHandler(st, store.StartdAd, fwd), CommandLevel(commands.UPDATE_STARTD_AD_WITH_ACK))
+	cs.Handle(commands.UPDATE_STARTD_AD_WITH_ACK, ackUpdateHandler(st, store.StartdAd, fwd), CommandPerm(commands.UPDATE_STARTD_AD_WITH_ACK))
 	for cmd, t := range queryCommands {
-		cs.Handle(cmd, queryHandler(st, t), CommandLevel(cmd))
+		cs.Handle(cmd, queryHandler(st, t), CommandPerm(cmd))
 	}
 	// QUERY_MULTIPLE_ADS / QUERY_MULTIPLE_PVT_ADS: one query ad names several
 	// target types (TargetType is a list) with optional per-type constraints; the
 	// negotiator uses these every cycle to fetch Submitter + Machine ads at once.
-	cs.Handle(commands.QUERY_MULTIPLE_ADS, multiQueryHandler(st), CommandLevel(commands.QUERY_MULTIPLE_ADS))
-	cs.Handle(commands.QUERY_MULTIPLE_PVT_ADS, multiQueryHandler(st), CommandLevel(commands.QUERY_MULTIPLE_PVT_ADS))
+	cs.Handle(commands.QUERY_MULTIPLE_ADS, multiQueryHandler(st), CommandPerm(commands.QUERY_MULTIPLE_ADS))
+	cs.Handle(commands.QUERY_MULTIPLE_PVT_ADS, multiQueryHandler(st), CommandPerm(commands.QUERY_MULTIPLE_PVT_ADS))
 	for cmd, t := range invalidateCommands {
-		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd), CommandLevel(cmd))
+		cs.Handle(cmd, invalidateHandler(st, t, cmd, fwd), CommandPerm(cmd))
 	}
 	// WatchAds: subscribe to a table's change stream (resumable, cursor-based).
-	cs.Handle(watch.WatchAds, watchHandler(st), CommandLevel(watch.WatchAds))
+	cs.Handle(watch.WatchAds, watchHandler(st), CommandPerm(watch.WatchAds))
 }
 
 // updateHandler stores one ad update into table t. Each ad is its own command

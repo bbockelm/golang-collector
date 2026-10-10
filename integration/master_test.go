@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,6 +43,13 @@ func TestGoCollectorUnderCondorMaster(t *testing.T) {
 	build := exec.Command("go", "build", "-buildvcs=false", "-o", collBin, "../cmd/golang-collector")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building golang-collector: %v\n%s", err, out)
+	}
+
+	// The daemons run as the test's own account, so that account stands in for
+	// "condor" in the authorization lists below.
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	extra := fmt.Sprintf(`
@@ -77,7 +85,18 @@ KILL = FALSE
 RUNBENCHMARKS = FALSE
 NEGOTIATOR_INTERVAL = 5
 NEGOTIATOR_MIN_INTERVAL = 1
-`, collBin)
+
+# --- Authorization: the lists of "use SECURITY:recommended_v9_0", with this ---
+# --- test's account as the daemon account. The Go collector enforces them on ---
+# --- every command: startds and schedds advertise under ADVERTISE_* (falling ---
+# --- back to DAEMON), the negotiator reads private ads under NEGOTIATOR, and ---
+# --- condor_status reads under READ. ---
+ALLOW_READ = *
+ALLOW_WRITE = *
+ALLOW_DAEMON = %[2]s@* condor@* condor_pool@*
+ALLOW_NEGOTIATOR = %[2]s@* condor@* condor_pool@*
+ALLOW_ADMINISTRATOR = %[2]s@* condor@* condor_pool@*
+`, collBin, me.Username)
 
 	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
 	defer h.Shutdown()

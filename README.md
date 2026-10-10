@@ -140,6 +140,10 @@ Notes:
 - **Leave security alone.** `htc-collector` inherits the pool's `SEC_*` policy; it
   interoperates on a normal pool (AES with `IDTOKENS`/`FS`). Do not hand-craft a
   separate security config for it.
+- **Authorization applies to forwarded ads.** The stock collector forwards under
+  its own daemon identity, so the view daemon's `ALLOW_DAEMON` (or
+  `ALLOW_ADVERTISE_*`) and `ALLOW_NEGOTIATOR` (negotiator and accounting ads) must
+  admit it. The recommended policy (`condor@*`, `condor_pool@*`) does.
 - **Nothing about the stock collector changes** except the three
   `CONDOR_VIEW_HOST` / `UPDATE_VIEW_COLLECTOR_WITH_TCP` / `CONDOR_VIEW_CLASSAD_TYPES`
   lines, which are read only by the `COLLECTOR` subsystem; the `HTCVIEW.`-scoped
@@ -195,6 +199,7 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_SLOW_OP_MS` | Log a WARN when a single ad update or batch flush blocks at least this long. Default `2000`; `0` disables. |
 | `COLLECTOR_DEBUG_PPROF` | Serve Go `pprof` endpoints under `/debug/pprof/` on the metrics listener. Default off (debugging only). |
 | `SEC_*` | Authentication/encryption policy, exactly as for the C++ collector. |
+| `ALLOW_*` / `DENY_*` | Authorization of every command, at the C++ collector's levels: queries at `READ`; startd, schedd/submitter and master ad updates and invalidations at `ADVERTISE_STARTD`, `ADVERTISE_SCHEDD` and `ADVERTISE_MASTER`; private-ad queries and negotiator/accounting ads at `NEGOTIATOR`; other ad types at `DAEMON`; the embedded CCB and negotiator commands at their own levels. Denials are logged as `PERMISSION DENIED` with the command, level, peer, identity and the deciding `ALLOW_`/`DENY_` knob. Reloaded on `condor_reconfig`. |
 
 ### Ad store backends
 

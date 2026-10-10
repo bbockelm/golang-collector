@@ -29,7 +29,6 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
-	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
@@ -119,6 +118,11 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("building %s security config: %w", lvl.name, err)
 		}
+		// FS peers authenticate as user@UID_DOMAIN, as in C++; the
+		// GetServerSecurityConfig helper does not set it.
+		if v, ok := cfg.Get("UID_DOMAIN"); ok {
+			s.UIDDomain = v
+		}
 		secForLevel[lvl.name] = s
 	}
 	// READ is the permissive baseline; it also backstops any command not mapped to
@@ -134,16 +138,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	c, err := collector.New(collector.Config{
-		Security:            sec,
-		SecurityForLevel:    secForLevel,
-		Backend:             backend, // nil selects the default in-memory store
-		ViewHosts:           viewHosts(cfg),
-		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
-		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
-		ExpireInterval:      configSeconds(cfg, "COLLECTOR_UPDATE_INTERVAL", 900*time.Second),
-		Logger:              d.Slog(),
+	// ALLOW_<level>/DENY_<level> authorization for every command on the
+	// command socket (collector protocol, DC_* defaults, embedded CCB and
+	// negotiator), rebuilt on reconfig like the C++ daemons' IpVerify.
+	az, err := newCollectorAuthz(d.Config())
+	if err != nil {
+		return fmt.Errorf("building authorization policy: %w", err)
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if err := az.reload(newCfg); err != nil {
+			log.Error(logging.DestinationSecurity, "reloading authorization policy failed; keeping the previous one", "err", err.Error())
+		}
 	})
+	c, err := newCollector(cfg, sec, secForLevel, backend, az, d.Slog())
 	if err != nil {
 		return err
 	}
@@ -166,6 +173,13 @@ func run() error {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
+	// Behind a shared port, require the id an FS client reports in its channel
+	// binding to be ours, as C++ checks it against its own command sinful.
+	if sock := d.SharedPortName(); sock != "" {
+		for _, s := range secForLevel {
+			s.SharedPortID = sock
+		}
+	}
 
 	// Publish our command address so the rest of the pool (and tools like
 	// condor_status) can find us, exactly like the C++ collector's
@@ -187,7 +201,7 @@ func run() error {
 	// Optional embedded negotiator (NEGOTIATOR_EMBEDDED), reading this
 	// collector's ad store directly and serving the userprio/RESCHEDULE
 	// protocol on the same command socket.
-	if err := maybeStartEmbeddedNegotiator(ctx, d, cfg, srv, st, collectorAddr(d, ln)); err != nil {
+	if err := maybeStartEmbeddedNegotiator(ctx, d, cfg, srv, st, collectorAddr(d, ln), az.Authorize); err != nil {
 		return err
 	}
 
@@ -214,7 +228,25 @@ func run() error {
 	log.Info(logging.DestinationGeneral, "golang-collector starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
-	return d.Serve(ctx, ln, srv.Serve)
+	return d.Serve(ctx, ln, serveCommands(srv, az, d.Slog()))
+}
+
+// newCollector builds the collector core: the store, protocol handlers,
+// CONDOR_VIEW_HOST forwarding and background maintenance settings, with the
+// per-level security policy and the ALLOW_/DENY_ authorization policy (az)
+// enforced on every command its server dispatches.
+func newCollector(cfg *config.Config, sec *security.SecurityConfig, secForLevel map[string]*security.SecurityConfig, backend store.Backend, az *collectorAuthz, logger *slog.Logger) (*collector.Collector, error) {
+	return collector.New(collector.Config{
+		Security:            sec,
+		SecurityForLevel:    secForLevel,
+		Backend:             backend, // nil selects the default in-memory store
+		ViewHosts:           viewHosts(cfg),
+		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),
+		DictSampleSize:      configInt(cfg, "COLLECTOR_DICT_SAMPLE_SIZE", 4000),
+		ExpireInterval:      configSeconds(cfg, "COLLECTOR_UPDATE_INTERVAL", 900*time.Second),
+		Authorizer:          az.Authorize,
+		Logger:              logger,
+	})
 }
 
 // viewHosts returns the CONDOR_VIEW_HOST collector addresses to forward to,
@@ -270,7 +302,8 @@ func collectorAddr(d *daemon.Daemon, ln net.Listener) string {
 // command socket when ENABLE_CCB_SERVER is set, mirroring the C++ collector. It
 // registers the CCB handlers onto srv (so CCB commands arrive on the shared port)
 // and starts CCB background maintenance under ctx. pubAddr is the collector's
-// reachable address, used to build the "<addr>#<id>" CCB contact strings.
+// reachable address, used to build the "<addr>#<id>" CCB contact strings. The
+// CCB commands are authorized by srv's Authorizer, like the collector's own.
 func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Config, sec *security.SecurityConfig, srv *cedarserver.Server, pubAddr string) error {
 	if !configBool(cfg, "ENABLE_CCB_SERVER", false) {
 		return nil
@@ -301,7 +334,10 @@ func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Co
 // $(SPOOL)/GoAccountant.log — the Go-native transaction-log format, NOT the
 // C++ Accountantnew.log ClassAdLog (whose importer is deferred; design doc
 // 3.4). Point the knob at a fresh path when migrating from a C++ negotiator.
-func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st store.Backend, pubAddr string) error {
+//
+// authorize is the collector's ALLOW_/DENY_ policy, which srv already applies
+// to every command it dispatches; the negotiator's handlers check it too.
+func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *cedarserver.Server, st store.Backend, pubAddr string, authorize func(perm, peerAddr, user string) bool) error {
 	if !configBool(cfg, "NEGOTIATOR_EMBEDDED", false) {
 		return nil
 	}
@@ -342,14 +378,6 @@ func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *co
 		return fmt.Errorf("embedded negotiator: %w", err)
 	}
 
-	// Per-command ALLOW_/DENY_ authorization for the userprio setters
-	// (enforced inside the negotiator's handlers; the collector's own
-	// handlers are unaffected).
-	policy, err := authz.NewPolicy(cfg, "NEGOTIATOR")
-	if err != nil {
-		return fmt.Errorf("embedded negotiator: authorization policy: %w", err)
-	}
-
 	neg, err := negotiator.New(negotiator.Config{
 		Source:         adSrc,
 		Accountant:     acct,
@@ -360,7 +388,7 @@ func maybeStartEmbeddedNegotiator(ctx context.Context, d *daemon.Daemon, cfg *co
 		CycleDelay:     configSeconds(cfg, "NEGOTIATOR_CYCLE_DELAY", 20*time.Second),
 		MinInterval:    configSeconds(cfg, "NEGOTIATOR_MIN_INTERVAL", 5*time.Second),
 		UpdateInterval: configSeconds(cfg, "NEGOTIATOR_UPDATE_INTERVAL", 300*time.Second),
-		Authorizer:     policy.Authorize,
+		Authorizer:     authorize,
 		Logger:         d.Slog(),
 	})
 	if err != nil {
