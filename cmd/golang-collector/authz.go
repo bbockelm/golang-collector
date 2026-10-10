@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/bbockelm/cedar/commands"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/golang-htcondor/authz"
 
@@ -32,6 +33,22 @@ type authzState struct {
 
 // authzSubsys is the subsystem whose ALLOW_<level>_<subsys> variants apply.
 const authzSubsys = "COLLECTOR"
+
+// punchedHoles are the levels C++ DaemonCore grants the identities of the
+// sessions condor_master shares with its children whatever ALLOW_/DENY_ say
+// (IpVerify::PunchHole in daemon_core.cpp: the inherited parent session at
+// ~9364-9366, the family session at ~9421-9427), with the levels each one
+// implies. Without them a restrictive ALLOW_ADMINISTRATOR would refuse
+// condor_master's own DC_RECONFIG and DC_OFF. cedar attributes these
+// identities only to a peer resuming the inherited session.
+var punchedHoles = map[string][]authz.Perm{
+	"condor@family": {
+		authz.PermAdministrator, authz.PermDaemon, authz.PermNegotiator,
+		authz.PermAdvertiseMaster, authz.PermAdvertiseSchedd, authz.PermAdvertiseStartd,
+		authz.PermWrite, authz.PermRead,
+	},
+	"condor@parent": {authz.PermAdministrator, authz.PermDaemon, authz.PermWrite, authz.PermRead},
+}
 
 func newCollectorAuthz(cfg authz.ConfigGetter) (*collectorAuthz, error) {
 	a := &collectorAuthz{}
@@ -56,6 +73,11 @@ func (a *collectorAuthz) reload(cfg authz.ConfigGetter) error {
 // authorization level perm. It has the signature of cedar's
 // Server.Authorizer.
 func (a *collectorAuthz) Authorize(perm, peerAddr, user string) bool {
+	for _, p := range punchedHoles[user] {
+		if string(p) == perm {
+			return true
+		}
+	}
 	return a.cur.Load().policy.Authorize(perm, peerAddr, user)
 }
 
@@ -81,15 +103,38 @@ func (a *collectorAuthz) policyKnob(prefix, perm string) string {
 }
 
 // refusedRE matches the error cedar's Server.ServeConn returns when the
-// Authorizer refuses a command: it names the command and the identity. The
-// denial tests in authz_test.go fail if cedar changes that wording.
-var refusedRE = regexp.MustCompile(`command (\d+) \([^)]*\) refused: identity ("(?:[^"\\]|\\.)*") is not authorized`)
+// Authorizer refuses a command: it names the command and the identity, which
+// is unauthenticated@unmapped for a peer that did not authenticate.
+// limitedRE matches the one it returns when the command's levels are outside
+// the authorization limits of the peer's credential (an IDTOKEN's
+// condor:/<LEVEL> scopes), which cedar checks before the Authorizer. The
+// denial tests in authz_test.go fail if cedar changes either wording.
+var (
+	refusedRE = regexp.MustCompile(`command (\d+) \([^)]*\) refused: identity ("(?:[^"\\]|\\.)*") is not authorized`)
+	limitedRE = regexp.MustCompile(`command (\d+) \([^)]*\) refused: authorization levels \[([^\]]*)\] are outside the session's authorization limits \[([^\]]*)\]`)
+)
 
-// logDenial logs err if it is a command the authorization policy refused,
-// with the command, its authorization level, the peer, the identity, and
-// the ALLOW_/DENY_ settings that decide that level.
+// logDenial logs err if it is a command refused for authorization: by the
+// ALLOW_/DENY_ policy, with the command, its authorization level, the peer,
+// the identity and the settings that decide that level; or by the peer's
+// authorization limits, with the command, level, peer and those limits.
 func (a *collectorAuthz) logDenial(log *slog.Logger, srv *cedarserver.Server, peerAddr string, err error) {
-	m := refusedRE.FindStringSubmatch(err.Error())
+	msg := err.Error()
+	if m := limitedRE.FindStringSubmatch(msg); m != nil {
+		cmd, convErr := strconv.Atoi(m[1])
+		if convErr != nil {
+			return
+		}
+		log.Warn("PERMISSION DENIED",
+			"command", commandName(cmd),
+			"command_id", cmd,
+			"level", strings.Join(strings.Fields(m[2]), ","),
+			"peer", peerAddr,
+			"authorization_limits", strings.Join(strings.Fields(m[3]), ","),
+			"destination", "security")
+		return
+	}
+	m := refusedRE.FindStringSubmatch(msg)
 	if m == nil {
 		return
 	}
@@ -100,9 +145,6 @@ func (a *collectorAuthz) logDenial(log *slog.Logger, srv *cedarserver.Server, pe
 	user, convErr := strconv.Unquote(m[2])
 	if convErr != nil {
 		return
-	}
-	if user == "" {
-		user = "unauthenticated"
 	}
 	perms := srv.CommandPerms(cmd)
 	var allow, deny []string
@@ -116,12 +158,8 @@ func (a *collectorAuthz) logDenial(log *slog.Logger, srv *cedarserver.Server, pe
 			deny = append(deny, k)
 		}
 	}
-	name := server.CommandName(cmd)
-	if name == "" {
-		name = m[1]
-	}
 	log.Warn("PERMISSION DENIED",
-		"command", name,
+		"command", commandName(cmd),
 		"command_id", cmd,
 		"level", strings.Join(perms, ","),
 		"peer", peerAddr,
@@ -129,6 +167,31 @@ func (a *collectorAuthz) logDenial(log *slog.Logger, srv *cedarserver.Server, pe
 		"allow_knob", strings.Join(allow, ","),
 		"deny_knob", strings.Join(deny, ","),
 		"destination", "security")
+}
+
+// dcCommandNames names the DaemonCore commands this socket serves (see
+// daemon.RegisterDefaultCommands) that cedar's command table does not.
+var dcCommandNames = map[int]string{
+	commands.DC_NOP:            "DC_NOP",
+	commands.DC_NOP_READ:       "DC_NOP_READ",
+	commands.DC_NOP_WRITE:      "DC_NOP_WRITE",
+	commands.DC_NOP_NEGOTIATOR: "DC_NOP_NEGOTIATOR",
+	commands.DC_RECONFIG:       "DC_RECONFIG",
+	commands.DC_RECONFIG_FULL:  "DC_RECONFIG_FULL",
+	commands.DC_OFF_GRACEFUL:   "DC_OFF_GRACEFUL",
+	commands.DC_OFF_PEACEFUL:   "DC_OFF_PEACEFUL",
+	commands.DC_OFF_FAST:       "DC_OFF_FAST",
+}
+
+// commandName returns cmd's HTCondor name, or its number if it has none.
+func commandName(cmd int) string {
+	if n := server.CommandName(cmd); n != "" {
+		return n
+	}
+	if n, ok := dcCommandNames[cmd]; ok {
+		return n
+	}
+	return strconv.Itoa(cmd)
 }
 
 // serveCommands returns a serve loop for srv: like cedar's Server.Serve, it

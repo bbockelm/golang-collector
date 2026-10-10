@@ -16,6 +16,7 @@ import (
 	"github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
+	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
 
@@ -71,6 +72,13 @@ func (s *stubCycle) wait(t *testing.T, ctx context.Context, what string) time.Ti
 // accountant, and a stub cycle, and serves it on its own cedar server.
 func newDaemon(t *testing.T, ctx context.Context, authorizer func(string, string, string) bool, cfgMut func(*negotiator.Config)) (addr string, acct *accountant.Accountant, neg *negotiator.Negotiator) {
 	t.Helper()
+	return newDaemonWithSecurity(t, ctx, authorizer, negtest.ServerSecurity(), cfgMut)
+}
+
+// newDaemonWithSecurity is newDaemon with the cedar server's security policy
+// sec.
+func newDaemonWithSecurity(t *testing.T, ctx context.Context, authorizer func(string, string, string) bool, sec *security.SecurityConfig, cfgMut func(*negotiator.Config)) (addr string, acct *accountant.Accountant, neg *negotiator.Negotiator) {
+	t.Helper()
 	st := store.New()
 	src, err := source.NewEmbedded(st, source.Config{})
 	if err != nil {
@@ -97,7 +105,7 @@ func newDaemon(t *testing.T, ctx context.Context, authorizer func(string, string
 		t.Fatal(err)
 	}
 
-	srv := cedarserver.New(negtest.ServerSecurity())
+	srv := cedarserver.New(sec)
 	neg.RegisterOn(srv)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

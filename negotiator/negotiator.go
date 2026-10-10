@@ -252,15 +252,13 @@ func (n *Negotiator) handle(cs *cedarserver.Server, cmd int, fn cedarserver.Hand
 }
 
 // authorize applies the configured policy for the connection's command,
-// verifying the peer's authenticated identity against the given levels.
+// verifying the peer's identity (unauthenticated@unmapped for a peer that did
+// not authenticate, as cedar's dispatch check uses) against the given levels.
 func (n *Negotiator) authorize(c *cedarserver.Conn, perms []string) error {
 	if n.cfg.Authorizer == nil {
 		return nil
 	}
-	user := ""
-	if c.Negotiation != nil {
-		user = c.Negotiation.User
-	}
+	user := c.AuthorizationUser()
 	for _, perm := range perms {
 		if n.cfg.Authorizer(perm, c.RemoteAddr, user) {
 			return nil
@@ -488,9 +486,15 @@ func (n *Negotiator) handleSetPriorityFactor(ctx context.Context, c *cedarserver
 		return fmt.Errorf("negotiator: SET_PRIORITYFACTOR: reading factor: %w", err)
 	}
 
+	// ADMINISTRATOR must also be within the peer credential's authorization
+	// limits: cedar checked only the registered WRITE level against them
+	// (matchmaker.cpp:1153, isAuthorizationInBoundingSet("ADMINISTRATOR")).
 	errCode := 0
 	errString := ""
-	if err := n.authorize(c, []string{"ADMINISTRATOR"}); err != nil {
+	if !c.InAuthorizationBoundingSet("ADMINISTRATOR") {
+		errCode = 4
+		errString = fmt.Sprintf("client is not authorized to set the priority factor of %s", submitter)
+	} else if err := n.authorize(c, []string{"ADMINISTRATOR"}); err != nil {
 		errCode = 4 // the C++ errstack code for "not authorized"
 		errString = fmt.Sprintf("client is not authorized to set the priority factor of %s", submitter)
 	} else if err := n.cfg.Accountant.SetPriorityFactor(submitter, factor); err != nil {

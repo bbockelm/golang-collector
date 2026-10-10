@@ -118,6 +118,11 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("building %s security config: %w", lvl.name, err)
 		}
+		// FS peers authenticate as user@UID_DOMAIN, as in C++; the
+		// GetServerSecurityConfig helper does not set it.
+		if v, ok := cfg.Get("UID_DOMAIN"); ok {
+			s.UIDDomain = v
+		}
 		secForLevel[lvl.name] = s
 	}
 	// READ is the permissive baseline; it also backstops any command not mapped to
@@ -168,6 +173,13 @@ func run() error {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
+	// Behind a shared port, require the id an FS client reports in its channel
+	// binding to be ours, as C++ checks it against its own command sinful.
+	if sock := d.SharedPortName(); sock != "" {
+		for _, s := range secForLevel {
+			s.SharedPortID = sock
+		}
+	}
 
 	// Publish our command address so the rest of the pool (and tools like
 	// condor_status) can find us, exactly like the C++ collector's

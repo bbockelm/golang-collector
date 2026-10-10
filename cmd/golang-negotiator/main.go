@@ -84,6 +84,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
+	// FS peers authenticate as user@UID_DOMAIN, as in C++; the
+	// GetServerSecurityConfig helper does not set it.
+	if v, ok := cfg.Get("UID_DOMAIN"); ok {
+		sec.UIDDomain = v
+	}
 	srv := cedarserver.New(sec)
 
 	// Per-command ALLOW_/DENY_ authorization (getters READ, setters
@@ -108,6 +113,9 @@ func run() error {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
+	// Behind a shared port, require the id an FS client reports in its channel
+	// binding to be ours, as C++ checks it against its own command sinful.
+	sec.SharedPortID = d.SharedPortName()
 
 	// Publish our command address (NEGOTIATOR_ADDRESS_FILE, default
 	// $(LOG)/.negotiator_address) so condor_userprio and friends can find us

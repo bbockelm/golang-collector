@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,8 +15,11 @@ import (
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
+	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/bbockelm/golang-htcondor/daemon"
+	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-collector/store"
 )
@@ -32,6 +36,8 @@ const testTrustDomain = "pool"
 type authzCollector struct {
 	addr    string
 	keyDir  string
+	cache   *security.SessionCache
+	srv     *cedarserver.Server
 	az      *collectorAuthz
 	st      store.Backend
 	records chan slog.Record
@@ -46,7 +52,9 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 	if err := security.GeneratePoolSigningKey(filepath.Join(keyDir, "POOL")); err != nil {
 		t.Fatal(err)
 	}
+	cache := security.NewSessionCache()
 	sec := &security.SecurityConfig{
+		SessionCache:            cache,
 		AuthMethods:             []security.AuthMethod{security.AuthToken},
 		Authentication:          security.SecurityOptional,
 		CryptoMethods:           []security.CryptoMethod{security.CryptoAES},
@@ -86,7 +94,7 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 		cancel()
 		<-done
 	})
-	return &authzCollector{addr: ln.Addr().String(), keyDir: keyDir, az: az, st: c.Store(), records: records}
+	return &authzCollector{addr: ln.Addr().String(), keyDir: keyDir, cache: cache, srv: c.Server(), az: az, st: c.Store(), records: records}
 }
 
 // as returns a client security config that authenticates as identity with an
@@ -94,6 +102,13 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 // Each config carries its own session cache, so no session (and so no
 // identity) is reused across clients.
 func (ac *authzCollector) as(t *testing.T, identity string) *security.SecurityConfig {
+	t.Helper()
+	return ac.limitedAs(t, identity, nil)
+}
+
+// limitedAs is as with an IDTOKEN whose authorization is limited to the
+// levels limits (its condor:/<LEVEL> scopes); nil means unlimited.
+func (ac *authzCollector) limitedAs(t *testing.T, identity string, limits []string) *security.SecurityConfig {
 	t.Helper()
 	if identity == "" {
 		return &security.SecurityConfig{
@@ -105,7 +120,7 @@ func (ac *authzCollector) as(t *testing.T, identity string) *security.SecurityCo
 		}
 	}
 	now := time.Now().Unix()
-	tok, err := security.GenerateJWT(ac.keyDir, "POOL", identity, testTrustDomain, now, now+3600, nil)
+	tok, err := security.GenerateJWT(ac.keyDir, "POOL", identity, testTrustDomain, now, now+3600, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +133,34 @@ func (ac *authzCollector) as(t *testing.T, identity string) *security.SecurityCo
 		Token:          tok,
 		TrustDomain:    testTrustDomain,
 		SessionCache:   security.NewSessionCache(),
+	}
+}
+
+// session returns a client security config for a peer the collector knows as
+// identity through a session pre-shared with it, the way condor_master's
+// family and inherited parent sessions carry condor@family and condor@parent.
+func (ac *authzCollector) session(t *testing.T, identity string) *security.SecurityConfig {
+	t.Helper()
+	claim, err := security.MintClaimSession(ac.cache, security.MintClaimOptions{
+		Sinful:  "<127.0.0.1:1>",
+		PeerFQU: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := security.NewSessionCache()
+	sid, err := security.ImportClaimSession(cc, claim.ClaimID(), security.ClaimSessionOptions{PeerFQU: "collector@" + testTrustDomain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &security.SecurityConfig{
+		AuthMethods:    []security.AuthMethod{security.AuthToken},
+		Authentication: security.SecurityOptional,
+		CryptoMethods:  []security.CryptoMethod{security.CryptoAES},
+		Encryption:     security.SecurityOptional,
+		Integrity:      security.SecurityOptional,
+		SessionID:      sid,
+		SessionCache:   cc,
 	}
 }
 
@@ -267,7 +310,7 @@ func TestAuthzAdvertiseStartd(t *testing.T) {
 	ac.expectDenial(t, "UPDATE_STARTD_AD_WITH_ACK", "ADVERTISE_STARTD", "intruder@pool", "ALLOW_ADVERTISE_STARTD", "")
 
 	_ = ac.advertise(t, ac.as(t, ""), commands.UPDATE_STARTD_AD, "slot3@anonymous")
-	ac.expectDenial(t, "UPDATE_STARTD_AD", "ADVERTISE_STARTD", "unauthenticated", "ALLOW_ADVERTISE_STARTD", "")
+	ac.expectDenial(t, "UPDATE_STARTD_AD", "ADVERTISE_STARTD", "unauthenticated@unmapped", "ALLOW_ADVERTISE_STARTD", "")
 
 	if err := ac.advertise(t, ac.as(t, "startd@pool"), commands.UPDATE_STARTD_AD_WITH_ACK, "slot1@startd"); err != nil {
 		t.Fatalf("UPDATE_STARTD_AD_WITH_ACK from ALLOW_ADVERTISE_STARTD identity: %v", err)
@@ -393,6 +436,131 @@ func TestAuthzLevelsMatchCpp(t *testing.T) {
 	ac.expectDenial(t, "UPDATE_NEGOTIATOR_AD", "NEGOTIATOR", "daemon@pool", "ALLOW_NEGOTIATOR", "")
 	advNeg("negotiator@pool")
 	ac.waitStored(t, store.NegotiatorAd, "neg@pool")
+}
+
+// TestAuthzTokenLimits: a token limited to ADVERTISE_STARTD cannot run
+// QUERY_STARTD_PVT_ADS (NEGOTIATOR) even for an identity in
+// ALLOW_NEGOTIATOR, and the refusal is logged with the token's limits; the
+// same token still advertises a startd ad, and the identity's unlimited
+// token still reads the private ads.
+func TestAuthzTokenLimits(t *testing.T) {
+	ac := startAuthzCollector(t, map[string]string{
+		"ALLOW_READ":             "*",
+		"ALLOW_ADVERTISE_STARTD": "daemon@pool",
+		"ALLOW_NEGOTIATOR":       "daemon@pool",
+	})
+	limited := ac.limitedAs(t, "daemon@pool", []string{"ADVERTISE_STARTD"})
+	if err := ac.advertise(t, limited, commands.UPDATE_STARTD_AD, "slot1@host"); err != nil {
+		t.Fatalf("UPDATE_STARTD_AD with an ADVERTISE_STARTD-limited token: %v", err)
+	}
+	ac.waitStored(t, store.StartdPvtAd, "slot1@host")
+
+	ads, err := ac.query(t, ac.limitedAs(t, "daemon@pool", []string{"ADVERTISE_STARTD"}), commands.QUERY_STARTD_PVT_ADS)
+	if err == nil {
+		t.Errorf("QUERY_STARTD_PVT_ADS with an ADVERTISE_STARTD-limited token returned %d ads, want a refusal", len(ads))
+	}
+	got := ac.waitDenial(t)
+	want := map[string]string{
+		"command":              "QUERY_STARTD_PVT_ADS",
+		"level":                "NEGOTIATOR",
+		"authorization_limits": "ADVERTISE_STARTD",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("denial %s = %q, want %q (record %v)", k, got[k], v, got)
+		}
+	}
+	if got["peer"] == "" {
+		t.Errorf("denial names no peer (record %v)", got)
+	}
+
+	ads, err = ac.query(t, ac.as(t, "daemon@pool"), commands.QUERY_STARTD_PVT_ADS)
+	if err != nil {
+		t.Fatalf("QUERY_STARTD_PVT_ADS with an unlimited token: %v", err)
+	}
+	if len(ads) != 1 {
+		t.Errorf("QUERY_STARTD_PVT_ADS with an unlimited token returned %d ads, want 1", len(ads))
+	}
+}
+
+// TestAuthzMasterSessions: condor_master's family and inherited parent
+// sessions hold the levels DaemonCore grants them whatever ALLOW_/DENY_
+// say, so under a restrictive ALLOW_ADMINISTRATOR the master can still
+// reconfigure the collector with DC_RECONFIG; another condor identity is
+// decided by the lists.
+func TestAuthzMasterSessions(t *testing.T) {
+	ac := startAuthzCollector(t, map[string]string{
+		"ALLOW_READ":          "*",
+		"ALLOW_ADMINISTRATOR": "admin@pool",
+		"DENY_NEGOTIATOR":     "condor@*",
+	})
+	// The daemon's DC_* commands, as run() registers them. DC_RECONFIG
+	// rereads CONDOR_CONFIG, so point it at an empty file.
+	condorConfig := filepath.Join(t.TempDir(), "condor_config")
+	if err := os.WriteFile(condorConfig, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONDOR_CONFIG", condorConfig)
+	dlog, err := logging.New(&logging.Config{OutputPath: filepath.Join(t.TempDir(), "CollectorLog")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := daemon.New(daemon.Options{Subsys: "COLLECTOR", Config: config.NewEmpty(), Logger: dlog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconfigs := make(chan struct{}, 4)
+	d.OnReconfig(func(*config.Config) { reconfigs <- struct{}{} })
+	d.RegisterDefaultCommands(ac.srv)
+
+	reconfig := func(sec *security.SecurityConfig) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cs := *sec
+		cs.Command = commands.DC_RECONFIG
+		cl, err := client.ConnectAndAuthenticate(ctx, ac.addr, &cs)
+		if err != nil {
+			t.Fatalf("DC_RECONFIG: %v", err)
+		}
+		_ = cl.Close()
+	}
+
+	reconfig(ac.session(t, "condor@pool"))
+	ac.expectDenial(t, "DC_RECONFIG", "ADMINISTRATOR", "condor@pool", "ALLOW_ADMINISTRATOR", "")
+	select {
+	case <-reconfigs:
+		t.Error("DC_RECONFIG from condor@pool, outside ALLOW_ADMINISTRATOR, reconfigured the collector")
+	default:
+	}
+
+	for _, who := range []string{"condor@family", "condor@parent"} {
+		reconfig(ac.session(t, who))
+		select {
+		case <-reconfigs:
+		case <-time.After(10 * time.Second):
+			t.Errorf("DC_RECONFIG from %s did not reconfigure the collector", who)
+		}
+	}
+
+	// The levels each session holds: the family session's include the
+	// ADVERTISE_* and NEGOTIATOR levels (over DENY_NEGOTIATOR); the parent
+	// session's do not.
+	for _, perm := range []string{"ADMINISTRATOR", "DAEMON", "NEGOTIATOR", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER", "WRITE", "READ"} {
+		if !ac.az.Authorize(perm, "127.0.0.1:1", "condor@family") {
+			t.Errorf("condor@family not authorized at %s", perm)
+		}
+	}
+	for _, perm := range []string{"ADMINISTRATOR", "DAEMON", "WRITE", "READ"} {
+		if !ac.az.Authorize(perm, "127.0.0.1:1", "condor@parent") {
+			t.Errorf("condor@parent not authorized at %s", perm)
+		}
+	}
+	for _, perm := range []string{"NEGOTIATOR", "ADVERTISE_STARTD"} {
+		if ac.az.Authorize(perm, "127.0.0.1:1", "condor@parent") {
+			t.Errorf("condor@parent authorized at %s; DaemonCore grants it ADMINISTRATOR and DAEMON only", perm)
+		}
+	}
 }
 
 // TestAuthzReload: a reconfig that admits an identity takes effect for the
