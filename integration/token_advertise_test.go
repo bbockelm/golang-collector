@@ -2,11 +2,14 @@
 // with the real C++ client tools. This is the deployment story that motivated
 // per-level negotiation: monitoring (READ) is public so condor_status works with
 // no credentials, while publishing (ADVERTISE) requires an authenticated,
-// encrypted session -- here an HTCondor IDTOKEN. We assert all three arms:
+// encrypted session -- here an HTCondor IDTOKEN -- and an identity the
+// ALLOW_ADVERTISE_STARTD list admits. We assert all four arms:
 //
 //   - condor_status (READ) succeeds unauthenticated and sees the pool;
 //   - condor_advertise (ADVERTISE) with a valid IDTOKEN + encryption succeeds;
-//   - condor_advertise WITHOUT a token is refused.
+//   - condor_advertise WITHOUT a token is refused;
+//   - condor_advertise with a valid IDTOKEN for an identity outside
+//     ALLOW_ADVERTISE_STARTD is refused, and the collector logs the denial.
 //
 // The collector runs standalone (not under condor_master) on a fixed loopback
 // port so the per-level SEC_* policy under test is exactly what we set, with no
@@ -75,6 +78,17 @@ TRUST_DOMAIN = %s
 	if err := os.WriteFile(tokenFile, []byte(out), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A second, equally valid token for an identity the policy does not admit.
+	intruderTokenDir := filepath.Join(tmp, "intruder-tokens.d")
+	if err := os.MkdirAll(intruderTokenDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runCondorErr(tokenCfg, 20*time.Second, "condor_token_create",
+		"-identity", "intruder@"+trustDomain, "-key", "POOL")
+	if err != nil {
+		t.Fatalf("condor_token_create failed: %v\n%s", err, out)
+	}
+	writeFile(t, filepath.Join(intruderTokenDir, "intruder.token"), out)
 
 	// --- Collector: READ permissive (unauthenticated condor_status), ADVERTISE
 	// requires IDTOKENS auth + encryption + integrity.
@@ -105,9 +119,10 @@ SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
 SEC_ADVERTISE_AUTHENTICATION_METHODS = IDTOKENS
 SEC_DEFAULT_CRYPTO_METHODS = AES
 ALLOW_READ = *
-ALLOW_ADVERTISE = *
-ALLOW_DAEMON = *
-`, releaseDir(t), collDir, collDir, collDir, collDir, passwdDir, poolKey, trustDomain))
+ALLOW_ADVERTISE_STARTD = advertise@%s
+ALLOW_DAEMON = condor@* condor_pool@*
+ALLOW_NEGOTIATOR = condor@* condor_pool@*
+`, releaseDir(t), collDir, collDir, collDir, collDir, passwdDir, poolKey, trustDomain, trustDomain))
 
 	startStandaloneCollector(t, collBin, collCfg, addr)
 
@@ -182,6 +197,65 @@ SEC_DEFAULT_CRYPTO_METHODS = AES
 		t.Fatalf("unauthenticated advertise should have been refused, but succeeded:\n%s", out)
 	}
 	t.Logf("unauthenticated advertise refused as expected: %s (err=%v)", out, err)
+
+	// Arm 4: an authenticated identity outside ALLOW_ADVERTISE_STARTD is refused.
+	// UPDATE_STARTD_AD is not acknowledged, so condor_advertise cannot see the
+	// refusal; the collector's PERMISSION DENIED line is the evidence, after
+	// which the ad must be absent.
+	intruderCfg := filepath.Join(tmp, "intruder_client_config")
+	writeFile(t, intruderCfg, fmt.Sprintf(`
+RELEASE_DIR = %s
+SEC_TOKEN_DIRECTORY = %s
+TRUST_DOMAIN = %s
+SEC_DEFAULT_AUTHENTICATION = REQUIRED
+SEC_CLIENT_AUTHENTICATION_METHODS = IDTOKENS
+SEC_DEFAULT_CRYPTO_METHODS = AES
+SEC_CLIENT_ENCRYPTION = REQUIRED
+`, releaseDir(t), intruderTokenDir, trustDomain))
+	intruderAd := filepath.Join(tmp, "intruder.ad")
+	writeFile(t, intruderAd, `MyType = "Machine"
+TargetType = "Job"
+Name = "slot1@intruderhost"
+Machine = "intruderhost"
+StartdIpAddr = "<127.0.0.1:9998>"
+State = "Unclaimed"
+Activity = "Idle"
+`)
+	out, err = runCondorErr(intruderCfg, 30*time.Second, "condor_advertise", "-pool", addr, "UPDATE_STARTD_AD", intruderAd)
+	t.Logf("advertise as intruder@%s: %s (err=%v)", trustDomain, out, err)
+	collLog := filepath.Join(collDir, "log", "CollectorLog")
+	var denial string
+	for deadline := time.Now().Add(20 * time.Second); denial == "" && time.Now().Before(deadline); {
+		data, _ := os.ReadFile(collLog)
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, "PERMISSION DENIED") && strings.Contains(line, "intruder") {
+				denial = line
+				break
+			}
+		}
+		if denial == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if denial == "" {
+		t.Fatalf("collector logged no PERMISSION DENIED for intruder@%s", trustDomain)
+	}
+	t.Logf("collector: %s", denial)
+	for _, want := range []string{"UPDATE_STARTD_AD", "ADVERTISE_STARTD", "ALLOW_ADVERTISE_STARTD"} {
+		if !strings.Contains(denial, want) {
+			t.Errorf("denial line lacks %q: %s", want, denial)
+		}
+	}
+	out, err = runCondorErr(readCfg, 15*time.Second, "condor_status", "-pool", addr)
+	if err != nil {
+		t.Fatalf("condor_status after the refused advertise: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "intruderhost") {
+		t.Fatalf("ad from an identity outside ALLOW_ADVERTISE_STARTD was stored:\n%s", out)
+	}
+	if !strings.Contains(out, "tokenhost") {
+		t.Fatalf("condor_status no longer shows the authorized ad:\n%s", out)
+	}
 }
 
 // startStandaloneCollector launches the htc-collector binary as a standalone
