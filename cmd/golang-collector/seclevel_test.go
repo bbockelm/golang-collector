@@ -60,7 +60,7 @@ func TestNegotiationLevelsMatchCpp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	secForLevel, err := securityForLevels(d)
+	secForLevel, err := d.SecurityLevelConfigs()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestNegotiationLevelsMatchCpp(t *testing.T) {
 	}
 	records := make(chan slog.Record, 64)
 	logger := slog.New(&recordHandler{ch: records})
-	c, err := newCollector(cfg, secForLevel["READ"], secForLevel, nil, az, logger)
+	c, err := newDaemonCollector(d, secForLevel["READ"], nil, az, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

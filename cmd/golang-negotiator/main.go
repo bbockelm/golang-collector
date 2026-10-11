@@ -29,7 +29,6 @@ import (
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
-	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
 	"github.com/bbockelm/golang-collector/negotiator/cycle"
@@ -211,21 +210,22 @@ func run() error {
 // newCommandServer builds the command server for the negotiator's own socket
 // (userprio + RESCHEDULE, registered by the caller, and the DC_* commands).
 // Each command negotiates under the SEC_<level>_* policy of the level it is
-// registered at, as in the C++ negotiator, and is authorized by the
+// registered at, as in the C++ negotiator, rebuilt on reconfig, and is authorized by the
 // ALLOW_<level>/DENY_<level> policy (getters READ, setters ADMINISTRATOR,
 // SET_PRIORITYFACTOR WRITE, RESCHEDULE DAEMON, like the C++ negotiator's
 // Register_Command levels) with the holes DaemonCore punches for
 // condor_master's sessions, rebuilt on reconfig. Serve it with the returned
 // Authz's Serve, which logs each denial. Call it after d.Listener.
 func newCommandServer(d *daemon.Daemon) (*cedarserver.Server, *daemon.Authz, error) {
-	secForLevel, err := seclevel.Build(d.Config(), func(secContext string) (*security.SecurityConfig, error) {
-		return d.ServerSecurityConfig(commands.DC_NOP, secContext)
-	})
+	// READ's policy for a command registered at no level.
+	sec, err := d.ServerSecurityConfig(commands.DC_NOP, string(authz.PermRead))
 	if err != nil {
 		return nil, nil, fmt.Errorf("building security config: %w", err)
 	}
-	srv := cedarserver.New(secForLevel[string(authz.PermRead)])
-	seclevel.Install(srv, secForLevel)
+	srv := cedarserver.New(sec)
+	if err := d.InstallSecurityLevels(srv); err != nil {
+		return nil, nil, fmt.Errorf("building security config: %w", err)
+	}
 
 	az, err := d.NewAuthz(daemon.AuthzOptions{})
 	if err != nil {

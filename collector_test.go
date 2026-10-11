@@ -120,3 +120,51 @@ func TestEmbeddableRegisterOn(t *testing.T) {
 		t.Errorf("embedded Store().Len(StartdAd) = %d, want 1", n)
 	}
 }
+
+// TestEmbeddableSecurityForLevel: with SecurityForLevel, the collector's own
+// server negotiates each command under the policy of its level, and a command
+// whose level is absent from the map under Security. A plaintext client can
+// query (READ) and advertise a schedd (ADVERTISE_SCHEDD, absent), but not a
+// startd: ADVERTISE_STARTD requires authentication.
+func TestEmbeddableSecurityForLevel(t *testing.T) {
+	authRequired := plaintextSec()
+	authRequired.Authentication = security.SecurityRequired
+	authRequired.AuthMethods = []security.AuthMethod{security.AuthToken}
+	c, err := New(Config{
+		Security: plaintextSec(),
+		SecurityForLevel: map[string]*security.SecurityConfig{
+			"READ":             plaintextSec(),
+			"ADVERTISE_STARTD": authRequired,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Serve(ctx, ln) }()
+
+	cctx := htcondor.WithSecurityConfig(context.Background(), plaintextSec())
+	col := htcondor.NewCollector(ln.Addr().String())
+	startd, err := classad.Parse(`[MyType="Machine"; Name="slot1@plain"; MyAddress="<127.0.0.1:1>"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := col.Advertise(cctx, startd, &htcondor.AdvertiseOptions{Command: commands.UPDATE_STARTD_AD}); err == nil {
+		t.Error("plaintext UPDATE_STARTD_AD negotiated, though ADVERTISE_STARTD requires authentication")
+	}
+	schedd, err := classad.Parse(`[MyType="Scheduler"; Name="schedd@plain"; MyAddress="<127.0.0.1:2>"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := col.Advertise(cctx, schedd, &htcondor.AdvertiseOptions{Command: commands.UPDATE_SCHEDD_AD}); err != nil {
+		t.Errorf("plaintext UPDATE_SCHEDD_AD under the base policy: %v", err)
+	}
+	if _, err := col.QueryAds(cctx, "Machine", ""); err != nil {
+		t.Errorf("plaintext QUERY_STARTD_ADS under READ's policy: %v", err)
+	}
+}

@@ -130,6 +130,14 @@ queue 1
 	}
 	t.Log("job completed: the Go negotiator matched a C++ schedd's job to a C++ startd end-to-end")
 
+	// condor_ping (DC_SEC_QUERY) answers each level as the C++ collector does
+	// under the same policy.
+	negAddr, err := os.ReadFile(filepath.Join(logDir, ".negotiator_address"))
+	if err != nil {
+		t.Fatalf("reading the negotiator address file: %v", err)
+	}
+	checkPingLevels(t, h.GetConfigFile(), strings.TrimSpace(strings.SplitN(string(negAddr), "\n", 2)[0]), h.GetCollectorAddr())
+
 	// Bonus wire-compat probe (best-effort): the real condor_userprio tool
 	// locates the negotiator through the collector's NegotiatorAd and speaks
 	// GET_PRIORITY at it. Failures are logged, not fatal — daemon location

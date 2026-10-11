@@ -31,8 +31,8 @@ import (
 
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/bbockelm/golang-htcondor/daemon"
 
-	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
 )
@@ -56,7 +56,10 @@ type Config struct {
 	// authentication. This covers commands later registered on Server() (DC_*,
 	// CCB, negotiator) too. A command whose level is absent from the map
 	// falls back to Security. Each policy shares Security's post-authentication
-	// policy. Optional.
+	// policy. daemon.Daemon.SecurityLevelConfigs builds the map from the SEC_*
+	// configuration. It is not rebuilt on reconfig; a host daemon can instead
+	// call daemon.Daemon.InstallSecurityLevels on Server(), which follows
+	// reconfig. Optional.
 	SecurityForLevel map[string]*security.SecurityConfig
 
 	// Backend is the ad store. Optional; nil selects the default in-memory store
@@ -135,7 +138,7 @@ func New(cfg Config) (*Collector, error) {
 		c.srv.Authorizer = cfg.Authorizer
 	}
 	if cfg.SecurityForLevel != nil {
-		seclevel.Install(c.srv, cfg.SecurityForLevel)
+		daemon.InstallSecurityLevels(c.srv, cfg.SecurityForLevel)
 	}
 	c.RegisterOn(c.srv)
 	return c, nil
