@@ -124,6 +124,77 @@ func TestMasterSessionsReconfig(t *testing.T) {
 	}
 }
 
+// TestCommandLevelsNegotiate: each command negotiates under the SEC_<level>_*
+// policy of the level it is registered at, as in the C++ negotiator. With
+// authentication required at ADMINISTRATOR only, an anonymous peer
+// negotiates a READ command but not an ADMINISTRATOR one.
+func TestCommandLevelsNegotiate(t *testing.T) {
+	condorConfig := filepath.Join(t.TempDir(), "condor_config")
+	if err := os.WriteFile(condorConfig, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONDOR_CONFIG", condorConfig)
+	cfg := config.NewEmpty()
+	for k, v := range map[string]string{
+		"ALLOW_READ":                         "*",
+		"ALLOW_ADMINISTRATOR":                "*",
+		"SEC_DEFAULT_AUTHENTICATION":         "OPTIONAL",
+		"SEC_ADMINISTRATOR_AUTHENTICATION":   "REQUIRED",
+		"SEC_DEFAULT_AUTHENTICATION_METHODS": "IDTOKENS",
+	} {
+		cfg.Set(k, v)
+	}
+	dlog, err := logging.New(&logging.Config{OutputPath: filepath.Join(t.TempDir(), "NegotiatorLog")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := daemon.New(daemon.Options{Subsys: "NEGOTIATOR", Config: cfg, Logger: dlog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, az, err := newCommandServer(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = az.Serve(srv, slog.New(&recordHandler{ch: make(chan slog.Record, 64)}))(ctx, ln)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	anonymous := func(command int) error {
+		t.Helper()
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		cl, err := client.ConnectAndAuthenticate(cctx, ln.Addr().String(), &security.SecurityConfig{
+			Command:        command,
+			Authentication: security.SecurityNever,
+			Encryption:     security.SecurityNever,
+			Integrity:      security.SecurityNever,
+			SessionCache:   security.NewSessionCache(),
+		})
+		if err != nil {
+			return err
+		}
+		return cl.Close()
+	}
+	if err := anonymous(commands.DC_NOP_READ); err != nil {
+		t.Errorf("anonymous DC_NOP_READ under SEC_DEFAULT_AUTHENTICATION=OPTIONAL: %v", err)
+	}
+	if err := anonymous(commands.DC_NOP_ADMINISTRATOR); err == nil {
+		t.Error("anonymous DC_NOP_ADMINISTRATOR negotiated, though SEC_ADMINISTRATOR_AUTHENTICATION=REQUIRED")
+	}
+}
+
 // waitDenial returns the attributes of the next PERMISSION DENIED record.
 func waitDenial(t *testing.T, records chan slog.Record) map[string]string {
 	t.Helper()
