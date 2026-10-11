@@ -78,7 +78,7 @@ func startAuthzCollector(t *testing.T, knobs map[string]string) *authzCollector 
 	}
 	records := make(chan slog.Record, 64)
 	logger := slog.New(&recordHandler{ch: records})
-	c, err := newCollector(cfg, sec, nil, nil, az, logger)
+	c, err := newCollector(cfg, sec, nil, az, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

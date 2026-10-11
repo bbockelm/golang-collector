@@ -35,7 +35,6 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	collector "github.com/bbockelm/golang-collector"
-	"github.com/bbockelm/golang-collector/internal/seclevel"
 	"github.com/bbockelm/golang-collector/metrics"
 	"github.com/bbockelm/golang-collector/negotiator"
 	"github.com/bbockelm/golang-collector/negotiator/accountant"
@@ -132,16 +131,14 @@ func run() error {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// Server-side security policy per authorization level; see
-	// securityForLevels. Built after Listener, so behind a shared port each
-	// policy names our sock id.
-	secForLevel, err := securityForLevels(d)
+	// Server-side security policy for a command registered at no level: READ's,
+	// the permissive baseline. Built after Listener, so behind a shared port it
+	// names our sock id.
+	sec, err := d.ServerSecurityConfig(commands.DC_NOP, string(authz.PermRead))
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
-	// READ is the permissive baseline for a command registered at no level.
-	sec := secForLevel[string(authz.PermRead)]
-	c, err := newCollector(cfg, sec, secForLevel, backend, az, d.Slog())
+	c, err := newDaemonCollector(d, sec, backend, az, d.Slog())
 	if err != nil {
 		return err
 	}
@@ -209,27 +206,32 @@ func authzOptions() daemon.AuthzOptions {
 	return daemon.AuthzOptions{CommandNames: server.CommandNames()}
 }
 
-// securityForLevels builds the server-side security policy of every
-// authorization level from the HTCondor configuration (SEC_* knobs). As in the
-// C++ collector, each command negotiates under the SEC_<level>_* policy of the
-// level it is registered at (collector.Config.SecurityForLevel): QUERY_*_ADS
-// under READ's (monitoring is public, so condor_status works without daemon
-// credentials), UPDATE_STARTD_AD under ADVERTISE_STARTD's, falling back to
-// DAEMON's, and DC_RECONFIG under ADMINISTRATOR's. Call it after d.Listener.
-func securityForLevels(d *daemon.Daemon) (map[string]*security.SecurityConfig, error) {
-	return seclevel.Build(d.Config(), func(secContext string) (*security.SecurityConfig, error) {
-		return d.ServerSecurityConfig(commands.DC_NOP, secContext)
-	})
+// newDaemonCollector builds the collector this daemon serves: newCollector,
+// with every command registered at a level negotiating under that level's
+// SEC_<level>_* policy, rebuilt on reconfig, as in the C++ collector
+// (daemon.Daemon.InstallSecurityLevels): QUERY_*_ADS under READ's (monitoring
+// is public, so condor_status works without daemon credentials),
+// UPDATE_STARTD_AD under ADVERTISE_STARTD's, falling back to DAEMON's, and
+// DC_RECONFIG under ADMINISTRATOR's. sec is the policy of a command registered
+// at no level. Call it after d.Listener.
+func newDaemonCollector(d *daemon.Daemon, sec *security.SecurityConfig, backend store.Backend, az *daemon.Authz, logger *slog.Logger) (*collector.Collector, error) {
+	c, err := newCollector(d.Config(), sec, backend, az, logger)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.InstallSecurityLevels(c.Server()); err != nil {
+		return nil, fmt.Errorf("building security config: %w", err)
+	}
+	return c, nil
 }
 
 // newCollector builds the collector core: the store, protocol handlers,
-// CONDOR_VIEW_HOST forwarding and background maintenance settings, with the
-// per-level security policy and the ALLOW_/DENY_ authorization policy (az)
+// CONDOR_VIEW_HOST forwarding and background maintenance settings, under the
+// security policy sec and with the ALLOW_/DENY_ authorization policy (az)
 // enforced on every command its server dispatches.
-func newCollector(cfg *config.Config, sec *security.SecurityConfig, secForLevel map[string]*security.SecurityConfig, backend store.Backend, az *daemon.Authz, logger *slog.Logger) (*collector.Collector, error) {
+func newCollector(cfg *config.Config, sec *security.SecurityConfig, backend store.Backend, az *daemon.Authz, logger *slog.Logger) (*collector.Collector, error) {
 	return collector.New(collector.Config{
 		Security:            sec,
-		SecurityForLevel:    secForLevel,
 		Backend:             backend, // nil selects the default in-memory store
 		ViewHosts:           viewHosts(cfg),
 		DictRetrainInterval: configSeconds(cfg, "COLLECTOR_DICT_RETRAIN_INTERVAL", 15*time.Minute),

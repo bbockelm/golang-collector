@@ -141,6 +141,10 @@ ALLOW_ADMINISTRATOR = %[2]s@* condor@* condor_pool@*
 	}
 	t.Logf("condor_status -any via the Go collector:\n%s", out)
 
+	// condor_ping (DC_SEC_QUERY) answers each level as the C++ schedd does under
+	// the same policy.
+	checkPingLevels(t, h.GetConfigFile(), h.GetCollectorAddr(), locateWithRetry(t, ctx, col, "Schedd", 10*time.Second))
+
 	// Full negotiation cycle. Submit a trivial vanilla job and wait for it to run
 	// to completion. Force a real file transfer (transfer_executable) so a slot is
 	// actually claimed and a starter runs. We transfer a small shell script that
