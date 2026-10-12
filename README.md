@@ -191,7 +191,7 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_PERSIST_SESSIONS` | Persist the CEDAR session cache across restarts (see below). Default off. |
 | `COLLECTOR_SESSION_CACHE_FILE` | Path to the encrypted session DB (default `$(SPOOL)/collector_sessions.db`). |
 | `SEC_PASSWORD_DIRECTORY` | Pool signing keys — required for session persistence, embedded-store encryption, and IDTOKENS. |
-| `ENABLE_CCB_SERVER` | Run an embedded CCB server on the collector's command socket. |
+| `ENABLE_CCB_SERVER` | Run an embedded CCB server on the collector's command socket. The collector then advertises the minimum HTCondor version for CCB streaming (private-to-private) requests, cedar's `ccb.StreamingMinVersion`, in its security handshake. |
 | `NEGOTIATOR_EMBEDDED` | Run the negotiator inside `htc-collector` (reads the store directly). |
 | `COLLECTOR_METRICS_ADDRESS` / `-metrics` | Serve Prometheus metrics at `/metrics`. |
 | `COLLECTOR_UPDATE_INTERVAL` | Ad expiry sweep interval. |
