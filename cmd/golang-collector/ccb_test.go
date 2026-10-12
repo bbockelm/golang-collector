@@ -21,11 +21,11 @@ import (
 )
 
 // TestEmbeddedCCBServesStreaming: with ENABLE_CCB_SERVER, the collector's
-// handshake for CCB_REQUEST and CCB_REGISTER advertises a version at or above
-// ccb.StreamingMinVersion, below which a requester sends no streaming
-// request, and a private requester's streaming CCB_REQUEST is served over an
-// encrypted session: its bytes reach a target registered with the embedded
-// CCB and come back.
+// handshake for CCB_REQUEST and CCB_REGISTER, negotiated or resumed,
+// advertises a version at or above ccb.StreamingMinVersion, below which a
+// requester sends no streaming request, and a private requester's streaming
+// CCB_REQUEST is served over an encrypted session: its bytes reach a target
+// registered with the embedded CCB and come back.
 func TestEmbeddedCCBServesStreaming(t *testing.T) {
 	keyDir := t.TempDir()
 	if err := security.GeneratePoolSigningKey(filepath.Join(keyDir, "POOL")); err != nil {
@@ -98,7 +98,8 @@ func TestEmbeddedCCBServesStreaming(t *testing.T) {
 	ac := &authzCollector{addr: addr, keyDir: keyDir}
 
 	// The handshakes for CCB_REQUEST (at READ) and CCB_REGISTER (at DAEMON)
-	// advertise a streaming-capable version.
+	// advertise a streaming-capable version, both when they negotiate a
+	// session and when a later connection resumes it.
 	hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer hcancel()
 	for _, hs := range []struct {
@@ -110,17 +111,22 @@ func TestEmbeddedCCBServesStreaming(t *testing.T) {
 	} {
 		cs := *ac.as(t, hs.identity)
 		cs.Command = hs.command
-		cl, err := client.ConnectAndAuthenticate(hctx, addr, &cs)
-		if err != nil {
-			t.Fatalf("%s handshake: %v", hs.name, err)
-		}
-		neg := cl.GetSecurityNegotiation()
-		_ = cl.Close()
-		if neg == nil || neg.ServerConfig == nil {
-			t.Fatalf("%s handshake returned no server policy", hs.name)
-		}
-		if v, ok := cedarversion.Parse(neg.ServerConfig.RemoteVersion); !ok || !v.AtLeast(ccb.StreamingMinVersion) {
-			t.Errorf("%s handshake advertises %q, want at least %s", hs.name, neg.ServerConfig.RemoteVersion, ccb.StreamingMinVersion)
+		for _, resume := range []bool{false, true} {
+			cl, err := client.ConnectAndAuthenticate(hctx, addr, &cs)
+			if err != nil {
+				t.Fatalf("%s handshake (resume=%v): %v", hs.name, resume, err)
+			}
+			neg := cl.GetSecurityNegotiation()
+			_ = cl.Close()
+			if neg == nil || neg.ServerConfig == nil {
+				t.Fatalf("%s handshake (resume=%v) returned no server policy", hs.name, resume)
+			}
+			if neg.SessionResumed != resume {
+				t.Fatalf("%s handshake: session resumed = %v, want %v", hs.name, neg.SessionResumed, resume)
+			}
+			if v, ok := cedarversion.Parse(neg.ServerConfig.RemoteVersion); !ok || !v.AtLeast(ccb.StreamingMinVersion) {
+				t.Errorf("%s handshake (resume=%v) advertises %q, want at least %s", hs.name, resume, neg.ServerConfig.RemoteVersion, ccb.StreamingMinVersion)
+			}
 		}
 	}
 

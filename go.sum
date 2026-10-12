@@ -8,8 +8,8 @@ github.com/PelicanPlatform/classad/dbrpc v0.29.11 h1:LpdzJRwH5rqtYI/y7vX2QlkWIEY
 github.com/PelicanPlatform/classad/dbrpc v0.29.11/go.mod h1:au9Tb6ciYnI2pZi5m/uIrjRDnp/Xdm/7WB6cDRgcRUc=
 github.com/RoaringBitmap/roaring/v2 v2.26.0 h1:K30ZxF4vZcIKvJsbmgfiep2K64f+dILJqkYGoj4xnwU=
 github.com/RoaringBitmap/roaring/v2 v2.26.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
-github.com/bbockelm/cedar v0.7.9 h1:pUlv1ehlyNyDq5xw+XJ1xTgNBBAIH/vx2z2U+ddBmx0=
-github.com/bbockelm/cedar v0.7.9/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
+github.com/bbockelm/cedar v0.7.10 h1:HhCYTDpl4svYQ+jF+a7TopnavYmICZl1/kM743Y1r1U=
+github.com/bbockelm/cedar v0.7.10/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bbockelm/golang-ccb v0.4.0 h1:VGLpXbu1J4KNKomLHXR608bI4mX4B7jFF46t4BLRM6M=
 github.com/bbockelm/golang-ccb v0.4.0/go.mod h1:zakGaHshZ+aTmdwjjW44YF6x2ZDMPobtl+z6ix+ZF98=
 github.com/bbockelm/golang-htcondor v0.20.2 h1:Ey9BqjLB2v0vlbJbIbTXWPFgLHUEiaBYwz+TlvOAlIc=
