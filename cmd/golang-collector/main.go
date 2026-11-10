@@ -472,8 +472,8 @@ func startMetrics(ctx context.Context, addr string, st store.Backend, log *loggi
 	// served -- they matter most for the remote-database backend, which is
 	// precisely the one with no store.Statser. The per-ad-type storage gauges are
 	// added only when the backend exposes them.
-	statser, _ := st.(store.Statser) // nil for a backend without stats; Handler tolerates it
-	dbd := dbDiagnoser(st)           // non-nil only for the remote-database backend
+	statser, _ := store.As[store.Statser](st) // nil for a backend without stats; Handler tolerates it
+	dbd := dbDiagnoser(st)                    // non-nil only for the remote-database backend
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(statser, dbd))
 	if pprofOn {
@@ -529,15 +529,8 @@ func installGoroutineDumpSignal(log *logging.Logger) {
 // for a local backend, so the collector's /metrics adds the remote-database metrics
 // only when there is a remote database behind it.
 func dbDiagnoser(st store.Backend) metrics.DBDiagnoser {
-	if d, ok := st.(metrics.DBDiagnoser); ok {
-		return d
-	}
-	if u, ok := st.(interface{ Base() store.Backend }); ok {
-		if d, ok := u.Base().(metrics.DBDiagnoser); ok {
-			return d
-		}
-	}
-	return nil
+	d, _ := store.As[metrics.DBDiagnoser](st)
+	return d
 }
 
 // buildBackend selects the collector's ad-store backend from COLLECTOR_STORE:
@@ -549,8 +542,16 @@ func dbDiagnoser(st store.Backend) metrics.DBDiagnoser {
 // persistent backends are wrapped with COLLECTOR_BATCH_WINDOW_MS update batching.
 func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error) {
 	base, err := buildBaseBackend(cfg, log)
-	if err != nil || base == nil {
-		return base, err // nil = in-memory default (no batching)
+	if err != nil {
+		return nil, err
+	}
+	// The in-memory default gets the same guard. It has no disk and no network to stall
+	// on today, which is exactly why it is worth guarding: the protection should not
+	// depend on that staying true as the storage engine underneath it changes. Buffering
+	// also makes its ingest path cheaper, because the store write moves off the receiving
+	// goroutine (~1.0us to accept an ad rather than ~3.4us).
+	if base == nil {
+		base = store.New()
 	}
 	// Ad-update batching: COLLECTOR_BATCH_WINDOW_MS buffers non-ack updates for
 	// that many milliseconds (deduplicated by ad) and commits them in one
@@ -561,17 +562,55 @@ func buildBackend(cfg *config.Config, log *logging.Logger) (store.Backend, error
 	// collector's update cadence), and ACK updates bypass it (store.DurableUpdate).
 	wms := configInt(cfg, "COLLECTOR_BATCH_WINDOW_MS", 100)
 	if wms <= 0 {
+		// The buffer is also the deep update queue, so turning batching off gives up the
+		// guarantee that ingest never waits on storage: a stalled backend will again block
+		// the command socket, and with it whoever is advertising to us.
+		log.Warn(logging.DestinationGeneral, "ad-update stall guard disabled; ad updates will block on the backend, so a storage stall will stall the daemons advertising to this collector", "knob", "COLLECTOR_BATCH_WINDOW_MS")
 		return base, nil
 	}
 	maxBuf := configInt(cfg, "COLLECTOR_BATCH_MAX_ADS", 2048)
-	buffered, err := store.NewBufferedBackend(base, time.Duration(wms)*time.Millisecond, maxBuf,
+	qp := queuePolicy(cfg)
+	buffered, err := store.NewBufferedBackendPolicy(base, time.Duration(wms)*time.Millisecond, maxBuf, qp,
 		func(e error) { log.Warn(logging.DestinationGeneral, "ad-update batch flush failed", "err", e.Error()) })
 	if err != nil {
 		log.Info(logging.DestinationGeneral, "ad-update batching unavailable for this backend; continuing unbuffered", "err", err.Error())
 		return base, nil
 	}
-	log.Info(logging.DestinationGeneral, "ad-update batching enabled", "window_ms", wms, "max_ads", maxBuf)
+	log.Info(logging.DestinationGeneral, "ad-update stall guard enabled", "window_ms", wms, "max_ads", maxBuf,
+		"batching", !qp.DirectUntilStalled, "queue_stall_ms", qp.StallThreshold.Milliseconds(),
+		"queue_max_ads", qp.MaxAds, "queue_max_bytes", qp.MaxBytes, "queue_clear", qp.StallClear)
 	return buffered, nil
+}
+
+// queuePolicy reads the deep-update-queue knobs. The queue is what keeps a storage
+// problem here from propagating back to whoever is advertising to us -- above all a
+// primary collector forwarding to this one as its CONDOR_VIEW_HOST, which writes to us
+// synchronously and would otherwise block its own pool. It stays dormant until the
+// backend actually stalls:
+//
+//	COLLECTOR_QUEUE_STALL_MS     a backend flush at least this slow engages the queue
+//	                             (default 1000; 0 keeps it engaged permanently)
+//	COLLECTOR_QUEUE_CLEAR_S      stall-free seconds before it disengages (default 300)
+//	COLLECTOR_QUEUE_MAX_ADS      queued-ad cap, coalesced per ad (default 200000; 0 = no cap)
+//	COLLECTOR_QUEUE_MAX_MB       queued-ad memory cap, the one worth tuning (default 256)
+//	COLLECTOR_QUEUE_MAX_INVALIDATES  deferred-invalidation cap (default 4096)
+//	COLLECTOR_FLUSH_TIMEOUT_S    bound on one backend flush (default 300; 0 = none)
+func queuePolicy(cfg *config.Config) store.QueuePolicy {
+	d := store.DefaultQueuePolicy
+	return store.QueuePolicy{
+		StallThreshold: time.Duration(configIntZero(cfg, "COLLECTOR_QUEUE_STALL_MS", int(d.StallThreshold.Milliseconds()))) * time.Millisecond,
+		StallClear:     time.Duration(configInt(cfg, "COLLECTOR_QUEUE_CLEAR_S", int(d.StallClear.Seconds()))) * time.Second,
+		MaxAds:         unbounded(configIntZero(cfg, "COLLECTOR_QUEUE_MAX_ADS", d.MaxAds)),
+		MaxBytes:       int64(unbounded(configIntZero(cfg, "COLLECTOR_QUEUE_MAX_MB", int(d.MaxBytes>>20)))) << 20,
+		MaxInvalidates: unbounded(configIntZero(cfg, "COLLECTOR_QUEUE_MAX_INVALIDATES", d.MaxInvalidates)),
+		FlushTimeout:   time.Duration(unbounded(configIntZero(cfg, "COLLECTOR_FLUSH_TIMEOUT_S", int(d.FlushTimeout.Seconds())))) * time.Second,
+		// COLLECTOR_INGEST_DIRECT restores the pre-guard behavior: apply each ad update on
+		// the receiving goroutine while the backend is healthy. Off by default because it
+		// cannot protect a producer that is already inside the backend when it stalls --
+		// every daemon that advertises within COLLECTOR_QUEUE_STALL_MS of the onset blocks
+		// with it. It is an escape hatch, not a tuning knob.
+		DirectUntilStalled: configBool(cfg, "COLLECTOR_INGEST_DIRECT", false),
+	}
 }
 
 // embeddedDBKeys returns the pool signing keys that encrypt the embedded ad
@@ -780,6 +819,27 @@ func configSeconds(cfg *config.Config, key string, def time.Duration) time.Durat
 func configInt(cfg *config.Config, key string, def int) int {
 	if v, ok := cfg.Get(key); ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// unbounded translates an operator's 0 ("no cap", "no timeout") into the negative
+// value QueuePolicy uses for it, since 0 there means "take the default".
+func unbounded(n int) int {
+	if n == 0 {
+		return -1
+	}
+	return n
+}
+
+// configIntZero is configInt for knobs where 0 is a meaningful setting ("no cap",
+// "no timeout", "always on") rather than "unset" -- configInt rejects it as invalid.
+// A negative value is still rejected.
+func configIntZero(cfg *config.Config, key string, def int) int {
+	if v, ok := cfg.Get(key); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			return n
 		}
 	}
