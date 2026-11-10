@@ -176,6 +176,33 @@ type Statser interface {
 	Stats() map[AdType]collections.Stats
 }
 
+// As finds optional capability T on b, looking at b itself first and then at any
+// backend it wraps (a wrapper exposes the one it wraps through Base()).
+//
+// Use it instead of a direct type assertion for every optional capability. A wrapper
+// like BufferedBackend embeds the Backend *interface*, so only Backend's own methods
+// are promoted: `b.(Retrainer)` against a wrapped in-memory Store fails and silently
+// turns dictionary retraining off, and `b.(Statser)` silently empties the storage
+// gauges. Neither reports an error -- the feature just stops existing. As walks the
+// chain, so adding a wrapper cannot quietly remove a capability.
+//
+// Matching the outermost holder first is deliberate: a wrapper that implements a
+// capability itself (BufferedBackend's query methods flush before delegating) must win
+// over the backend underneath it.
+func As[T any](b Backend) (T, bool) {
+	for {
+		if v, ok := any(b).(T); ok {
+			return v, true
+		}
+		u, ok := any(b).(interface{ Base() Backend })
+		if !ok {
+			var zero T
+			return zero, false
+		}
+		b = u.Base()
+	}
+}
+
 // The in-memory Store is the default backend and implements every capability.
 var (
 	_ Backend                     = (*Store)(nil)
@@ -185,4 +212,5 @@ var (
 	_ RedactedProjectedRawQueryer = (*Store)(nil)
 	_ Retrainer                   = (*Store)(nil)
 	_ Statser                     = (*Store)(nil)
+	_ BatchWriter                 = (*Store)(nil)
 )

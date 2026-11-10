@@ -137,6 +137,26 @@ func (s *Store) UpdateOldText(ctx context.Context, t AdType, text string) error 
 	return col.UpdateOld([]collections.OldAdUpdate{{Key: key, Text: text}})
 }
 
+// UpdateBatch applies a buffer of upserts one at a time. The in-memory Store has no
+// transaction to amortize, so this is not batching for its own sake: it is what lets the
+// default backend sit behind BufferedBackend's stall guard, which requires a BatchWriter
+// (see QueuePolicy.DirectUntilStalled). While the store is healthy the guard calls the
+// per-ad path directly and this is never reached.
+func (s *Store) UpdateBatch(ctx context.Context, batch []PendingUpdate) error {
+	for _, p := range batch {
+		if p.Pvt {
+			if err := s.UpdatePvt(ctx, p.Text, p.PvtText); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.UpdateOldText(ctx, p.Type, p.Text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // UpdatePvt stores a startd *private* ad (supplementary attributes like claim
 // ids that only the negotiator may see) in the StartdPvtAd table, keyed the same
 // as its public ad -- whose wire text is publicText.

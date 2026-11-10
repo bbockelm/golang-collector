@@ -62,15 +62,36 @@ type metrics struct {
 	// (each triggers a full-batch replay; invisible to retriesTotal). See putBatchTx.
 	conflictsTotal *prometheus.CounterVec
 	adsPerBatch    prometheus.Histogram
-	// backpressureTotal counts times a producer had to flush inline because the buffer
-	// hit its hard cap (the background writer could not keep up). A rising rate means the
-	// update stream is being throttled by commit throughput -- the signal that writes are
-	// no longer pipelining freely.
+	// backpressureTotal counts times the buffer hit its normal high-water mark while the
+	// background writer was falling behind. It no longer means a producer blocked (the
+	// ingest path never blocks); it is the trigger that engages the deep update queue,
+	// and a rising rate means commit throughput is below the ad-arrival rate.
 	backpressureTotal prometheus.Counter
 	// commitFanout records how many concurrent commit units a fanned-out UpdateBatch split
 	// into (1 = no fan-out). It shows the adaptive write parallelism engaging: values >1
 	// appear only when a flush is large enough to spread across the write pool.
 	commitFanout prometheus.Histogram
+
+	// --- deep update queue (shed mode) ---
+	//
+	// queueShedMode is 1 while the deep update queue is engaged: the backend has
+	// stalled, so ad updates are queued (coalesced, in wire form) and shed at the cap
+	// instead of ever blocking the sender. It is the single alert-worthy signal --
+	// while it is 1 the collector is still accepting ads but may be losing some.
+	queueShedMode prometheus.Gauge
+	// queueStallsTotal counts transitions into shed mode (healthy -> stalled). A rising
+	// rate means the backend repeatedly stalls; a flat 1-per-incident means one outage.
+	queueStallsTotal prometheus.Counter
+	// queueDroppedTotal counts ads and invalidations shed at the queue cap, by reason
+	// ("ads_cap", "bytes_cap", "invalidate_cap"). Nonzero means the collector's view of
+	// the pool is lossy for the duration of the stall; daemons re-advertise, so it
+	// self-heals within one update interval.
+	queueDroppedTotal *prometheus.CounterVec
+	// queueAds / queueBytes / queueInvalidations are the current queue occupancy -- how
+	// much of the stall the buffer is absorbing, and how close it is to shedding.
+	queueAds           prometheus.Gauge
+	queueBytes         prometheus.Gauge
+	queueInvalidations prometheus.Gauge
 
 	// RPC-layer instruments for the remote-database backend -- where the update/query
 	// path actually spends its time once the DB itself is fast. These isolate the wire
@@ -123,6 +144,10 @@ type metrics struct {
 // label is observed) and dashboards/alerts have a stable series from the first scrape.
 var retryCauses = []string{"no_txn", "deadline", "conn_closed", "transport", "dial"}
 
+// queueDropReasons is the closed set of shed reasons labeled onto queue_dropped_total,
+// pre-initialized to zero so the family is present from the first scrape.
+var queueDropReasons = []string{dropAdsCap, dropBytesCap, dropInvalidateCap}
+
 func newMetrics(reg prometheus.Registerer) *metrics {
 	fa := promauto.With(reg)
 	// Latency buckets from ~1ms to ~30s: updates should be sub-ms to ms; anything
@@ -159,12 +184,36 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		backpressureTotal: fa.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "backpressure_total",
-			Help: "Times a producer flushed inline because the buffer hit its hard cap (the background writer fell behind).",
+			Help: "Times the buffer hit its normal high-water mark with the background writer falling behind, engaging the deep update queue. The producer is never blocked; see queue_shed_mode and queue_dropped_total.",
 		}),
 		commitFanout: fa.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Name: "commit_fanout",
 			Help:    "Concurrent commit units a fanned-out batch split into (1 = no fan-out); shows adaptive write parallelism engaging under load.",
 			Buckets: []float64{1, 2, 4, 8, 16, 32},
+		}),
+		queueShedMode: fa.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Name: "queue_shed_mode",
+			Help: "1 while the deep update queue is engaged (backend stalled): ads are queued and shed at the cap, never blocked. The signal to alert on.",
+		}),
+		queueStallsTotal: fa.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Name: "queue_stalls_total",
+			Help: "Transitions into shed mode (healthy -> stalled backend).",
+		}),
+		queueDroppedTotal: fa.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Name: "queue_dropped_total",
+			Help: "Queued ad updates and invalidations shed at the queue cap, by reason. Self-heals as daemons re-advertise.",
+		}, []string{"reason"}),
+		queueAds: fa.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Name: "queue_ads",
+			Help: "Ad updates currently queued for the backend (coalesced: one entry per ad).",
+		}),
+		queueBytes: fa.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Name: "queue_bytes",
+			Help: "Approximate memory held by queued ad updates (wire text plus per-entry overhead).",
+		}),
+		queueInvalidations: fa.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Name: "queue_invalidations",
+			Help: "Invalidations currently queued for the backend (shed mode only; applied after the queued updates).",
 		}),
 		retriesTotal: fa.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "retries_total",
@@ -229,6 +278,9 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	}
 	for _, lane := range []string{"write", "read"} {
 		m.rpcInflight.WithLabelValues(lane) // materialize the zero series
+	}
+	for _, r := range queueDropReasons {
+		m.queueDroppedTotal.WithLabelValues(r) // materialize the zero series
 	}
 	return m
 }

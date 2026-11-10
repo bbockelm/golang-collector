@@ -188,6 +188,13 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_DB_HOST` | `db` store: address of the external database daemon (CEDAR). |
 | `COLLECTOR_BATCH_WINDOW_MS` | Ad-update batching window for the persistent backends. Default `100`; `0` disables. |
 | `COLLECTOR_BATCH_MAX_ADS` | Flush the batch early once this many ads buffer. Default `2048`. |
+| `COLLECTOR_QUEUE_STALL_MS` | A backend flush at least this slow engages the [deep update queue](#never-blocking-on-storage). Default `1000`; `0` keeps it engaged permanently. |
+| `COLLECTOR_QUEUE_CLEAR_S` | Stall-free seconds before the deep queue disengages. Default `300`. |
+| `COLLECTOR_QUEUE_MAX_ADS` | Queued-ad cap while the deep queue is engaged (coalesced, one entry per ad). Default `200000`; `0` = no cap. |
+| `COLLECTOR_QUEUE_MAX_MB` | Memory cap for queued ads — the bound worth tuning. Default `256`; `0` = no cap. |
+| `COLLECTOR_QUEUE_MAX_INVALIDATES` | Cap on invalidations deferred while stalled. Default `4096`; `0` = no cap. |
+| `COLLECTOR_INGEST_DIRECT` | Apply ad updates on the receiving goroutine while the backend is healthy (pre-guard behavior). Default `False`; see [Never blocking on storage](#never-blocking-on-storage). |
+| `COLLECTOR_FLUSH_TIMEOUT_S` | Bound on one backend flush, so a writer wedged on a dead-but-open connection retries. Default `300`; `0` = no bound. |
 | `COLLECTOR_PERSIST_SESSIONS` | Persist the CEDAR session cache across restarts (see below). Default off. |
 | `COLLECTOR_SESSION_CACHE_FILE` | Path to the encrypted session DB (default `$(SPOOL)/collector_sessions.db`). |
 | `SEC_PASSWORD_DIRECTORY` | Pool signing keys — required for session persistence, embedded-store encryption, and IDTOKENS. |
@@ -230,7 +237,61 @@ storms into far fewer commits/round-trips. Reads flush the buffer first, so the
 window bounds only write-visibility latency (well under the C++ collector's update
 cadence, and imperceptible to `condor_status`); `UPDATE_*_AD_WITH_ACK` updates
 bypass the buffer entirely, so an acknowledgment always follows durability. Set the
-window to `0` to disable batching. Batching does not apply to the `memory` store.
+window to `0` to disable batching — but note that the same buffer is what keeps ingest
+from blocking on storage (below), so disabling it gives that up. The `memory` store is
+buffered for that protection rather than for batching; it has no commit to amortize.
+
+### Never blocking on storage
+
+A collector's ingest path is a persistent CEDAR command socket, and the daemon on the
+other end writes to it synchronously. A primary collector forwarding to this one as its
+`CONDOR_VIEW_HOST` is the case that matters: if an update handler here blocks, that
+collector blocks in its TCP send, and a storage problem on a *monitoring* collector
+becomes a scheduling problem for the *whole source pool*.
+
+So with a persistent backend the ingest path never waits on storage — not on a disk
+that has stopped completing I/O, not on a database daemon that has been `SIGSTOP`ped,
+not on a storage bug that never returns. An ad update costs only a hash, a mutex and a
+copy of the wire text into the update buffer; commits happen on a background writer.
+
+When the backend does stall — a flush slower than `COLLECTOR_QUEUE_STALL_MS`, or the
+buffer reaching its high-water mark while a commit is still outstanding — the buffer
+becomes a **deep update queue**:
+
+- Updates keep being accepted and stay **coalesced per ad in wire form**, so the queue
+  holds one entry per advertising daemon at roughly the size of the ad on the wire.
+- It is bounded by `COLLECTOR_QUEUE_MAX_MB` and `COLLECTOR_QUEUE_MAX_ADS`. Past either
+  bound the collector **sheds** queued ads — an arbitrary victim, never the ad just
+  accepted — rather than applying backpressure. Losing a monitoring ad costs one update
+  interval, because every daemon re-advertises; blocking the ingest socket costs the
+  source pool its scheduling cycle.
+- **Invalidations are deferred too**, into their own bounded FIFO applied after the
+  queued updates (a view feed interleaves `UPDATE_*` and `INVALIDATE_*` down one
+  socket, so an invalidation that blocked would stall it exactly as an update would).
+  A shed invalidation only means its ad lingers until `ClassAdLifetime` expires.
+- Queries skip the buffer flush while a flush is in progress instead of queueing behind
+  it, so a write stall does not spread to the read path.
+- The queue disengages after `COLLECTOR_QUEUE_CLEAR_S` without a stall, returning the
+  buffer to its ordinary high-water mark.
+
+`/metrics` reports the mode and its cost: `condor_collector_queue_shed_mode` (the
+series to alert on), `condor_collector_queue_stalls_total`,
+`condor_collector_queue_dropped_total{reason}`, and `condor_collector_queue_ads` /
+`_bytes` / `_invalidations` for occupancy. The log records entry and exit, with the
+shed rate rate-limited to one line per 10s.
+
+This applies to every store, including `memory`. The in-memory store has no disk and no
+network to stall on today, which is exactly the reason to guard it: the collector's
+ability to keep accepting ads should not depend on that remaining true as the storage
+engine underneath it changes. Buffering also makes its ingest path cheaper, because the
+store write moves off the receiving goroutine — ~1.0 µs to accept an ad rather than
+~3.4 µs.
+
+`COLLECTOR_INGEST_DIRECT = True` restores the previous behavior, applying each update on
+the receiving goroutine while the backend is healthy. It is an escape hatch rather than a
+tuning knob: it cannot protect a producer that is already inside the backend when it
+stalls, so every daemon that advertises within `COLLECTOR_QUEUE_STALL_MS` of the onset
+blocks with it.
 
 ### Encrypted session persistence and the privilege model
 

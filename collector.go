@@ -172,7 +172,9 @@ func (c *Collector) StartBackground(ctx context.Context) func() {
 	var stops []func()
 	// Dictionary retraining is an in-memory-backend optimization (store.Retrainer);
 	// a backend that manages its own storage (a database) does not implement it.
-	if r, ok := c.store.(store.Retrainer); ok && c.cfg.DictRetrainInterval > 0 {
+	// store.As, not a direct assertion: the in-memory store may be wrapped in the stall
+	// guard, and a plain assertion against the wrapper would quietly find nothing.
+	if r, ok := store.As[store.Retrainer](c.store); ok && c.cfg.DictRetrainInterval > 0 {
 		c.log.Info("collector: dictionary auto-retraining enabled",
 			"interval", c.cfg.DictRetrainInterval.String(), "sample_size", c.cfg.DictSampleSize)
 		stops = append(stops, r.StartAutoRetrain(c.cfg.DictRetrainInterval, c.cfg.DictSampleSize))
