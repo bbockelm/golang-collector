@@ -193,6 +193,7 @@ type over TCP (no `CONDOR_VIEW_CLASSAD_TYPES` needed on the Go side). Note the C
 | `COLLECTOR_QUEUE_MAX_ADS` | Queued-ad cap while the deep queue is engaged (coalesced, one entry per ad). Default `200000`; `0` = no cap. |
 | `COLLECTOR_QUEUE_MAX_MB` | Memory cap for queued ads — the bound worth tuning. Default `256`; `0` = no cap. |
 | `COLLECTOR_QUEUE_MAX_INVALIDATES` | Cap on invalidations deferred while stalled. Default `4096`; `0` = no cap. |
+| `COLLECTOR_INGEST_DIRECT` | Apply ad updates on the receiving goroutine while the backend is healthy (pre-guard behavior). Default `False`; see [Never blocking on storage](#never-blocking-on-storage). |
 | `COLLECTOR_FLUSH_TIMEOUT_S` | Bound on one backend flush, so a writer wedged on a dead-but-open connection retries. Default `300`; `0` = no bound. |
 | `COLLECTOR_PERSIST_SESSIONS` | Persist the CEDAR session cache across restarts (see below). Default off. |
 | `COLLECTOR_SESSION_CACHE_FILE` | Path to the encrypted session DB (default `$(SPOOL)/collector_sessions.db`). |
@@ -237,8 +238,8 @@ window bounds only write-visibility latency (well under the C++ collector's upda
 cadence, and imperceptible to `condor_status`); `UPDATE_*_AD_WITH_ACK` updates
 bypass the buffer entirely, so an acknowledgment always follows durability. Set the
 window to `0` to disable batching — but note that the same buffer is what keeps ingest
-from blocking on storage (below), so disabling it gives that up. Batching does not apply
-to the `memory` store.
+from blocking on storage (below), so disabling it gives that up. The `memory` store is
+buffered for that protection rather than for batching; it has no commit to amortize.
 
 ### Never blocking on storage
 
@@ -279,8 +280,18 @@ series to alert on), `condor_collector_queue_stalls_total`,
 `_bytes` / `_invalidations` for occupancy. The log records entry and exit, with the
 shed rate rate-limited to one line per 10s.
 
-This applies to the `embedded` and `db` stores. The `memory` store writes to process
-memory and has nothing to stall on.
+This applies to every store, including `memory`. The in-memory store has no disk and no
+network to stall on today, which is exactly the reason to guard it: the collector's
+ability to keep accepting ads should not depend on that remaining true as the storage
+engine underneath it changes. Buffering also makes its ingest path cheaper, because the
+store write moves off the receiving goroutine — ~1.0 µs to accept an ad rather than
+~3.4 µs.
+
+`COLLECTOR_INGEST_DIRECT = True` restores the previous behavior, applying each update on
+the receiving goroutine while the backend is healthy. It is an escape hatch rather than a
+tuning knob: it cannot protect a producer that is already inside the backend when it
+stalls, so every daemon that advertises within `COLLECTOR_QUEUE_STALL_MS` of the onset
+blocks with it.
 
 ### Encrypted session persistence and the privilege model
 

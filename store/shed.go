@@ -47,6 +47,19 @@ type QueuePolicy struct {
 	// open but dead eventually gives up, drops it and redials instead of never returning.
 	// It cannot interrupt a blocking disk syscall -- that is what the queue is for.
 	FlushTimeout time.Duration
+	// DirectUntilStalled keeps ad updates on the caller's goroutine, applied straight to
+	// the backend, for as long as the backend is healthy; the queue engages only once a
+	// stall is detected. It buys the stall protection for a backend where buffering has
+	// nothing to amortize -- the in-memory store, where a commit is a map write -- without
+	// adding a buffer hop and a flush-before-read to the fast path.
+	//
+	// The protection it gives is narrower by exactly one update: a stall has to be
+	// observed before it can be reacted to, so whichever producer is inside the stalled
+	// call stays there. Every OTHER producer sees the in-flight call, engages the queue
+	// and returns at once -- so one connection hangs instead of all of them. Set
+	// StallThreshold to 0 for the unconditional guarantee (always queue, nobody ever
+	// blocks) at the cost of buffering every update.
+	DirectUntilStalled bool
 }
 
 // In every bound above, zero means "unset, take the default" (Go cannot tell an unset

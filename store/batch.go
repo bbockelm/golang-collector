@@ -122,6 +122,8 @@ var (
 	_ RawStreamer          = (*BufferedBackend)(nil)
 	_ ProjectedRawStreamer = (*BufferedBackend)(nil)
 	_ DurableUpdater       = (*BufferedBackend)(nil)
+	_ Statser              = (*BufferedBackend)(nil)
+	_ Retrainer            = (*BufferedBackend)(nil)
 )
 
 // DurableUpdater is an optional Backend capability: apply one ad update and return
@@ -297,6 +299,15 @@ func (b *BufferedBackend) run() {
 // Without a background writer (window == 0, e.g. tests) it flushes inline when full,
 // as before -- there is no one else to do the work.
 func (b *BufferedBackend) enqueue(ctx context.Context, p PendingUpdate) error {
+	// The direct path is decided BEFORE the ad is keyed. dedupKey hashes the ad's name
+	// out of its wire text, which is most of what an in-memory update costs; computing
+	// it only to hand the text to a backend that keys it again doubled the cost of the
+	// default store's fast path. A direct update needs no dedup key -- nothing is being
+	// deduplicated -- and the backend reports an unkeyable ad itself.
+	if b.window > 0 && b.qp.DirectUntilStalled && !b.shedding() {
+		return b.applyDirect(ctx, p)
+	}
+
 	k, ok := p.dedupKey()
 	if !ok {
 		return fmt.Errorf("collector: %s ad has no Name/Machine to key on", p.Type)
@@ -630,6 +641,72 @@ func rejectedText(p PendingUpdate) string {
 		return p.Text + "\n# --- private ad ---\n" + p.PvtText
 	}
 	return p.Text
+}
+
+// applyDirect writes p straight through to the backend on the caller's goroutine, which
+// is what DirectUntilStalled does while the backend is healthy, and watches that call for
+// the stall that switches the mode.
+//
+// It watches in two ways because one is not enough. The duration on the way out catches a
+// backend that is slow; publishing the call's start for its whole lifetime catches one
+// that has stopped returning at all, which a completed-duration check can never see. That
+// published start is what every other producer reads in shedding(), so a single wedged
+// update diverts everyone else into the queue instead of into the same wedged call.
+func (b *BufferedBackend) applyDirect(ctx context.Context, p PendingUpdate) error {
+	start := time.Now()
+	nano := start.UnixNano()
+	// Only the claimant clears the slot. A producer that does not get it is simply not
+	// the one being timed; if it is the one that wedges, the next producer to claim an
+	// empty slot starts the clock, so detection is delayed by at most one call.
+	claimed := b.flushStart.CompareAndSwap(0, nano)
+
+	var err error
+	if p.Pvt {
+		err = b.Backend.UpdatePvt(ctx, p.Text, p.PvtText)
+	} else {
+		err = b.Backend.UpdateOldText(ctx, p.Type, p.Text)
+	}
+
+	if claimed {
+		b.flushStart.CompareAndSwap(nano, 0)
+	}
+	if d := time.Since(start); b.qp.StallThreshold > 0 && d >= b.qp.StallThreshold {
+		b.markStall("an ad update took " + d.Round(time.Millisecond).String())
+	}
+	return err
+}
+
+// --- optional capabilities forwarded from the wrapped backend ---
+//
+// Without these the wrapper would ANSWER for the backend it hides: it embeds the Backend
+// interface, so only Backend's methods are promoted and a capability the wrapped store
+// implements becomes invisible. Reached through store.As, which also unwraps via Base(),
+// so a caller gets the same answer wrapped or not.
+
+// Stats forwards per-table introspection metrics, so wrapping a backend does not empty
+// the collector's storage gauges.
+func (b *BufferedBackend) Stats() map[AdType]collections.Stats {
+	if s, ok := b.Backend.(Statser); ok {
+		return s.Stats()
+	}
+	return nil
+}
+
+// RetrainDict forwards one dictionary-retraining pass.
+func (b *BufferedBackend) RetrainDict(sampleMax int) {
+	if r, ok := b.Backend.(Retrainer); ok {
+		r.RetrainDict(sampleMax)
+	}
+}
+
+// StartAutoRetrain forwards periodic dictionary retraining, so wrapping the in-memory
+// store does not silently turn off its memory-footprint lever. It returns a no-op stop
+// for a backend that manages its own storage.
+func (b *BufferedBackend) StartAutoRetrain(interval time.Duration, sampleMax int) func() {
+	if r, ok := b.Backend.(Retrainer); ok {
+		return r.StartAutoRetrain(interval, sampleMax)
+	}
+	return func() {}
 }
 
 // --- buffered write paths ---

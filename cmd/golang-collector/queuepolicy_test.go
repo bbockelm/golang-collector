@@ -10,7 +10,8 @@ import (
 
 // TestQueuePolicyDefaults checks that an unconfigured collector gets the deep update
 // queue with its shipped bounds -- the protection has to be on by default, since the
-// pools that need it are the ones nobody has tuned.
+// pools that need it are the ones nobody has tuned -- and in particular that ingest is
+// buffered rather than direct, the mode with no detection window.
 func TestQueuePolicyDefaults(t *testing.T) {
 	got := queuePolicy(config.NewEmpty())
 	if got != store.DefaultQueuePolicy {
@@ -29,14 +30,16 @@ func TestQueuePolicyOverrides(t *testing.T) {
 	cfg.Set("COLLECTOR_QUEUE_MAX_MB", "64")
 	cfg.Set("COLLECTOR_QUEUE_MAX_INVALIDATES", "128")
 	cfg.Set("COLLECTOR_FLUSH_TIMEOUT_S", "30")
+	cfg.Set("COLLECTOR_INGEST_DIRECT", "True")
 	got := queuePolicy(cfg)
 	want := store.QueuePolicy{
-		StallThreshold: 250 * time.Millisecond,
-		StallClear:     time.Minute,
-		MaxAds:         5000,
-		MaxBytes:       64 << 20,
-		MaxInvalidates: 128,
-		FlushTimeout:   30 * time.Second,
+		StallThreshold:     250 * time.Millisecond,
+		StallClear:         time.Minute,
+		MaxAds:             5000,
+		MaxBytes:           64 << 20,
+		MaxInvalidates:     128,
+		FlushTimeout:       30 * time.Second,
+		DirectUntilStalled: true,
 	}
 	if got != want {
 		t.Errorf("policy = %+v, want %+v", got, want)
