@@ -257,16 +257,27 @@ func TestInvalidateDeferredWhileStalled(t *testing.T) {
 		t.Fatal("Invalidate blocked on the wedged backend; a view feed's command socket would be stalled")
 	}
 
-	// Let storage recover and settle. The settled count is the assertion, not slot3's
-	// absence on its own: before the queue drains, slot3 is absent merely because it has
-	// not been written yet, which would pass for the wrong reason.
+	// Let storage recover and settle. Both halves are ONE condition, because the queue
+	// drains over several flushes and neither half identifies the settled state alone:
+	// slot3 is absent early on merely because it has not been written yet, and the count
+	// reaches 7 early on with slot3 among those 7 and another ad still queued. Waiting on
+	// the count and then reading slot3 samples that moment and reports a resurrection
+	// that is really a drain in progress.
 	g.Release()
-	if !waitFor(10*time.Second, func() bool { n, _ := b.Len(ctx, StartdAd); return n == 7 }) {
-		n, _ := b.Len(ctx, StartdAd)
-		t.Fatalf("settled at %d ads, want 7 (8 advertised, 1 invalidated) -- queued updates or the invalidation were lost", n)
+	alive := func() bool {
+		_, ok := b.Get(ctx, StartdAd, mustParse(t, `Name = "slot3@host"`))
+		return ok
 	}
-	if _, ok := b.Get(ctx, StartdAd, mustParse(t, `Name = "slot3@host"`)); ok {
-		t.Fatal("slot3 survived: the deferred invalidation was applied before the update it must outrank, which resurrected the ad")
+	settled := waitFor(10*time.Second, func() bool {
+		n, _ := b.Len(ctx, StartdAd)
+		return n == 7 && !alive()
+	})
+	if !settled {
+		n, _ := b.Len(ctx, StartdAd)
+		if alive() {
+			t.Fatalf("slot3 survived (settled at %d ads): the deferred invalidation was applied before the update it must outrank, which resurrected the ad", n)
+		}
+		t.Fatalf("settled at %d ads, want 7 (8 advertised, 1 invalidated) -- queued updates or the invalidation were lost", n)
 	}
 }
 
