@@ -27,8 +27,11 @@ func (g *gatedBatchWriter) UpdateBatch(ctx context.Context, batch []PendingUpdat
 }
 
 // TestBufferedBackendPipelining verifies the fix for the jerky db-mode update stream:
-// while a batch is committing, producers must keep buffering (not block on the commit),
-// and only block once the buffer hits its hard cap (backpressure).
+// while a batch is committing, producers must keep buffering rather than block on the
+// commit -- and past the high-water mark they must STILL not block, engaging the deep
+// update queue instead (see TestIngestNeverBlocksOnStalledBackend for the full
+// guarantee). Every ad here fits inside the queue's caps, so none is shed: pipelining
+// must not cost correctness.
 func TestBufferedBackendPipelining(t *testing.T) {
 	under, err := NewDBBackend(t.TempDir())
 	if err != nil {
@@ -77,10 +80,10 @@ func TestBufferedBackendPipelining(t *testing.T) {
 		t.Fatal("producer blocked while a batch was committing -- no pipelining")
 	}
 
-	// Backpressure: keep filling past the hard cap while the commit is still gated; the
-	// producer must eventually take the inline-flush path (counted). The writer is single-
-	// threaded and gated, so it cannot swap the buffer meanwhile -- the count grows
-	// monotonically to hardCap.
+	// Past the high-water mark: the buffer reaching hardCap with the writer still
+	// committing is the signal that engages the deep update queue (counted). The producer
+	// must sail straight through it -- the writer is single-threaded and gated, so it
+	// cannot drain anything meanwhile, and anything that waited here would wait forever.
 	before := testutil.ToFloat64(Metrics.backpressureTotal)
 	bp := make(chan struct{})
 	go func() {
@@ -89,12 +92,16 @@ func TestBufferedBackendPipelining(t *testing.T) {
 		}
 		close(bp)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for testutil.ToFloat64(Metrics.backpressureTotal) == before {
-		if time.Now().After(deadline) {
-			t.Fatal("buffer never applied backpressure past the hard cap")
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-bp:
+	case <-time.After(2 * time.Second):
+		t.Fatal("producer blocked past the buffer's high-water mark -- the ingest path still applies backpressure")
+	}
+	if testutil.ToFloat64(Metrics.backpressureTotal) == before {
+		t.Fatal("filling past the hard cap did not engage the deep update queue")
+	}
+	if !b.Shedding() {
+		t.Fatal("deep update queue was not engaged after the buffer passed its hard cap")
 	}
 
 	// Release: every gated commit proceeds; all distinct ads must land.
