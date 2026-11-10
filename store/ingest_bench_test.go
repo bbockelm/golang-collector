@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,7 +115,6 @@ func BenchmarkIngestLatencyUnderStall(b *testing.B) {
 type wedgedWriter struct {
 	Backend
 	release chan struct{}
-	once    sync.Once
 }
 
 func (w *wedgedWriter) UpdateBatch(_ context.Context, _ []PendingUpdate) error {
