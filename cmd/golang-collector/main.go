@@ -23,10 +23,12 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/cedar/ccb"
 	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	cedarversion "github.com/bbockelm/cedar/version"
 	ccbserver "github.com/bbockelm/golang-ccb"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
@@ -291,15 +293,35 @@ func collectorAddr(d *daemon.Daemon, ln net.Listener) string {
 	return ln.Addr().String()
 }
 
+// ccbStreamingVersion is the CondorVersion the collector advertises in the
+// security handshake while it runs the embedded CCB: the minimum at which a
+// cedar requester sends a CCB broker streaming (private-to-private)
+// CCB_REQUESTs, ccb.StreamingMinVersion, which is at or above the C++
+// CCBClient's (ccb_client.cpp CCB_STREAMING_VERSION_*). It is derived from
+// cedar's constant so it cannot fall below that gate.
+var ccbStreamingVersion = fmt.Sprintf(
+	"$CondorVersion: %s 2026-10-11 BuildID: golang-collector GitSHA: dev $",
+	ccb.StreamingMinVersion,
+)
+
 // maybeStartEmbeddedCCB starts an embedded CCB server on the collector's own
 // command socket when ENABLE_CCB_SERVER is set, mirroring the C++ collector. It
 // registers the CCB handlers onto srv (so CCB commands arrive on the shared port)
 // and starts CCB background maintenance under ctx. pubAddr is the collector's
 // reachable address, used to build the "<addr>#<id>" CCB contact strings. The
 // CCB commands are authorized by srv's Authorizer, like the collector's own.
+// sec is srv's base security policy; call this before srv serves.
 func maybeStartEmbeddedCCB(ctx context.Context, d *daemon.Daemon, cfg *config.Config, sec *security.SecurityConfig, srv *cedarserver.Server, pubAddr string) error {
 	if !configBool(cfg, "ENABLE_CCB_SERVER", false) {
 		return nil
+	}
+	// Without a version of its own, cedar advertises one older than the
+	// streaming minimum, and a requester then makes no streaming request to
+	// this broker. The per-level policies take the base policy's version
+	// (daemon.InstallSecurityLevels), so this covers CCB_REGISTER and
+	// CCB_REQUEST alike.
+	if v, ok := cedarversion.Parse(sec.RemoteVersion); !ok || !v.AtLeast(ccb.StreamingMinVersion) {
+		sec.RemoteVersion = ccbStreamingVersion
 	}
 	ccbSrv, err := ccbserver.New(ccbserver.Config{
 		PublicAddress: pubAddr,
