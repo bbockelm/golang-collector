@@ -8,7 +8,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/golang-htcondor"
+	"github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"
 )

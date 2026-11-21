@@ -5,7 +5,7 @@ run:
 
 # Keep the default linter set (errcheck, govet, ineffassign, staticcheck,
 # unused). The exclusions below match the convention in the sibling
-# PelicanPlatform/classad and bbockelm/golang-htcondor repos.
+# PelicanPlatform/classad and htcondor/golang-htcondor repos.
 linters:
   exclusions:
     rules:

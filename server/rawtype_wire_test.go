@@ -9,7 +9,7 @@ import (
 	"github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestWithRawTypeAttrs pins the helper that re-adds MyType/TargetType as attribute lines.

@@ -31,7 +31,7 @@ import (
 
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/golang-htcondor/daemon"
+	"github.com/htcondor/golang-htcondor/daemon"
 
 	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"

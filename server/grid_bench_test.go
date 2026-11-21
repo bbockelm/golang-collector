@@ -10,7 +10,7 @@ import (
 
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // BenchmarkGrid sweeps a grid of workload x concurrency against both the Go and

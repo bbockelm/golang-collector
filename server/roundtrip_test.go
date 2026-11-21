@@ -12,7 +12,7 @@ import (
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"
 )

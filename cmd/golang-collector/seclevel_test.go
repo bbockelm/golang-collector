@@ -10,9 +10,9 @@ import (
 
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/golang-htcondor/config"
-	"github.com/bbockelm/golang-htcondor/daemon"
-	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/htcondor/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/daemon"
+	"github.com/htcondor/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-collector/store"
 )

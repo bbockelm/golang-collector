@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // viewDaemonTypes are the daemon ad types every healthy pool advertises and that
