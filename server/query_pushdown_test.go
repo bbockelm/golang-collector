@@ -9,7 +9,7 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/cedar/commands"
-	"github.com/htcondor/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"
 )

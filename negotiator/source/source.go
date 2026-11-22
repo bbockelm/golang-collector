@@ -93,8 +93,8 @@ func NewRemote(cfg Config) (*RemoteSource, error) {
 		return nil, fmt.Errorf("source: NEGOTIATOR_SUBMITTER_CONSTRAINT %q: %w", cfg.SubmitterConstraint, err)
 	}
 	return &RemoteSource{
-		cfg: cfg,
-		log: cfg.logger(),
+		cfg:           cfg,
+		log:           cfg.logger(),
 		defaultWeight: ParseSlotWeight(cfg.SlotWeightExpr),
 	}, nil
 }
