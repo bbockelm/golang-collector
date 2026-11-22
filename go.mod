@@ -4,9 +4,9 @@ go 1.26.0
 
 require (
 	github.com/PelicanPlatform/classad v0.43.0
-	github.com/PelicanPlatform/classad/collections v0.38.3
-	github.com/PelicanPlatform/classad/db v0.38.2
-	github.com/PelicanPlatform/classad/dbrpc v0.38.2
+	github.com/PelicanPlatform/classad/collections v0.43.0
+	github.com/PelicanPlatform/classad/db v0.43.0
+	github.com/PelicanPlatform/classad/dbrpc v0.43.0
 	github.com/bbockelm/cedar v0.7.16
 	github.com/bbockelm/golang-ccb v0.6.0
 	github.com/htcondor/golang-htcondor v0.25.0
