@@ -7,9 +7,9 @@ require (
 	github.com/PelicanPlatform/classad/collections v0.43.0
 	github.com/PelicanPlatform/classad/db v0.43.0
 	github.com/PelicanPlatform/classad/dbrpc v0.43.0
-	github.com/bbockelm/cedar v0.7.15
-	github.com/bbockelm/golang-ccb v0.5.0
-	github.com/bbockelm/golang-htcondor v0.24.0
+	github.com/bbockelm/cedar v0.7.16
+	github.com/bbockelm/golang-ccb v0.6.0
+	github.com/htcondor/golang-htcondor v0.25.0
 	github.com/prometheus/client_golang v1.25.0
 )
 
@@ -49,7 +49,7 @@ require (
 	github.com/tidwall/btree v1.8.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
-	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect

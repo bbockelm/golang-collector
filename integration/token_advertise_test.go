@@ -326,4 +326,3 @@ func writeFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
-

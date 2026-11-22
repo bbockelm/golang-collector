@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/golang-collector/store"
-	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/config"
 )
 
 // TestQueuePolicyDefaults checks that an unconfigured collector gets the deep update

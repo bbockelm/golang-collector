@@ -18,7 +18,7 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 
 	collector "github.com/bbockelm/golang-collector"
 	"github.com/bbockelm/golang-collector/negotiator"

@@ -373,7 +373,7 @@ docs/                   negotiator design, roadmap, and C++ differences
 
 ### Related repositories
 
-- [`golang-htcondor`](https://github.com/bbockelm/golang-htcondor) — config, daemon
+- [`golang-htcondor`](https://github.com/htcondor/golang-htcondor) — config, daemon
   core, privilege drop, security, session cache.
 - [`golang-classads`](https://github.com/bbockelm/golang-classads) — the ClassAd
   collections/compression engine backing the store.

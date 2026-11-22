@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/watch"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"
 )

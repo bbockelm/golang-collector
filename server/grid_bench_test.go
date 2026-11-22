@@ -10,7 +10,7 @@ import (
 
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // BenchmarkGrid sweeps a grid of workload x concurrency against both the Go and
@@ -41,10 +41,10 @@ func BenchmarkGrid(b *testing.B) {
 		query    string // "" for a write-only scenario
 	}{
 		{"write", 100, ""},
-		{"read-point", 0, `Name == "slot5@host5"`},      // unique -> 1 match (indexed in Go)
-		{"read-selective", 0, `State == "Claimed"`},     // ~1/4 match (indexed categorical in Go)
-		{"read-scan", 0, `Activity == "Idle"`},          // all match, un-indexed -> full scan
-		{"mixed", 50, `Name == "slot5@host5"`},          // 50/50 write + point read
+		{"read-point", 0, `Name == "slot5@host5"`},  // unique -> 1 match (indexed in Go)
+		{"read-selective", 0, `State == "Claimed"`}, // ~1/4 match (indexed categorical in Go)
+		{"read-scan", 0, `Activity == "Idle"`},      // all match, un-indexed -> full scan
+		{"mixed", 50, `Name == "slot5@host5"`},      // 50/50 write + point read
 	}
 	for _, be := range backends {
 		b.Run(be.name, func(b *testing.B) {
