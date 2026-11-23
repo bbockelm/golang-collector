@@ -3,8 +3,8 @@ package server
 import (
 	"testing"
 
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/watch"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/watch"
 
 	"github.com/bbockelm/golang-collector/store"
 )

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/watch"
+	"github.com/htcondor/cedar/watch"
 	htcondor "github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"

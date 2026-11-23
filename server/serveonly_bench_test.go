@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/stream"
 
 	"github.com/bbockelm/golang-collector/store"
 )

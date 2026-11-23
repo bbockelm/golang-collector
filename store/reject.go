@@ -3,7 +3,7 @@ package store
 import (
 	"strings"
 
-	"github.com/bbockelm/cedar/message"
+	"github.com/htcondor/cedar/message"
 )
 
 // AdName extracts an ad's Name attribute from old-ClassAd wire text, for

@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/stream"
 )
 
 // stripLastHeardFrom removes a LastHeardFrom line from old-ClassAd text. The

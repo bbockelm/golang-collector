@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/message"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/message"
 )
 
 // TestQueryAccountingAds exercises the direct QUERY_ACCOUNTING_ADS command a

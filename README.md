@@ -377,5 +377,5 @@ docs/                   negotiator design, roadmap, and C++ differences
   core, privilege drop, security, session cache.
 - [`golang-classads`](https://github.com/bbockelm/golang-classads) — the ClassAd
   collections/compression engine backing the store.
-- [`cedar`](https://github.com/bbockelm/cedar) — the CEDAR wire/security library.
+- [`cedar`](https://github.com/htcondor/cedar) — the CEDAR wire/security library.
 - [`golang-ccb`](https://github.com/bbockelm/golang-ccb) — the embedded CCB server.

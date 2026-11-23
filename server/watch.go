@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/message"
-	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/cedar/watch"
+	"github.com/htcondor/cedar/message"
+	cedarserver "github.com/htcondor/cedar/server"
+	"github.com/htcondor/cedar/watch"
 
 	"github.com/bbockelm/golang-collector/store"
 )

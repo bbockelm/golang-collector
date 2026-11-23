@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
-	"github.com/bbockelm/cedar/commands"
 	ccbserver "github.com/bbockelm/golang-ccb"
+	"github.com/htcondor/cedar/ccb"
+	"github.com/htcondor/cedar/commands"
 	htcondor "github.com/htcondor/golang-htcondor"
 
 	"github.com/bbockelm/golang-collector/store"
