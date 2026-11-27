@@ -29,10 +29,10 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/message"
-	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/cedar/version"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/message"
+	cedarserver "github.com/htcondor/cedar/server"
+	"github.com/htcondor/cedar/version"
 )
 
 // Config configures an embeddable Negotiator daemon object.

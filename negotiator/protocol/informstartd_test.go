@@ -5,9 +5,9 @@ import (
 	"net"
 	"testing"
 
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/message"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/message"
+	cedarserver "github.com/htcondor/cedar/server"
 
 	"github.com/bbockelm/golang-collector/negotiator/negtest"
 )

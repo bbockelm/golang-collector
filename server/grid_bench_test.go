@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/security"
 	htcondor "github.com/htcondor/golang-htcondor"
 )
 

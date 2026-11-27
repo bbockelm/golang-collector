@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/security"
 
 	"github.com/bbockelm/golang-collector/store"
 )

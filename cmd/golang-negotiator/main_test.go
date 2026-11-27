@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/client"
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/client"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/security"
 	"github.com/htcondor/golang-htcondor/config"
 	"github.com/htcondor/golang-htcondor/daemon"
 	"github.com/htcondor/golang-htcondor/logging"

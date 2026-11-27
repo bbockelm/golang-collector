@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bbockelm/cedar/client"
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/message"
+	"github.com/htcondor/cedar/client"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/message"
 )
 
 // InformStartd sends a MATCH_INFO notification to a startd, mirroring the C++

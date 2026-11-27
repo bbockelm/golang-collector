@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/security"
 
 	"github.com/bbockelm/golang-collector/server"
 	"github.com/bbockelm/golang-collector/store"
